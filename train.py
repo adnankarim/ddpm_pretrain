@@ -226,15 +226,10 @@ class ModifiedDiffusersUNet(nn.Module):
     def __init__(self, image_size=96, fingerprint_dim=1024):
         super().__init__()
         print(f"Loading base architecture from {Config.base_model_id}...")
+        # Load pretrained model with its default architecture, then modify
         self.unet = UNet2DModel.from_pretrained(
             Config.base_model_id,
             sample_size=image_size,
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),
-            down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-            up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
             class_embed_type="identity"
         )
         
@@ -257,8 +252,10 @@ class ModifiedDiffusersUNet(nn.Module):
         self.unet.conv_in = new_conv
         print("  ✓ Input layer modified: 3 -> 6 channels (Zero-initialized control weights)")
 
-        # Surgery: Projection
-        target_dim = 128 * 4 
+        # Surgery: Projection - get actual class embedding dimension from model
+        # The model uses class_labels, so we need to match its embedding dimension
+        # For identity class_embed_type, it uses time_embedding_dim
+        target_dim = self.unet.time_embedding.linear_1.out_features
         self.fingerprint_proj = nn.Sequential(
             nn.Linear(fingerprint_dim, 512),
             nn.SiLU(),
