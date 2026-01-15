@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.21.0
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+imageio>=2.31.0
+wandb>=0.15.0
+rdkit-pypi>=2022.9.5
