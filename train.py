@@ -16,7 +16,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
 from pathlib import Path
-import matplotlib.pyplot as plt # Added for plotting
+
+# --- Plotting Backend (Prevents crashes on headless servers) ---
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless servers
+import matplotlib.pyplot as plt
 
 # --- NEW IMPORTS ---
 try:
@@ -82,38 +86,48 @@ class Config:
 # ============================================================================
 
 class TrainingLogger:
+    """
+    Logs training metrics to CSV and generates plots every epoch.
+    Uses log scale for better visualization of diffusion loss dynamics.
+    """
     def __init__(self, save_dir):
         self.save_dir = save_dir
         self.history = {
-            'train_loss': [],
-            'epochs': []
+            'epoch': [],
+            'train_loss': []
         }
+        self.csv_path = os.path.join(save_dir, "training_history.csv")
+        self.plot_path = os.path.join(save_dir, "training_loss.png")
         
     def update(self, epoch, loss):
+        # Update internal history
+        self.history['epoch'].append(epoch)
         self.history['train_loss'].append(loss)
-        self.history['epochs'].append(epoch)
-        self.plot()
         
-    def plot(self):
+        # Save to CSV immediately
+        df = pd.DataFrame(self.history)
+        df.to_csv(self.csv_path, index=False)
+        
+        # Generate Plot
+        self._plot()
+        
+    def _plot(self):
         plt.figure(figsize=(10, 6))
-        plt.plot(self.history['epochs'], self.history['train_loss'], label='Training Loss', color='blue')
+        # Plot Loss with log scale (better for diffusion training)
+        plt.plot(self.history['epoch'], self.history['train_loss'], 
+                 label='MSE Loss (Proxy for KL)', color='#1f77b4', linewidth=2)
         
-        plt.title('Training Loss over Epochs')
+        plt.title(f'DDPM Training Dynamics (Epoch {self.history["epoch"][-1]})')
         plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss')
+        plt.ylabel('Loss')
+        plt.yscale('log')  # Log scale is often better for diffusion loss
+        plt.grid(True, which="both", ls="-", alpha=0.2)
         plt.legend()
-        plt.grid(True, alpha=0.3)
         
-        # Save plot
-        plt.savefig(os.path.join(self.save_dir, "training_loss.png"))
+        # Save
+        plt.tight_layout()
+        plt.savefig(self.plot_path, dpi=150)
         plt.close()
-        
-        # Save raw data to CSV
-        df = pd.DataFrame({
-            'epoch': self.history['epochs'],
-            'loss': self.history['train_loss']
-        })
-        df.to_csv(os.path.join(self.save_dir, "training_history.csv"), index=False)
 
 # ============================================================================
 # DATASET & ENCODER
@@ -149,52 +163,86 @@ class BBBC021Dataset(Dataset):
         self.image_size = image_size
         self.encoder = encoder
         
-        df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
-        if 'SPLIT' in df.columns: df = df[df['SPLIT'].str.lower() == split.lower()]
+        # Robust CSV loading
+        csv_full_path = os.path.join(data_dir, metadata_file)
+        if not os.path.exists(csv_full_path):
+            csv_full_path = metadata_file  # Try relative path
+            
+        df = pd.read_csv(csv_full_path)
+        if 'SPLIT' in df.columns: 
+            df = df[df['SPLIT'].str.lower() == split.lower()]
         
         self.metadata = df.to_dict('records')
         self.batch_map = self._group_by_batch()
         
+        # Pre-encode chemicals
         self.fingerprints = {}
-        for cpd in df['CPD_NAME'].unique():
-            smiles = df[df['CPD_NAME'] == cpd].iloc[0].get('SMILES', '')
-            self.fingerprints[cpd] = self.encoder.encode(smiles)
+        if 'CPD_NAME' in df.columns:
+            for cpd in df['CPD_NAME'].unique():
+                row = df[df['CPD_NAME'] == cpd].iloc[0]
+                smiles = row.get('SMILES', '')
+                self.fingerprints[cpd] = self.encoder.encode(smiles)
 
     def _group_by_batch(self):
         groups = {}
         for idx, row in enumerate(self.metadata):
-            b = row['BATCH']
+            b = row.get('BATCH', 'unknown')
             if b not in groups: groups[b] = {'ctrl': [], 'trt': []}
-            if row['CPD_NAME'].upper() == 'DMSO': groups[b]['ctrl'].append(idx)
-            else: groups[b]['trt'].append(idx)
+            
+            cpd = str(row.get('CPD_NAME', '')).upper()
+            if cpd == 'DMSO': 
+                groups[b]['ctrl'].append(idx)
+            else: 
+                groups[b]['trt'].append(idx)
         return groups
 
     def get_perturbed_indices(self):
-        return [i for i, m in enumerate(self.metadata) if m['CPD_NAME'].upper() != 'DMSO']
+        return [i for i, m in enumerate(self.metadata) if str(m.get('CPD_NAME', '')).upper() != 'DMSO']
 
     def get_paired_sample(self, trt_idx):
-        batch = self.metadata[trt_idx]['BATCH']
-        ctrls = self.batch_map[batch]['ctrl']
-        return (np.random.choice(ctrls), trt_idx) if ctrls else (trt_idx, trt_idx)
+        batch = self.metadata[trt_idx].get('BATCH', 'unknown')
+        if batch in self.batch_map and self.batch_map[batch]['ctrl']:
+            ctrls = self.batch_map[batch]['ctrl']
+            return (np.random.choice(ctrls), trt_idx)
+        return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
     def __len__(self): return len(self.metadata)
 
     def __getitem__(self, idx):
         meta = self.metadata[idx]
         path = meta.get('image_path') or meta.get('SAMPLE_KEY')
-        full_path = self.data_dir / path if (self.data_dir / path).exists() else self.data_dir / (path + '.npy')
         
+        # Try finding the file
+        full_path = self.data_dir / path
+        if not full_path.exists():
+            full_path = self.data_dir / (str(path) + '.npy')
+            
         try:
             img = np.load(full_path)
-            if img.ndim == 3 and img.shape[-1] == 3: img = img.transpose(2, 0, 1)
+            # Handle [H, W, C] -> [C, H, W]
+            if img.ndim == 3 and img.shape[-1] == 3: 
+                img = img.transpose(2, 0, 1)
             img = torch.from_numpy(img).float()
-            if img.max() > 1.0: img = (img / 127.5) - 1.0
+            
+            # Normalize [0, 255] or [0, 1] -> [-1, 1]
+            if img.max() > 1.0: 
+                img = (img / 127.5) - 1.0
+            else:
+                img = (img * 2.0) - 1.0
+                
             img = torch.clamp(img, -1, 1)
-        except:
+        except Exception:
+            # Silent fallback for robust training
             img = torch.zeros((3, self.image_size, self.image_size))
 
-        fp = self.fingerprints.get(meta['CPD_NAME'], np.zeros(1024))
-        return {'image': img, 'fingerprint': torch.from_numpy(fp).float(), 'compound': meta['CPD_NAME']}
+        cpd = meta.get('CPD_NAME', 'DMSO')
+        fp = self.fingerprints.get(cpd, np.zeros(1024))
+        
+        return {
+            'image': img, 
+            'fingerprint': torch.from_numpy(fp).float(), 
+            'compound': cpd
+        }
 
 class PairedDataLoader:
     def __init__(self, dataset, batch_size, shuffle=True):
@@ -202,6 +250,8 @@ class PairedDataLoader:
         self.bs = batch_size
         self.indices = self.ds.get_perturbed_indices()
         self.shuffle = shuffle
+        if len(self.indices) == 0:
+            print("Warning: No perturbed samples found. DataLoader will be empty.")
     
     def __iter__(self):
         if self.shuffle: np.random.shuffle(self.indices)
@@ -214,9 +264,19 @@ class PairedDataLoader:
                 trts.append(self.ds[tidx]['image'])
                 fps.append(self.ds[tidx]['fingerprint'])
                 names.append(self.ds[tidx]['compound'])
-            yield {'control': torch.stack(ctrls), 'perturbed': torch.stack(trts), 
-                   'fingerprint': torch.stack(fps), 'compound': names}
-    def __len__(self): return (len(self.indices) + self.bs - 1) // self.bs
+            
+            if not ctrls: continue
+            
+            yield {
+                'control': torch.stack(ctrls), 
+                'perturbed': torch.stack(trts), 
+                'fingerprint': torch.stack(fps), 
+                'compound': names
+            }
+            
+    def __len__(self): 
+        if self.bs == 0: return 0
+        return (len(self.indices) + self.bs - 1) // self.bs
 
 # ============================================================================
 # ARCHITECTURE
@@ -250,7 +310,7 @@ class ModifiedDiffusersUNet(nn.Module):
             new_conv.bias = old_conv.bias
             
         self.unet.conv_in = new_conv
-        print("  ✓ Input layer modified: 3 -> 6 channels (Zero-initialized control weights)")
+        print("  ✓ Network Surgery: Input expanded 3 -> 6 channels")
 
         # Surgery: Projection - get actual class embedding dimension from model
         # The model uses class_labels, so we need to match its embedding dimension
@@ -261,11 +321,14 @@ class ModifiedDiffusersUNet(nn.Module):
             nn.SiLU(),
             nn.Linear(512, target_dim)
         )
-        print(f"  ✓ Embedding projector added: {fingerprint_dim} -> {target_dim}")
+        print(f"  ✓ Projection Added: {fingerprint_dim} -> {target_dim}")
 
     def forward(self, x, t, control, fingerprint):
+        # Concatenate noisy image with control
         x_in = torch.cat([x, control], dim=1)
+        # Project fingerprint to time embedding dimension
         emb = self.fingerprint_proj(fingerprint)
+        # Pass fingerprint embedding as 'class_labels'
         output = self.unet(x_in, t, class_labels=emb).sample
         return output
 
@@ -289,18 +352,25 @@ class DiffusionModel(nn.Module):
         b = x0.shape[0]
         t = torch.randint(0, self.timesteps, (b,), device=self.cfg.device)
         noise = torch.randn_like(x0)
+        
+        # Forward Diffusion: q(x_t | x_0)
         xt = self.sqrt_alpha_bar[t].view(-1,1,1,1) * x0 + \
              self.sqrt_one_minus_alpha_bar[t].view(-1,1,1,1) * noise
         
+        # Prediction
         noise_pred = self.model(xt, t, control, fingerprint)
+        
+        # Simple MSE Loss (Proxy for KL Divergence)
         return F.mse_loss(noise_pred, noise)
 
     @torch.no_grad()
     def sample(self, control, fingerprint):
+        """Generate a sample using reverse diffusion"""
         self.model.eval()
         b = control.shape[0]
         xt = torch.randn_like(control)
         
+        # Reverse Diffusion: p(x_{t-1} | x_t)
         for i in reversed(range(self.timesteps)):
             t = torch.full((b,), i, device=self.cfg.device, dtype=torch.long)
             noise_pred = self.model(xt, t, control, fingerprint)
@@ -309,6 +379,8 @@ class DiffusionModel(nn.Module):
             alpha_bar = self.alpha_bar[i]
             beta = 1 - alpha
             z = torch.randn_like(xt) if i > 0 else 0
+            
+            # Update step
             xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
             xt = torch.clamp(xt, -1, 1)
         return xt
@@ -318,11 +390,13 @@ class DiffusionModel(nn.Module):
 # ============================================================================
 
 def generate_video(model, control, fingerprint, save_path):
+    """Generate a video showing the reverse diffusion process"""
     if not IMAGEIO_AVAILABLE: return
     model.model.eval()
     xt = torch.randn_like(control)
     frames = []
     
+    # Capture 40 equidistant frames
     save_steps = np.linspace(0, model.timesteps-1, 40, dtype=int)
     
     with torch.no_grad():
@@ -501,7 +575,7 @@ def main():
         avg_loss = np.mean(losses)
         print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f}")
         
-        # Log and Plot
+        # LOGGING & PLOTTING
         logger.update(epoch+1, avg_loss)
         if WANDB_AVAILABLE: wandb.log({"loss": avg_loss, "epoch": epoch+1})
 
@@ -519,6 +593,7 @@ def main():
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
 
+        # CHECKPOINTING
         if (epoch + 1) % config.save_freq == 0:
             torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1}, 
                        f"{config.output_dir}/checkpoints/latest.pt")
