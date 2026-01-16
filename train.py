@@ -94,30 +94,57 @@ class TrainingLogger:
         self.save_dir = save_dir
         self.history = {
             'epoch': [],
-            'train_loss': []
+            'train_loss': [],
+            'kl_divergence': [],
+            'mse_loss': [],
+            'psnr': [],
+            'ssim': []
         }
         self.csv_path = os.path.join(save_dir, "training_history.csv")
         self.plot_path = os.path.join(save_dir, "training_loss.png")
+        self.metrics_plot_path = os.path.join(save_dir, "training_metrics.png")
         
-    def update(self, epoch, loss):
+    def update(self, epoch, loss, metrics=None):
+        """
+        Update logger with training loss and optional metrics.
+        
+        Args:
+            epoch: Current epoch number
+            loss: Training loss (MSE)
+            metrics: Optional dict with keys like 'kl_divergence', 'psnr', 'ssim'
+        """
         # Update internal history
         self.history['epoch'].append(epoch)
         self.history['train_loss'].append(loss)
+        self.history['mse_loss'].append(loss)  # MSE is the training loss
+        
+        # Add metrics if provided
+        if metrics:
+            self.history['kl_divergence'].append(metrics.get('kl_divergence', None))
+            self.history['psnr'].append(metrics.get('psnr', None))
+            self.history['ssim'].append(metrics.get('ssim', None))
+        else:
+            self.history['kl_divergence'].append(None)
+            self.history['psnr'].append(None)
+            self.history['ssim'].append(None)
         
         # Save to CSV immediately
         df = pd.DataFrame(self.history)
         df.to_csv(self.csv_path, index=False)
         
-        # Generate Plot
-        self._plot()
+        # Generate Plots
+        self._plot_loss()
+        if metrics and any(v is not None for v in metrics.values()):
+            self._plot_metrics()
         
-    def _plot(self):
+    def _plot_loss(self):
+        """Plot training loss curve"""
         plt.figure(figsize=(10, 6))
         # Plot Loss with log scale (better for diffusion training)
         plt.plot(self.history['epoch'], self.history['train_loss'], 
                  label='MSE Loss (Proxy for KL)', color='#1f77b4', linewidth=2)
         
-        plt.title(f'DDPM Training Dynamics (Epoch {self.history["epoch"][-1]})')
+        plt.title(f'DDPM Training Loss (Epoch {self.history["epoch"][-1]})')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.yscale('log')  # Log scale is often better for diffusion loss
@@ -127,6 +154,64 @@ class TrainingLogger:
         # Save
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
+        plt.close()
+    
+    def _plot_metrics(self):
+        """Plot additional metrics (KL, PSNR, SSIM)"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Filter out None values for plotting
+        epochs = self.history['epoch']
+        
+        # KL Divergence
+        kl_values = [v for v in self.history['kl_divergence'] if v is not None]
+        kl_epochs = [epochs[i] for i, v in enumerate(self.history['kl_divergence']) if v is not None]
+        if kl_values:
+            axes[0, 0].plot(kl_epochs, kl_values, label='KL Divergence', color='#ff7f0e', linewidth=2)
+            axes[0, 0].set_title('KL Divergence')
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('KL Divergence')
+            axes[0, 0].set_yscale('log')
+            axes[0, 0].grid(True, alpha=0.2)
+            axes[0, 0].legend()
+        
+        # PSNR
+        psnr_values = [v for v in self.history['psnr'] if v is not None]
+        psnr_epochs = [epochs[i] for i, v in enumerate(self.history['psnr']) if v is not None]
+        if psnr_values:
+            axes[0, 1].plot(psnr_epochs, psnr_values, label='PSNR', color='#2ca02c', linewidth=2)
+            axes[0, 1].set_title('Peak Signal-to-Noise Ratio')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('PSNR (dB)')
+            axes[0, 1].grid(True, alpha=0.2)
+            axes[0, 1].legend()
+        
+        # SSIM
+        ssim_values = [v for v in self.history['ssim'] if v is not None]
+        ssim_epochs = [epochs[i] for i, v in enumerate(self.history['ssim']) if v is not None]
+        if ssim_values:
+            axes[1, 0].plot(ssim_epochs, ssim_values, label='SSIM', color='#d62728', linewidth=2)
+            axes[1, 0].set_title('Structural Similarity Index')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('SSIM')
+            axes[1, 0].set_ylim([0, 1])
+            axes[1, 0].grid(True, alpha=0.2)
+            axes[1, 0].legend()
+        
+        # Combined metrics view
+        axes[1, 1].plot(self.history['epoch'], self.history['train_loss'], 
+                       label='MSE Loss', color='#1f77b4', linewidth=2)
+        if kl_values:
+            axes[1, 1].plot(kl_epochs, kl_values, label='KL Divergence', color='#ff7f0e', linewidth=2)
+        axes[1, 1].set_title('Loss Metrics Comparison')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Value')
+        axes[1, 1].set_yscale('log')
+        axes[1, 1].grid(True, alpha=0.2)
+        axes[1, 1].legend()
+        
+        plt.tight_layout()
+        plt.savefig(self.metrics_plot_path, dpi=150)
         plt.close()
 
 # ============================================================================
@@ -625,6 +710,103 @@ class DiffusionModel(nn.Module):
         return xt
 
 # ============================================================================
+# METRICS CALCULATION
+# ============================================================================
+
+def calculate_kl_divergence(noise_pred, noise_true):
+    """
+    Calculate KL divergence between predicted and true noise distributions.
+    For diffusion models, this is approximated as the MSE loss scaled appropriately.
+    """
+    # KL divergence approximation: 0.5 * MSE (assuming Gaussian distributions)
+    mse = F.mse_loss(noise_pred, noise_true)
+    # More accurate KL: 0.5 * (MSE / variance) where variance is typically 1.0
+    kl = 0.5 * mse
+    return kl.item()
+
+def calculate_metrics(model, val_loader, device, num_samples=8):
+    """
+    Calculate evaluation metrics on validation set.
+    
+    Returns:
+        dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim'
+    """
+    model.model.eval()
+    metrics = {
+        'kl_divergence': [],
+        'mse': [],
+        'psnr': [],
+        'ssim': []
+    }
+    
+    # Try to import scikit-image for SSIM/PSNR
+    try:
+        from skimage.metrics import structural_similarity as ssim
+        from skimage.metrics import peak_signal_noise_ratio as psnr
+        SKIMAGE_AVAILABLE = True
+    except ImportError:
+        SKIMAGE_AVAILABLE = False
+    
+    sample_count = 0
+    with torch.no_grad():
+        for batch in val_loader:
+            if sample_count >= num_samples:
+                break
+                
+            ctrl = batch['control'].to(device)
+            real_t = batch['perturbed'].to(device)
+            fp = batch['fingerprint'].to(device)
+            
+            # Generate samples
+            generated = model.sample(ctrl, fp)
+            
+            # Calculate KL divergence (using forward pass on a sample)
+            # Sample a random timestep and compute KL
+            b = ctrl.shape[0]
+            t = torch.randint(0, model.timesteps, (b,), device=device)
+            noise = torch.randn_like(real_t)
+            xt = model.sqrt_alpha_bar[t].view(-1,1,1,1) * real_t + \
+                 model.sqrt_one_minus_alpha_bar[t].view(-1,1,1,1) * noise
+            noise_pred = model.model(xt, t, ctrl, fp)
+            kl = calculate_kl_divergence(noise_pred, noise)
+            metrics['kl_divergence'].append(kl)
+            
+            # Calculate MSE between generated and real
+            mse = F.mse_loss(generated, real_t).item()
+            metrics['mse'].append(mse)
+            
+            # Calculate PSNR and SSIM if available
+            if SKIMAGE_AVAILABLE:
+                for i in range(generated.shape[0]):
+                    # Convert to numpy [0, 255] range
+                    gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                    real_np = ((real_t[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                    
+                    # Convert to grayscale for SSIM
+                    gen_gray = np.mean(gen_np, axis=2)
+                    real_gray = np.mean(real_np, axis=2)
+                    
+                    # Calculate SSIM
+                    ssim_val = ssim(real_gray, gen_gray, data_range=255)
+                    metrics['ssim'].append(ssim_val)
+                    
+                    # Calculate PSNR
+                    psnr_val = psnr(real_np, gen_np, data_range=255)
+                    metrics['psnr'].append(psnr_val)
+            
+            sample_count += generated.shape[0]
+    
+    # Average metrics
+    result = {
+        'kl_divergence': np.mean(metrics['kl_divergence']) if metrics['kl_divergence'] else None,
+        'mse': np.mean(metrics['mse']) if metrics['mse'] else None,
+        'psnr': np.mean(metrics['psnr']) if metrics['psnr'] else None,
+        'ssim': np.mean(metrics['ssim']) if metrics['ssim'] else None
+    }
+    
+    return result
+
+# ============================================================================
 # UTILITIES
 # ============================================================================
 
@@ -828,14 +1010,26 @@ def main():
             losses.append(loss.item())
             
         avg_loss = np.mean(losses)
-        print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f}")
         
-        # LOGGING & PLOTTING
-        logger.update(epoch+1, avg_loss)
-        if WANDB_AVAILABLE: wandb.log({"loss": avg_loss, "epoch": epoch+1})
-
+        # Calculate metrics during evaluation
+        metrics = None
         if (epoch + 1) % config.eval_freq == 0:
             print("Evaluation & Visualization...")
+            print("  Calculating metrics...", flush=True)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=16)
+            
+            # Print metrics
+            print(f"  Metrics:", flush=True)
+            if metrics['kl_divergence'] is not None:
+                print(f"    KL Divergence: {metrics['kl_divergence']:.6f}", flush=True)
+            if metrics['mse'] is not None:
+                print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+            if metrics['psnr'] is not None:
+                print(f"    PSNR: {metrics['psnr']:.2f} dB", flush=True)
+            if metrics['ssim'] is not None:
+                print(f"    SSIM: {metrics['ssim']:.4f}", flush=True)
+            
+            # Visualization
             val_iter = iter(val_loader)
             batch = next(val_iter)
             ctrl = batch['control'].to(config.device)
@@ -847,6 +1041,24 @@ def main():
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
+        
+        # LOGGING & PLOTTING
+        print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f}", flush=True)
+        logger.update(epoch+1, avg_loss, metrics)
+        
+        # Log to wandb
+        if WANDB_AVAILABLE:
+            log_dict = {"loss": avg_loss, "epoch": epoch+1, "mse_loss": avg_loss}
+            if metrics:
+                if metrics['kl_divergence'] is not None:
+                    log_dict['kl_divergence'] = metrics['kl_divergence']
+                if metrics['mse'] is not None:
+                    log_dict['mse_gen_real'] = metrics['mse']
+                if metrics['psnr'] is not None:
+                    log_dict['psnr'] = metrics['psnr']
+                if metrics['ssim'] is not None:
+                    log_dict['ssim'] = metrics['ssim']
+            wandb.log(log_dict)
 
         # CHECKPOINTING
         if (epoch + 1) % config.save_freq == 0:
