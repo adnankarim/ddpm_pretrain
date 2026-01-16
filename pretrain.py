@@ -137,19 +137,22 @@ class BBBC021TrainOnlyDataset(Dataset):
     """
     Loads only images marked as 'train' in the CSV split column.
     Ignores labels/conditions.
+    Uses robust path-finding logic from train.py
     """
-    def __init__(self, data_dir, metadata_file, image_size=96, split='train'):
+    def __init__(self, data_dir, metadata_file, image_size=96, split='train', paths_csv=None):
         self.data_dir = Path(data_dir).resolve()
         self.image_size = image_size
+        self._first_load_logged = False  # Track if we've logged the first successful load
         
         # Robust CSV Loading
-        csv_path = self.data_dir / metadata_file
-        if not csv_path.exists(): csv_path = Path(metadata_file)
+        csv_full_path = os.path.join(data_dir, metadata_file)
+        if not os.path.exists(csv_full_path):
+            csv_full_path = metadata_file  # Try relative path
         
-        if not csv_path.exists():
-            raise FileNotFoundError(f"Cannot find metadata CSV at {csv_path}")
+        if not os.path.exists(csv_full_path):
+            raise FileNotFoundError(f"Cannot find metadata CSV at {csv_full_path}")
             
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_full_path)
         
         # --- STRICT SPLIT FILTERING ---
         if 'SPLIT' not in df.columns:
@@ -161,52 +164,193 @@ class BBBC021TrainOnlyDataset(Dataset):
             
         self.metadata = df.to_dict('records')
         
-        # Paths lookup (Robust File Finding)
-        self.paths_lookup = {}
-        paths_csv = self.data_dir / "paths.csv"
-        if paths_csv.exists():
-            print(f"Loading paths.csv optimization...")
-            p_df = pd.read_csv(paths_csv)
-            for _, row in p_df.iterrows():
-                # Store as string to avoid Path object issues
-                self.paths_lookup[str(row['filename'])] = str(row['relative_path'])
+        # Load paths.csv for robust file lookup (same as train.py)
+        self.paths_lookup = {}  # filename -> list of relative_paths
+        self.paths_by_rel = {}  # relative_path -> full info
+        self.paths_by_basename = {}  # basename (without extension) -> list of paths
+        
+        if paths_csv:
+            paths_csv_path = Path(paths_csv)
+        else:
+            paths_csv_path = Path("paths.csv")
+            if not paths_csv_path.exists():
+                paths_csv_path = Path(data_dir) / "paths.csv"
+        
+        if paths_csv_path.exists():
+            print(f"Loading file paths from {paths_csv_path}...")
+            paths_df = pd.read_csv(paths_csv_path)
+            
+            for _, row in paths_df.iterrows():
+                filename = str(row['filename'])  # Ensure string
+                rel_path = str(row['relative_path'])  # Ensure string
+                basename = Path(filename).stem  # filename without extension
+                
+                # Lookup by exact filename
+                if filename not in self.paths_lookup:
+                    self.paths_lookup[filename] = []
+                self.paths_lookup[filename].append(rel_path)
+                
+                # Lookup by relative path
+                self.paths_by_rel[rel_path] = row.to_dict()
+                
+                # Lookup by basename (for matching without extension)
+                if basename not in self.paths_by_basename:
+                    self.paths_by_basename[basename] = []
+                self.paths_by_basename[basename].append(rel_path)
+            
+            print(f"  Loaded {len(self.paths_lookup)} unique filenames from paths.csv")
+        else:
+            print("  Note: paths.csv not found, will use fallback path resolution")
 
-    def _find_file(self, path_str):
-        if not path_str:
+    def _find_file_path(self, path):
+        """
+        Robust file path finding using paths.csv lookup (same logic as train.py).
+        Returns Path object if found, None otherwise.
+        """
+        if not path:
             return None
-            
-        # Convert to string if it's a Path
-        path_str = str(path_str)
         
-        # 1. Try direct
-        try:
-            p = self.data_dir / path_str
-            if p.exists(): 
-                return p
-        except Exception:
-            pass
+        path_str = str(path)  # Ensure string
+        path_obj = Path(path_str)
+        filename = path_obj.name
+        basename = path_obj.stem  # filename without extension
         
-        # 2. Try adding extension
-        try:
-            p_ext = self.data_dir / (path_str + ".npy")
-            if p_ext.exists(): 
-                return p_ext
-        except Exception:
-            pass
+        # Strategy 1: Parse SAMPLE_KEY format (Week7_34681_7_3338_348.0 -> Week7/34681/7_3338_348.0.npy)
+        if '_' in path_str and path_str.startswith('Week'):
+            parts = path_str.replace('.0', '').split('_')
+            if len(parts) >= 5:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1]  # 34681
+                table_part = parts[2]  # 7
+                image_part = parts[3]  # 3338
+                object_part = parts[4]  # 348
+                
+                # Construct expected filename: table_image_object.0.npy
+                expected_filename = f"{table_part}_{image_part}_{object_part}.0.npy"
+                expected_dir = f"{week_part}/{batch_part}"
+                
+                # Try to find in paths.csv
+                if self.paths_lookup and expected_filename in self.paths_lookup:
+                    for rel_path in self.paths_lookup[expected_filename]:
+                        rel_path_str = str(rel_path)
+                        # Check if this path is in the expected directory
+                        if expected_dir in rel_path_str or f"{week_part}/{batch_part}" in rel_path_str:
+                            # Handle path resolution
+                            candidates = []
+                            if self.data_dir.name in rel_path_str:
+                                if rel_path_str.startswith(self.data_dir.name + '/'):
+                                    rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                                    candidates.append(self.data_dir / rel_path_clean)
+                                candidates.append(self.data_dir.parent / rel_path)
+                            candidates.append(Path(rel_path).resolve())
+                            candidates.append(self.data_dir / rel_path)
+                            candidates.append(self.data_dir.parent / rel_path)
+                            
+                            candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                            for candidate in candidates:
+                                if candidate.exists():
+                                    return candidate
+                
+                # Also try direct directory search
+                search_dir = self.data_dir / week_part / batch_part
+                if not search_dir.exists():
+                    search_dir = self.data_dir.parent / week_part / batch_part
+                
+                if search_dir.exists():
+                    candidate = search_dir / expected_filename
+                    if candidate.exists():
+                        return candidate
         
-        # 3. Try lookup
-        try:
-            fname = Path(path_str).name
-            if fname in self.paths_lookup:
-                rel_path = self.paths_lookup[fname]
-                # Ensure rel_path is a string
-                rel_path = str(rel_path)
-                candidate = self.data_dir / rel_path
-                if candidate.exists():
-                    return candidate
-        except Exception:
-            pass
-            
+        # Strategy 2: Search paths.csv by SAMPLE_KEY in relative_path
+        if self.paths_lookup:
+            for rel_path_key, rel_path_info in self.paths_by_rel.items():
+                if path_str in rel_path_key or path_str.replace('.0', '') in rel_path_key:
+                    rel_path = str(rel_path_info['relative_path'])
+                    candidates = []
+                    
+                    rel_path_str = str(rel_path)
+                    if self.data_dir.name in rel_path_str:
+                        if rel_path_str.startswith(self.data_dir.name + '/'):
+                            rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                            candidates.append(self.data_dir / rel_path_clean)
+                        candidates.append(self.data_dir.parent / rel_path)
+                    candidates.append(Path(rel_path).resolve())
+                    candidates.append(self.data_dir / rel_path)
+                    candidates.append(self.data_dir.parent / rel_path)
+                    
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    for candidate in candidates:
+                        if candidate.exists():
+                            return candidate
+        
+        # Strategy 3: Exact filename match in paths.csv
+        if self.paths_lookup and filename in self.paths_lookup:
+            for rel_path in self.paths_lookup[filename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Strategy 4: Basename match in paths.csv
+        if self.paths_lookup and basename in self.paths_by_basename:
+            for rel_path in self.paths_by_basename[basename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Fallback: Direct path matching
+        for candidate in [self.data_dir / path_str, self.data_dir / (path_str + '.npy')]:
+            if candidate.exists():
+                return candidate
+        
+        # Last resort: Recursive search
+        search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
+        matches = list(self.data_dir.rglob(search_pattern))
+        if matches:
+            return matches[0]
+        
+        # Also try recursive search for SAMPLE_KEY in directory structure
+        if '_' in path_str:
+            parts = path_str.split('_')
+            if len(parts) >= 2:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1] if len(parts) > 1 else None  # 34681
+                
+                if batch_part:
+                    search_dir = self.data_dir / week_part / batch_part
+                    if search_dir.exists():
+                        search_pattern = path_str if path_str.endswith('.npy') else path_str + '.npy'
+                        matches = list(search_dir.rglob(search_pattern))
+                        if matches:
+                            return matches[0]
+        
         return None
 
     def __len__(self):
@@ -214,48 +358,77 @@ class BBBC021TrainOnlyDataset(Dataset):
 
     def __getitem__(self, idx):
         meta = self.metadata[idx]
-        path_str = meta.get('image_path') or meta.get('SAMPLE_KEY')
+        path = meta.get('image_path') or meta.get('SAMPLE_KEY')
         
-        if not path_str:
+        if not path:
             raise ValueError(
                 f"CRITICAL: No image path found in metadata!\n"
                 f"  Index: {idx}\n"
                 f"  Metadata keys: {list(meta.keys())}"
             )
         
-        full_path = self._find_file(path_str)
+        # Use robust path finding (same as train.py)
+        full_path = self._find_file_path(path)
         
+        # CRITICAL: Check if file exists before attempting to load
         if full_path is None or not full_path.exists():
             raise FileNotFoundError(
                 f"CRITICAL: Image file not found!\n"
                 f"  Index: {idx}\n"
-                f"  Path from metadata: {path_str}\n"
+                f"  Path from metadata: {path}\n"
                 f"  Data directory: {self.data_dir}\n"
                 f"  Data directory exists: {self.data_dir.exists()}\n"
                 f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
             )
-
+            
         try:
+            # Get file size before loading
+            file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
+            
             img = np.load(str(full_path))  # Convert Path to string for np.load
+            original_shape = img.shape
+            original_dtype = img.dtype
+            original_min = float(img.min())
+            original_max = float(img.max())
+            
+            # Handle [H, W, C] -> [C, H, W]
             if img.ndim == 3 and img.shape[-1] == 3: 
                 img = img.transpose(2, 0, 1)
             img = torch.from_numpy(img).float()
             
-            # Normalize to [-1, 1]
-            if img.max() > 1.0:
+            # Normalize [0, 255] or [0, 1] -> [-1, 1]
+            if img.max() > 1.0: 
                 img = (img / 127.5) - 1.0
             else:
                 img = (img * 2.0) - 1.0
                 
-            return torch.clamp(img, -1, 1)
+            img = torch.clamp(img, -1, 1)
             
+            # Log details for first successful load (or first few)
+            if not self._first_load_logged or idx < 3:
+                print(f"\n{'='*60}", flush=True)
+                print(f"✓ Successfully loaded image #{idx}", flush=True)
+                print(f"{'='*60}", flush=True)
+                print(f"  File path: {full_path}", flush=True)
+                print(f"  File size: {file_size_bytes:,} bytes ({file_size_bytes / 1024:.2f} KB)", flush=True)
+                print(f"  Original shape: {original_shape} (dtype: {original_dtype})", flush=True)
+                print(f"  Original range: [{original_min:.2f}, {original_max:.2f}]", flush=True)
+                print(f"  Processed shape: {img.shape} (dtype: {img.dtype})", flush=True)
+                print(f"  Processed range: [{img.min():.2f}, {img.max():.2f}]", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                if idx >= 3:
+                    self._first_load_logged = True
+                    
         except Exception as e:
+            # Show the actual error instead of silently failing
             raise RuntimeError(
                 f"CRITICAL: Failed to load image file!\n"
                 f"  Index: {idx}\n"
                 f"  File path: {full_path}\n"
                 f"  Original error: {type(e).__name__}: {str(e)}"
             ) from e
+        
+        return img
 
 # ============================================================================
 # ARCHITECTURE (MODERN U-NET)
