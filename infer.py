@@ -545,14 +545,34 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         if paths_lookup:
             if filename in paths_lookup:
                 for rel_path in paths_lookup[filename]:
-                    # Handle relative_path - it might be relative to current dir or data_dir
-                    # Try both: data_dir/rel_path and just rel_path
-                    candidates = [
-                        data_dir_path / rel_path,
-                        Path(rel_path),
-                        data_dir_path.parent / rel_path if data_dir_path.name in str(rel_path) else None
-                    ]
-                    candidates = [c for c in candidates if c is not None]
+                    # Handle relative_path - paths.csv has paths like "bbbc021_all/Week9/..."
+                    # If data_dir is "./data/bbbc021_all", we need to handle this correctly
+                    rel_path_str = str(rel_path)
+                    
+                    # Try multiple path combinations
+                    candidates = []
+                    
+                    # 1. If rel_path starts with data_dir name, use it relative to parent
+                    if data_dir_path.name in rel_path_str:
+                        # Remove data_dir name from start of rel_path
+                        if rel_path_str.startswith(data_dir_path.name + '/'):
+                            rel_path_clean = rel_path_str[len(data_dir_path.name) + 1:]
+                            candidates.append(data_dir_path / rel_path_clean)
+                        # Or use parent directory
+                        candidates.append(data_dir_path.parent / rel_path)
+                    
+                    # 2. Try as absolute path from current directory
+                    candidates.append(Path(rel_path).resolve())
+                    
+                    # 3. Try relative to data_dir
+                    candidates.append(data_dir_path / rel_path)
+                    
+                    # 4. Try relative to data_dir parent
+                    candidates.append(data_dir_path.parent / rel_path)
+                    
+                    # Remove duplicates and None
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    
                     for candidate in candidates:
                         if candidate.exists():
                             if debug:
@@ -560,14 +580,26 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
                             return candidate
                     if debug:
                         print(f"      Tried {len(candidates)} candidates for filename {filename}, none found")
+                        if len(candidates) <= 3:
+                            for c in candidates:
+                                print(f"        - {c} (exists: {c.exists()})")
             if basename in paths_by_basename:
                 for rel_path in paths_by_basename[basename]:
-                    candidates = [
-                        data_dir_path / rel_path,
-                        Path(rel_path),
-                        data_dir_path.parent / rel_path if data_dir_path.name in str(rel_path) else None
-                    ]
-                    candidates = [c for c in candidates if c is not None]
+                    rel_path_str = str(rel_path)
+                    candidates = []
+                    
+                    if data_dir_path.name in rel_path_str:
+                        if rel_path_str.startswith(data_dir_path.name + '/'):
+                            rel_path_clean = rel_path_str[len(data_dir_path.name) + 1:]
+                            candidates.append(data_dir_path / rel_path_clean)
+                        candidates.append(data_dir_path.parent / rel_path)
+                    
+                    candidates.append(Path(rel_path).resolve())
+                    candidates.append(data_dir_path / rel_path)
+                    candidates.append(data_dir_path.parent / rel_path)
+                    
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    
                     for candidate in candidates:
                         if candidate.exists():
                             if debug:
