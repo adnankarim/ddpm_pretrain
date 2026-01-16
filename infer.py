@@ -543,6 +543,31 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         
         # Try paths.csv lookup
         if paths_lookup:
+            # First, try searching for SAMPLE_KEY in relative_path (not just filename)
+            # SAMPLE_KEY like "Week7_34681_7_3338_348.0" might be in path like "bbbc021_all/Week7/34681/Week7_34681_7_3338_348.0.npy"
+            for rel_path_key, rel_path_info in paths_by_rel.items():
+                if path in rel_path_key or path.replace('.0', '') in rel_path_key:
+                    rel_path = rel_path_info['relative_path']
+                    candidates = []
+                    
+                    # Handle path resolution
+                    rel_path_str = str(rel_path)
+                    if data_dir_path.name in rel_path_str:
+                        if rel_path_str.startswith(data_dir_path.name + '/'):
+                            rel_path_clean = rel_path_str[len(data_dir_path.name) + 1:]
+                            candidates.append(data_dir_path / rel_path_clean)
+                        candidates.append(data_dir_path.parent / rel_path)
+                    candidates.append(Path(rel_path).resolve())
+                    candidates.append(data_dir_path / rel_path)
+                    candidates.append(data_dir_path.parent / rel_path)
+                    
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    for candidate in candidates:
+                        if candidate.exists():
+                            if debug:
+                                print(f"      Found via SAMPLE_KEY in path: {candidate}")
+                            return candidate
+            
             if filename in paths_lookup:
                 for rel_path in paths_lookup[filename]:
                     # Handle relative_path - paths.csv has paths like "bbbc021_all/Week9/..."
@@ -615,14 +640,35 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
                     print(f"      Found via direct path: {candidate}")
                 return candidate
         
-        # Last resort: recursive search by filename
+        # Last resort: recursive search by filename or SAMPLE_KEY
         if paths_lookup:
+            # Try with .npy extension
             search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
             matches = list(data_dir_path.rglob(search_pattern))
             if matches:
                 if debug:
-                    print(f"      Found via recursive search: {matches[0]}")
+                    print(f"      Found via recursive search (filename): {matches[0]}")
                 return matches[0]
+            
+            # Try searching for SAMPLE_KEY in directory structure
+            # SAMPLE_KEY format: Week7_34681_7_3338_348.0 -> might be in Week7/34681/ directory
+            if '_' in path:
+                parts = path.split('_')
+                if len(parts) >= 2:
+                    # Extract week and batch number: Week7_34681 -> Week7, 34681
+                    week_part = parts[0]  # Week7
+                    batch_part = parts[1] if len(parts) > 1 else None  # 34681
+                    
+                    if batch_part:
+                        # Search in Week7/34681/ directory
+                        search_dir = data_dir_path / week_part / batch_part
+                        if search_dir.exists():
+                            search_pattern = path if path.endswith('.npy') else path + '.npy'
+                            matches = list(search_dir.rglob(search_pattern))
+                            if matches:
+                                if debug:
+                                    print(f"      Found via directory search ({week_part}/{batch_part}): {matches[0]}")
+                                return matches[0]
         
         if debug:
             print(f"      No file found for: {path}")
