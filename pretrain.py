@@ -589,8 +589,23 @@ def main():
     print(f"{'='*60}")
     
     # Load ONLY Train Split
-    dataset = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train')
+    dataset = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train', paths_csv=None)
     print(f"Training Images: {len(dataset):,}")
+    
+    # Log paths.csv status
+    print(f"\n{'='*60}", flush=True)
+    print(f"File Path Resolution Status:", flush=True)
+    print(f"{'='*60}", flush=True)
+    if len(dataset.paths_lookup) > 0:
+        print(f"  ✓ paths.csv loaded successfully", flush=True)
+        print(f"  - Unique filenames in lookup: {len(dataset.paths_lookup):,}", flush=True)
+        print(f"  - Total paths indexed: {len(dataset.paths_by_rel):,}", flush=True)
+        print(f"  - Basename lookups: {len(dataset.paths_by_basename):,}", flush=True)
+    else:
+        print(f"  ⚠ paths.csv not found - using fallback path resolution", flush=True)
+    print(f"  - Data directory: {dataset.data_dir}", flush=True)
+    print(f"  - Data directory exists: {dataset.data_dir.exists()}", flush=True)
+    print(f"{'='*60}\n", flush=True)
     
     # Save a random dataset sample image
     print("\nSaving random dataset sample image...", flush=True)
