@@ -132,6 +132,22 @@ class TrainingLogger:
         df = pd.DataFrame(self.history)
         df.to_csv(self.csv_path, index=False)
         
+        # Also save metrics to a separate file for easy tracking (only when metrics exist)
+        if metrics and any(v is not None for v in metrics.values()):
+            metrics_df = pd.DataFrame([{
+                'epoch': epoch,
+                'kl_divergence': metrics.get('kl_divergence'),
+                'mse_gen_real': metrics.get('mse'),
+                'psnr': metrics.get('psnr'),
+                'ssim': metrics.get('ssim')
+            }])
+            metrics_csv = os.path.join(self.save_dir, "evaluation_metrics.csv")
+            # Append to file if it exists, otherwise create new
+            if os.path.exists(metrics_csv):
+                metrics_df.to_csv(metrics_csv, mode='a', header=False, index=False)
+            else:
+                metrics_df.to_csv(metrics_csv, index=False)
+        
         # Generate Plots
         self._plot_loss()
         if metrics and any(v is not None for v in metrics.values()):
@@ -1014,20 +1030,28 @@ def main():
         # Calculate metrics during evaluation
         metrics = None
         if (epoch + 1) % config.eval_freq == 0:
-            print("Evaluation & Visualization...")
-            print("  Calculating metrics...", flush=True)
+            print("\n" + "="*60, flush=True)
+            print(f"EVALUATION (Epoch {epoch+1})", flush=True)
+            print("="*60, flush=True)
+            print("  Calculating metrics on validation set...", flush=True)
             metrics = calculate_metrics(model, val_loader, config.device, num_samples=16)
             
-            # Print metrics
-            print(f"  Metrics:", flush=True)
+            # Print metrics prominently
+            print(f"\n  📊 EVALUATION METRICS:", flush=True)
+            print(f"  {'-'*58}", flush=True)
             if metrics['kl_divergence'] is not None:
-                print(f"    KL Divergence: {metrics['kl_divergence']:.6f}", flush=True)
+                print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
             if metrics['mse'] is not None:
                 print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
             if metrics['psnr'] is not None:
-                print(f"    PSNR: {metrics['psnr']:.2f} dB", flush=True)
+                print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
             if metrics['ssim'] is not None:
-                print(f"    SSIM: {metrics['ssim']:.4f}", flush=True)
+                print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+            print(f"  {'-'*58}", flush=True)
+            print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
+            print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
+            print(f"  ✓ Metrics plot: {logger.metrics_plot_path}", flush=True)
+            print("="*60 + "\n", flush=True)
             
             # Visualization
             val_iter = iter(val_loader)
