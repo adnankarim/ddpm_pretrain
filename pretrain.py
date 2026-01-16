@@ -46,6 +46,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+try:
+    import imageio
+    IMAGEIO_AVAILABLE = True
+except ImportError:
+    IMAGEIO_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -252,6 +258,7 @@ class UnconditionalDiffusion(nn.Module):
 
     @torch.no_grad()
     def sample(self, num_samples=16):
+        """Generate samples using reverse diffusion"""
         self.model.eval()
         xt = torch.randn(num_samples, 3, self.cfg.image_size, self.cfg.image_size).to(self.cfg.device)
         
@@ -271,6 +278,63 @@ class UnconditionalDiffusion(nn.Module):
             xt = torch.clamp(xt, -1, 1)
             
         return xt
+    
+    @torch.no_grad()
+    def sample_trajectory(self, num_samples=1, num_frames=60):
+        """
+        Generate samples and return frames showing the reverse diffusion process.
+        Useful for creating videos.
+        """
+        self.model.eval()
+        xt = torch.randn(num_samples, 3, self.cfg.image_size, self.cfg.image_size).to(self.cfg.device)
+        frames = []
+        
+        # Capture frames at equidistant timesteps
+        save_steps = np.linspace(0, self.timesteps-1, num_frames, dtype=int)
+        
+        for i in reversed(range(self.timesteps)):
+            t = torch.full((num_samples,), i, device=self.cfg.device, dtype=torch.long)
+            
+            # Predict noise
+            noise_pred = self.model(xt, t).sample
+            
+            # Step
+            alpha = 1 - torch.linspace(self.cfg.beta_start, self.cfg.beta_end, self.timesteps).to(self.cfg.device)[i]
+            alpha_bar = self.alpha_bar[i]
+            beta = 1 - alpha
+            z = torch.randn_like(xt) if i > 0 else 0
+            
+            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
+            xt = torch.clamp(xt, -1, 1)
+            
+            # Save frame if at a capture point
+            if i in save_steps or i == 0:
+                img_np = ((xt[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                frames.append(img_np)
+        
+        return frames
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def generate_video(model, save_path, num_frames=60):
+    """Generate a video showing the reverse diffusion process"""
+    if not IMAGEIO_AVAILABLE:
+        print("Warning: imageio not available. Skipping video generation.")
+        return
+    
+    try:
+        print(f"  Generating diffusion video...", flush=True)
+        frames = model.sample_trajectory(num_samples=1, num_frames=num_frames)
+        
+        if frames:
+            imageio.mimsave(save_path, frames, fps=10)
+            print(f"  ✓ Video saved to: {save_path}", flush=True)
+        else:
+            print(f"  ✗ Failed to generate video frames", flush=True)
+    except Exception as e:
+        print(f"  ✗ Error generating video: {e}", flush=True)
 
 # ============================================================================
 # MAIN
@@ -297,6 +361,35 @@ def main():
     # Load ONLY Train Split
     dataset = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train')
     print(f"Training Images: {len(dataset):,}")
+    
+    # Save a random dataset sample image
+    print("\nSaving random dataset sample image...", flush=True)
+    try:
+        import random
+        random_idx = random.randint(0, len(dataset) - 1)
+        sample_img = dataset[random_idx]
+        
+        # Convert tensor to numpy image
+        if isinstance(sample_img, torch.Tensor):
+            img_tensor = sample_img
+        else:
+            img_tensor = sample_img['image'] if isinstance(sample_img, dict) else sample_img
+        
+        img_np = ((img_tensor.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
+        img_np = np.clip(img_np, 0, 255)
+        
+        img_pil = Image.fromarray(img_np)
+        sample_filename = f"pretrain_dataset_sample.jpg"
+        absolute_path = os.path.abspath(sample_filename)
+        img_pil.save(absolute_path, "JPEG", quality=95)
+        print(f"  ✓ Saved random sample to: {absolute_path}", flush=True)
+        print(f"  (Current working directory: {os.getcwd()})", flush=True)
+        print(f"  Image shape: {img_tensor.shape}", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Warning: Could not save sample image: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
     
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
@@ -340,9 +433,21 @@ def main():
         
         # Evaluation
         if (epoch + 1) % config.eval_freq == 0:
-            print("Generating Random Samples...")
+            print("\n" + "="*60, flush=True)
+            print(f"EVALUATION (Epoch {epoch+1})", flush=True)
+            print("="*60, flush=True)
+            
+            print("  Generating sample grid...", flush=True)
             samples = model.sample(num_samples=16)
-            save_image(samples, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=4, normalize=True, value_range=(-1, 1))
+            grid_path = f"{config.output_dir}/plots/epoch_{epoch+1}.png"
+            save_image(samples, grid_path, nrow=4, normalize=True, value_range=(-1, 1))
+            print(f"  ✓ Sample grid saved to: {grid_path}", flush=True)
+            
+            # Generate video
+            video_path = f"{config.output_dir}/plots/video_{epoch+1}.mp4"
+            generate_video(model, video_path, num_frames=60)
+            
+            print("="*60 + "\n", flush=True)
             
         # Checkpointing
         if (epoch + 1) % config.save_freq == 0:
