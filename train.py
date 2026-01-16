@@ -98,14 +98,15 @@ class TrainingLogger:
             'kl_divergence': [],
             'mse_loss': [],
             'psnr': [],
-            'ssim': []
+            'ssim': [],
+            'learning_rate': []
         }
         self.csv_path = os.path.join(save_dir, "training_history.csv")
         self.plot_path = os.path.join(save_dir, "training_loss.png")
         self.metrics_plot_path = os.path.join(save_dir, "training_metrics.png")
         self.metrics_csv_path = os.path.join(save_dir, "evaluation_metrics.csv")
         
-    def update(self, epoch, loss, metrics=None):
+    def update(self, epoch, loss, metrics=None, lr=None):
         """
         Update logger with training loss and optional metrics.
         
@@ -113,11 +114,13 @@ class TrainingLogger:
             epoch: Current epoch number
             loss: Training loss (MSE)
             metrics: Optional dict with keys like 'kl_divergence', 'psnr', 'ssim'
+            lr: Current learning rate
         """
         # Update internal history
         self.history['epoch'].append(epoch)
         self.history['train_loss'].append(loss)
         self.history['mse_loss'].append(loss)  # MSE is the training loss
+        self.history['learning_rate'].append(lr if lr is not None else 0)
         
         # Add metrics if provided
         if metrics:
@@ -155,20 +158,30 @@ class TrainingLogger:
             self._plot_metrics()
         
     def _plot_loss(self):
-        """Plot training loss curve"""
-        plt.figure(figsize=(10, 6))
-        # Plot Loss with log scale (better for diffusion training)
-        plt.plot(self.history['epoch'], self.history['train_loss'], 
-                 label='MSE Loss (Proxy for KL)', color='#1f77b4', linewidth=2)
+        """Plot training loss curve with learning rate"""
+        fig, ax1 = plt.subplots(figsize=(12, 6))
         
-        plt.title(f'DDPM Training Loss (Epoch {self.history["epoch"][-1]})')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.yscale('log')  # Log scale is often better for diffusion loss
-        plt.grid(True, which="both", ls="-", alpha=0.2)
-        plt.legend()
+        # Loss on left y-axis
+        color = '#1f77b4'
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('MSE Loss (Proxy for KL)', color=color)
+        line1 = ax1.plot(self.history['epoch'], self.history['train_loss'], 
+                        label='MSE Loss', color=color, linewidth=2)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_yscale('log')  # Log scale is often better for diffusion loss
+        ax1.grid(True, which="both", ls="-", alpha=0.2)
         
-        # Save
+        # Learning rate on right y-axis
+        if any(lr > 0 for lr in self.history['learning_rate']):
+            ax2 = ax1.twinx()
+            color2 = '#ff7f0e'
+            ax2.set_ylabel('Learning Rate', color=color2)
+            line2 = ax2.plot(self.history['epoch'], self.history['learning_rate'], 
+                            label='Learning Rate', color=color2, linewidth=2, linestyle='--')
+            ax2.tick_params(axis='y', labelcolor=color2)
+            ax2.set_yscale('log')
+        
+        plt.title(f'DDPM Training Loss & Learning Rate (Epoch {self.history["epoch"][-1]})')
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
@@ -857,12 +870,14 @@ def generate_video(model, control, fingerprint, save_path):
     final_frames = [np.concatenate([f, ctrl_np], axis=1) for f in frames]
     imageio.mimsave(save_path, final_frames, fps=10)
 
-def load_checkpoint(model, optimizer, path):
+def load_checkpoint(model, optimizer, path, scheduler=None):
     if not os.path.exists(path): return 0
     print(f"Loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=model.cfg.device)
     model.load_state_dict(ckpt['model'])
     optimizer.load_state_dict(ckpt['optimizer'])
+    if scheduler is not None and 'scheduler' in ckpt:
+        scheduler.load_state_dict(ckpt['scheduler'])
     return ckpt['epoch']
 
 # ============================================================================
@@ -993,21 +1008,31 @@ def main():
 
     print(f"Initializing Modified Diffusers U-Net...")
     model = DiffusionModel(config)
-    optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr)
+    optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr, weight_decay=0.01)
+    
+    # Learning Rate Scheduler - Cosine Annealing (recommended for diffusion models)
+    # Gradually reduces LR from initial to near-zero over training
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.epochs,  # Full training cycle
+        eta_min=1e-6  # Minimum learning rate
+    )
 
     # Load checkpoint
     checkpoint_path = args.checkpoint if args.checkpoint else f"{config.output_dir}/checkpoints/latest.pt"
     if args.resume or args.checkpoint:
-        start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
             print(f"Resuming training from epoch {start_epoch+1}...")
+            print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
             print(f"Starting training from epoch 1 (checkpoint not found or empty)...")
     else:
         # Only auto-load if checkpoint exists
-        start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
             print(f"Found checkpoint, resuming from epoch {start_epoch+1}...")
+            print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
             print(f"Starting training from epoch 1...")
 
@@ -1067,13 +1092,22 @@ def main():
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
         
+        # Step scheduler
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
         # LOGGING & PLOTTING
-        print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f}", flush=True)
-        logger.update(epoch+1, avg_loss, metrics)
+        print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f} | LR: {current_lr:.2e}", flush=True)
+        logger.update(epoch+1, avg_loss, metrics, current_lr)
         
         # Log to wandb
         if WANDB_AVAILABLE:
-            log_dict = {"loss": avg_loss, "epoch": epoch+1, "mse_loss": avg_loss}
+            log_dict = {
+                "loss": avg_loss, 
+                "epoch": epoch+1, 
+                "mse_loss": avg_loss,
+                "learning_rate": current_lr
+            }
             if metrics:
                 if metrics['kl_divergence'] is not None:
                     log_dict['kl_divergence'] = metrics['kl_divergence']
@@ -1087,8 +1121,13 @@ def main():
 
         # CHECKPOINTING
         if (epoch + 1) % config.save_freq == 0:
-            torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': epoch+1}, 
-                       f"{config.output_dir}/checkpoints/latest.pt")
+            torch.save({
+                'model': model.state_dict(), 
+                'optimizer': optimizer.state_dict(), 
+                'scheduler': scheduler.state_dict(),
+                'epoch': epoch+1
+            }, f"{config.output_dir}/checkpoints/latest.pt")
+            print(f"Checkpoint Saved. (LR: {current_lr:.2e})", flush=True)
 
 if __name__ == "__main__":
     main()
