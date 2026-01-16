@@ -526,33 +526,74 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         video_indices = set(np.linspace(0, num_samples - 1, num_videos, dtype=int))
         print(f"Will generate videos for {num_videos} samples (indices: {sorted(video_indices)})")
     
-    def find_file_path(row):
+    def find_file_path(row, debug=False):
         """Find file path using paths.csv lookup"""
         path = row.get('image_path') or row.get('SAMPLE_KEY')
         if not path:
+            if debug:
+                print(f"      No path in row: {row.get('CPD_NAME', 'unknown')}")
             return None
         
         path_obj = Path(path)
         filename = path_obj.name
         basename = path_obj.stem
         
+        if debug:
+            print(f"      Looking for: path={path}, filename={filename}, basename={basename}")
+        
         # Try paths.csv lookup
         if paths_lookup:
             if filename in paths_lookup:
                 for rel_path in paths_lookup[filename]:
-                    candidate = data_dir_path / rel_path
-                    if candidate.exists():
-                        return candidate
+                    # Handle relative_path - it might be relative to current dir or data_dir
+                    # Try both: data_dir/rel_path and just rel_path
+                    candidates = [
+                        data_dir_path / rel_path,
+                        Path(rel_path),
+                        data_dir_path.parent / rel_path if data_dir_path.name in str(rel_path) else None
+                    ]
+                    candidates = [c for c in candidates if c is not None]
+                    for candidate in candidates:
+                        if candidate.exists():
+                            if debug:
+                                print(f"      Found via filename match: {candidate}")
+                            return candidate
+                    if debug:
+                        print(f"      Tried {len(candidates)} candidates for filename {filename}, none found")
             if basename in paths_by_basename:
                 for rel_path in paths_by_basename[basename]:
-                    candidate = data_dir_path / rel_path
-                    if candidate.exists():
-                        return candidate
+                    candidates = [
+                        data_dir_path / rel_path,
+                        Path(rel_path),
+                        data_dir_path.parent / rel_path if data_dir_path.name in str(rel_path) else None
+                    ]
+                    candidates = [c for c in candidates if c is not None]
+                    for candidate in candidates:
+                        if candidate.exists():
+                            if debug:
+                                print(f"      Found via basename match: {candidate}")
+                            return candidate
+                    if debug:
+                        print(f"      Tried {len(candidates)} candidates for basename {basename}, none found")
         
-        # Fallback
+        # Fallback - try direct path matching
         for candidate in [data_dir_path / path, data_dir_path / (path + '.npy')]:
             if candidate.exists():
+                if debug:
+                    print(f"      Found via direct path: {candidate}")
                 return candidate
+        
+        # Last resort: recursive search by filename
+        if paths_lookup:
+            search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
+            matches = list(data_dir_path.rglob(search_pattern))
+            if matches:
+                if debug:
+                    print(f"      Found via recursive search: {matches[0]}")
+                return matches[0]
+        
+        if debug:
+            print(f"      No file found for: {path}")
         return None
     
     def load_image_file(file_path):
@@ -577,10 +618,11 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         
         try:
             # Find target file
-            target_path = find_file_path(row)
+            target_path = find_file_path(row, debug=(failed < 3))  # Debug first 3 failures
             if target_path is None:
-                if failed < 5:  # Print first few failures for debugging
+                if failed < 3:  # Print first few failures for debugging
                     print(f"    Failed to find target file for sample {idx}: {row.get('CPD_NAME', 'unknown')}")
+                    print(f"      Row path fields: image_path={row.get('image_path', 'N/A')}, SAMPLE_KEY={row.get('SAMPLE_KEY', 'N/A')}")
                 failed += 1
                 continue
             
