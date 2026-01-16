@@ -374,6 +374,60 @@ def main():
     val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder)
     if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder)
 
+    # Print dataset details
+    print(f"\n{'='*60}")
+    print(f"Dataset Details:")
+    print(f"{'='*60}")
+    print(f"Train split: {len(train_ds)} samples")
+    print(f"Val/Test split: {len(val_ds)} samples")
+    print(f"Total samples: {len(train_ds) + len(val_ds)}")
+    
+    # Count compounds
+    train_compounds = len(set([m['CPD_NAME'] for m in train_ds.metadata]))
+    val_compounds = len(set([m['CPD_NAME'] for m in val_ds.metadata]))
+    print(f"Train compounds: {train_compounds}")
+    print(f"Val/Test compounds: {val_compounds}")
+    
+    # Count batches
+    train_batches = len(set([m['BATCH'] for m in train_ds.metadata]))
+    val_batches = len(set([m['BATCH'] for m in val_ds.metadata]))
+    print(f"Train batches: {train_batches}")
+    print(f"Val/Test batches: {val_batches}")
+    
+    # Count DMSO vs perturbed
+    train_dmso = sum([1 for m in train_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
+    train_perturbed = len(train_ds.metadata) - train_dmso
+    val_dmso = sum([1 for m in val_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
+    val_perturbed = len(val_ds.metadata) - val_dmso
+    print(f"Train - DMSO: {train_dmso}, Perturbed: {train_perturbed}")
+    print(f"Val/Test - DMSO: {val_dmso}, Perturbed: {val_perturbed}")
+    print(f"{'='*60}\n")
+
+    # Save a random dataset image as JPG
+    print("Saving random dataset sample image...")
+    try:
+        import random
+        from PIL import Image
+        
+        # Get a random sample from train dataset
+        random_idx = random.randint(0, len(train_ds) - 1)
+        sample = train_ds[random_idx]
+        
+        # Convert tensor to numpy image
+        img_tensor = sample['image']  # Shape: [3, H, W], range [-1, 1]
+        img_np = ((img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+        img_np = np.clip(img_np, 0, 255)
+        
+        # Save as JPG
+        img_pil = Image.fromarray(img_np)
+        sample_filename = f"dataset_sample_{sample['compound'].replace('/', '_')}.jpg"
+        img_pil.save(sample_filename, "JPEG", quality=95)
+        print(f"  Saved random sample to: {sample_filename}")
+        print(f"  Compound: {sample['compound']}")
+        print(f"  Image shape: {img_tensor.shape}")
+    except Exception as e:
+        print(f"  Warning: Could not save sample image: {e}")
+
     train_loader = PairedDataLoader(train_ds, config.batch_size, shuffle=True)
     val_loader = PairedDataLoader(val_ds, batch_size=8, shuffle=True)
 
