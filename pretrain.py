@@ -548,23 +548,52 @@ class UnconditionalDiffusion(nn.Module):
 # UTILITIES
 # ============================================================================
 
-def generate_video(model, save_path, num_frames=60):
-    """Generate a video showing the reverse diffusion process"""
+def generate_video(model, dataset, save_path, num_frames=60):
+    """
+    Generate a video showing the reverse diffusion process.
+    Shows: [Generated (changing)] | [Real Ground Truth from dataset]
+    """
     if not IMAGEIO_AVAILABLE:
         print("Warning: imageio not available. Skipping video generation.")
         return
     
     try:
         print(f"  Generating diffusion video...", flush=True)
+        
+        # Get a random real image from dataset for comparison
+        import random
+        random_idx = random.randint(0, len(dataset) - 1)
+        real_img_tensor = dataset[random_idx]  # This is already normalized to [-1, 1]
+        
+        # Convert real image to numpy [0, 255]
+        if isinstance(real_img_tensor, torch.Tensor):
+            real_img_np = ((real_img_tensor.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
+        else:
+            real_img_np = ((real_img_tensor['image'].permute(1, 2, 0).cpu().numpy() + 1) * 127.5).astype(np.uint8)
+        real_img_np = np.clip(real_img_np, 0, 255)
+        
+        # Generate diffusion trajectory frames
         frames = model.sample_trajectory(num_samples=1, num_frames=num_frames)
         
         if frames:
-            imageio.mimsave(save_path, frames, fps=10)
+            # Create separator line
+            separator = np.zeros((model.cfg.image_size, 2, 3), dtype=np.uint8)
+            
+            # Stitch frames together: [Generated] | [Real]
+            final_frames = []
+            for frame in frames:
+                combined = np.hstack([frame, separator, real_img_np])
+                final_frames.append(combined)
+            
+            imageio.mimsave(save_path, final_frames, fps=10)
             print(f"  ✓ Video saved to: {save_path}", flush=True)
+            print(f"  Layout: [Generated (changing)] | [Real Ground Truth]", flush=True)
         else:
             print(f"  ✗ Failed to generate video frames", flush=True)
     except Exception as e:
         print(f"  ✗ Error generating video: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
 # ============================================================================
 # MAIN
