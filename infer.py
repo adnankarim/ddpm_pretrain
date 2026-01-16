@@ -38,10 +38,13 @@ class ModifiedDiffusersUNet(nn.Module):
     def __init__(self, image_size=96, fingerprint_dim=1024):
         super().__init__()
         # Load base with default architecture (matches training script)
+        # Use ignore_mismatched_sizes since we'll load our own checkpoint anyway
         self.unet = UNet2DModel.from_pretrained(
             "google/ddpm-cifar10-32",
             sample_size=image_size,
-            class_embed_type="identity"
+            class_embed_type="identity",
+            ignore_mismatched_sizes=True,
+            low_cpu_mem_usage=False
         )
         
         # Re-apply 3 -> 6 channel surgery
@@ -220,7 +223,12 @@ def main():
     print(f"Loading model from {args.checkpoint_path}...")
     model = DiffusionModel(config)
     checkpoint = torch.load(args.checkpoint_path, map_location=config.device)
-    model.load_state_dict(checkpoint['model'])
+    # Use strict=False to allow partial loading if architecture differs
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys when loading checkpoint: {len(missing_keys)} keys")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
     model.eval()
     
     # 2. Load Data
