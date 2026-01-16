@@ -381,6 +381,69 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
 # BATCH EVALUATION
 # ============================================================================
 
+def calculate_fid(real_images, generated_images, device='cuda'):
+    """
+    Calculate Fréchet Inception Distance (FID) between real and generated images.
+    
+    Args:
+        real_images: Tensor of real images [N, 3, H, W] in range [-1, 1]
+        generated_images: Tensor of generated images [N, 3, H, W] in range [-1, 1]
+        device: Device to run computation on
+    
+    Returns:
+        FID score
+    """
+    try:
+        from torchvision.models import inception_v3
+        from scipy import linalg
+        TORCHVISION_AVAILABLE = True
+    except ImportError:
+        return None
+    
+    # Load Inception v3 model
+    inception = inception_v3(pretrained=True, transform_input=False).to(device)
+    inception.eval()
+    inception.fc = nn.Identity()  # Remove final classification layer
+    
+    def get_inception_features(images):
+        """Extract features from Inception network"""
+        # Resize to 299x299 for Inception v3
+        images_resized = F.interpolate(images, size=(299, 299), mode='bilinear', align_corners=False)
+        # Convert from [-1, 1] to [0, 1] then to [0, 255] for Inception
+        images_resized = (images_resized + 1) / 2.0  # [-1, 1] -> [0, 1]
+        images_resized = images_resized * 255.0  # [0, 1] -> [0, 255]
+        images_resized = images_resized.clamp(0, 255)
+        
+        with torch.no_grad():
+            features = inception(images_resized)
+        return features.cpu().numpy()
+    
+    # Extract features
+    print("  Computing FID: Extracting Inception features for real images...")
+    real_features = get_inception_features(real_images)
+    
+    print("  Computing FID: Extracting Inception features for generated images...")
+    gen_features = get_inception_features(generated_images)
+    
+    # Calculate mean and covariance
+    mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+    mu2, sigma2 = gen_features.mean(axis=0), np.cov(gen_features, rowvar=False)
+    
+    # Calculate sum squared difference between means
+    ssdiff = np.sum((mu1 - mu2) ** 2.0)
+    
+    # Calculate sqrt of product between cov
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
+    
+    # Check and correct imaginary numbers from sqrt
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    
+    # Calculate FID
+    fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    
+    return fid
+
 def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results"):
     """
     Evaluate model on multiple samples and compute metrics.
@@ -440,6 +503,8 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
             paths_by_basename[basename].append(rel_path)
     
     results = []
+    real_images_list = []  # For FID calculation
+    generated_images_list = []  # For FID calculation
     data_dir_path = Path(data_dir).resolve()
     config = Config()
     
@@ -553,6 +618,10 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
                 ssim_val = 0.0
                 psnr_val = 0.0
             
+            # Store images for FID calculation (keep in [-1, 1] range)
+            real_images_list.append(real_tensor.cpu())
+            generated_images_list.append(generated.cpu())
+            
             results.append({
                 'sample_idx': idx,
                 'compound': row['CPD_NAME'],
@@ -575,6 +644,18 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     results_csv = os.path.join(output_dir, "evaluation_results.csv")
     results_df.to_csv(results_csv, index=False)
     
+    # Calculate FID if we have enough samples
+    fid_score = None
+    if len(real_images_list) > 0 and len(generated_images_list) > 0:
+        print(f"\nComputing FID on {len(real_images_list)} image pairs...")
+        real_images_tensor = torch.cat(real_images_list, dim=0)
+        generated_images_tensor = torch.cat(generated_images_list, dim=0)
+        fid_score = calculate_fid(real_images_tensor, generated_images_tensor, device=config.device)
+        if fid_score is not None:
+            print(f"  FID Score: {fid_score:.4f}")
+        else:
+            print("  FID calculation failed (missing dependencies)")
+    
     # Compute summary statistics
     summary = {
         'total_samples': num_samples,
@@ -586,6 +667,7 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         'std_ssim': results_df['ssim'].std(),
         'mean_psnr': results_df['psnr'].mean(),
         'std_psnr': results_df['psnr'].std(),
+        'fid': fid_score if fid_score is not None else 'N/A',
     }
     
     summary_df = pd.DataFrame([summary])
@@ -602,6 +684,8 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     print(f"  MSE:  {summary['mean_mse']:.6f} ± {summary['std_mse']:.6f}")
     print(f"  SSIM: {summary['mean_ssim']:.4f} ± {summary['std_ssim']:.4f}")
     print(f"  PSNR: {summary['mean_psnr']:.2f} ± {summary['std_psnr']:.2f}")
+    if fid_score is not None:
+        print(f"  FID:  {fid_score:.4f}")
     print(f"\nResults saved to: {results_csv}")
     print(f"Summary saved to: {summary_csv}")
     
