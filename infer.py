@@ -90,6 +90,27 @@ class DiffusionModel(nn.Module):
         beta = torch.linspace(config.beta_start, config.beta_end, config.timesteps).to(config.device)
         alpha = 1. - beta
         self.alpha_bar = torch.cumprod(alpha, dim=0)
+        self.sqrt_alpha_bar = torch.sqrt(self.alpha_bar)
+        self.sqrt_one_minus_alpha_bar = torch.sqrt(1. - self.alpha_bar)
+
+    @torch.no_grad()
+    def sample(self, control, fingerprint):
+        """Generate a sample using reverse diffusion"""
+        self.model.eval()
+        b = control.shape[0]
+        xt = torch.randn_like(control)
+        
+        for i in reversed(range(self.timesteps)):
+            t = torch.full((b,), i, device=self.cfg.device, dtype=torch.long)
+            noise_pred = self.model(xt, t, control, fingerprint)
+            
+            alpha = 1 - torch.linspace(self.cfg.beta_start, self.cfg.beta_end, self.timesteps).to(self.cfg.device)[i]
+            alpha_bar = self.alpha_bar[i]
+            beta = 1 - alpha
+            z = torch.randn_like(xt) if i > 0 else 0
+            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
+            xt = torch.clamp(xt, -1, 1)
+        return xt
 
     @torch.no_grad()
     def sample_trajectory(self, control, fingerprint, num_frames=50):
