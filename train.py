@@ -216,6 +216,19 @@ class BBBC021Dataset(Dataset):
         full_path = self.data_dir / path
         if not full_path.exists():
             full_path = self.data_dir / (str(path) + '.npy')
+        
+        # CRITICAL: Check if file exists before attempting to load
+        if not full_path.exists():
+            raise FileNotFoundError(
+                f"CRITICAL: Image file not found!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  Path from metadata: {path}\n"
+                f"  Attempted path 1: {self.data_dir / path}\n"
+                f"  Attempted path 2: {full_path}\n"
+                f"  Data directory: {self.data_dir}\n"
+                f"  Data directory exists: {self.data_dir.exists()}"
+            )
             
         try:
             img = np.load(full_path)
@@ -231,9 +244,15 @@ class BBBC021Dataset(Dataset):
                 img = (img * 2.0) - 1.0
                 
             img = torch.clamp(img, -1, 1)
-        except Exception:
-            # Silent fallback for robust training
-            img = torch.zeros((3, self.image_size, self.image_size))
+        except Exception as e:
+            # Show the actual error instead of silently failing
+            raise RuntimeError(
+                f"CRITICAL: Failed to load image file!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  File path: {full_path}\n"
+                f"  Original error: {type(e).__name__}: {str(e)}"
+            ) from e
 
         cpd = meta.get('CPD_NAME', 'DMSO')
         fp = self.fingerprints.get(cpd, np.zeros(1024))
