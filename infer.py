@@ -156,11 +156,42 @@ class MorganFingerprintEncoder:
         arr = (np.random.rand(self.n_bits) > 0.5).astype(np.float32)
         return arr
 
-def load_data_sample(data_dir, metadata_file, encoder):
+def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
     """
     Finds a random Perturbed sample and its paired Control sample from the CSV.
+    Uses paths.csv if available for efficient file lookup.
+    
+    Args:
+        data_dir: Directory containing data
+        metadata_file: Path to metadata CSV file
+        encoder: Fingerprint encoder
+        paths_csv: Optional path to paths.csv file (auto-detected if None)
     """
     df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
+    
+    # Load paths.csv if available for efficient file lookup
+    paths_lookup = {}
+    if paths_csv:
+        paths_csv_path = Path(paths_csv)
+    else:
+        paths_csv_path = Path("paths.csv")
+        if not paths_csv_path.exists():
+            # Try in data_dir
+            paths_csv_path = Path(data_dir) / "paths.csv"
+    
+    if paths_csv_path.exists():
+        print(f"Loading file paths from {paths_csv_path}...")
+        paths_df = pd.read_csv(paths_csv_path)
+        # Create lookup by filename (most common case)
+        for _, row in paths_df.iterrows():
+            filename = row['filename']
+            rel_path = row['relative_path']
+            if filename not in paths_lookup:
+                paths_lookup[filename] = []
+            paths_lookup[filename].append(rel_path)
+        print(f"  Loaded {len(paths_lookup)} unique filenames from paths.csv")
+    else:
+        print("  Note: paths.csv not found, will use fallback path resolution")
     
     # 1. Find a perturbed sample (Non-DMSO)
     perturbed_df = df[df['CPD_NAME'].str.upper() != 'DMSO']
@@ -193,28 +224,59 @@ def load_data_sample(data_dir, metadata_file, encoder):
         
         print(f"  Looking for image with path: {path}")
         
-        # Try multiple path variations
         data_dir_path = Path(data_dir).resolve()
-        possible_paths = [
-            data_dir_path / path,  # Direct path
-            data_dir_path / (path + '.npy'),  # With .npy extension
-            Path(path).resolve() if Path(path).is_absolute() else None,  # Absolute path
-            data_dir_path / Path(path).name,  # Just filename
-            data_dir_path / (Path(path).name + '.npy'),  # Just filename with .npy
-        ]
-        
-        # Remove None values
-        possible_paths = [p for p in possible_paths if p is not None]
-        
         full_path = None
-        for p in possible_paths:
-            if p.exists():
-                full_path = p
-                print(f"  Found image at: {full_path}")
-                break
+        
+        # First, try using paths.csv lookup
+        if paths_lookup:
+            # Try to match by filename
+            path_obj = Path(path)
+            filename = path_obj.name
+            # Remove .npy extension if present for matching
+            filename_base = filename.replace('.npy', '')
+            
+            # Try exact filename match
+            if filename in paths_lookup:
+                for rel_path in paths_lookup[filename]:
+                    candidate = data_dir_path / rel_path
+                    if candidate.exists():
+                        full_path = candidate
+                        print(f"  Found image via paths.csv lookup: {full_path}")
+                        break
+            
+            # Try matching without extension
+            if full_path is None:
+                for key in paths_lookup.keys():
+                    if key.replace('.npy', '') == filename_base:
+                        for rel_path in paths_lookup[key]:
+                            candidate = data_dir_path / rel_path
+                            if candidate.exists():
+                                full_path = candidate
+                                print(f"  Found image via paths.csv (extension match): {full_path}")
+                                break
+                        if full_path:
+                            break
+        
+        # Fallback: Try multiple path variations
+        if full_path is None:
+            possible_paths = [
+                data_dir_path / path,  # Direct path
+                data_dir_path / (path + '.npy'),  # With .npy extension
+                Path(path).resolve() if Path(path).is_absolute() else None,  # Absolute path
+                data_dir_path / Path(path).name,  # Just filename
+                data_dir_path / (Path(path).name + '.npy'),  # Just filename with .npy
+            ]
+            
+            # Remove None values
+            possible_paths = [p for p in possible_paths if p is not None]
+            
+            for p in possible_paths:
+                if p.exists():
+                    full_path = p
+                    print(f"  Found image at: {full_path}")
+                    break
         
         # If still not found, try recursive search
-        search_pattern = None
         if full_path is None:
             search_pattern = Path(path).name + '.npy' if not path.endswith('.npy') else Path(path).name
             matches = list(data_dir_path.rglob(search_pattern))
@@ -223,12 +285,7 @@ def load_data_sample(data_dir, metadata_file, encoder):
                 print(f"  Found image via recursive search at: {full_path}")
         
         if full_path is None:
-            print(f"Error: Could not find image file. Tried paths:")
-            for p in possible_paths:
-                exists = "✓" if p.exists() else "✗"
-                print(f"  {exists} {p}")
-            if search_pattern:
-                print(f"  Also searched recursively for: {search_pattern}")
+            print(f"Error: Could not find image file for path: {path}")
             raise FileNotFoundError(f"Image file not found for: {row.get('CPD_NAME', 'unknown')} (path: {path})")
         
         img = np.load(full_path)
@@ -256,6 +313,7 @@ def main():
     parser.add_argument("--checkpoint_path", type=str, default="ddpm_diffusers_results/checkpoints/latest.pt", help="Path to checkpoint file (default: ddpm_diffusers_results/checkpoints/latest.pt)")
     parser.add_argument("--data_dir", type=str, default="./data/bbbc021_all")
     parser.add_argument("--metadata_file", type=str, default="metadata/bbbc021_df_all.csv")
+    parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     parser.add_argument("--output_path", type=str, default="inference_video.mp4")
     args = parser.parse_args()
 
@@ -275,7 +333,7 @@ def main():
     
     # 2. Load Data
     encoder = MorganFingerprintEncoder()
-    data = load_data_sample(args.data_dir, args.metadata_file, encoder)
+    data = load_data_sample(args.data_dir, args.metadata_file, encoder, paths_csv=args.paths_csv)
     if data is None: return
     
     ctrl, real_target, fp, compound_name = data
