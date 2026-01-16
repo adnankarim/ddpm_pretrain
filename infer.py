@@ -19,6 +19,7 @@ import imageio
 from pathlib import Path
 from diffusers import UNet2DModel
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 # --- Dependencies Check ---
@@ -377,6 +378,236 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
     return ctrl_tensor, real_tensor, fp_tensor, target_compound
 
 # ============================================================================
+# BATCH EVALUATION
+# ============================================================================
+
+def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results"):
+    """
+    Evaluate model on multiple samples and compute metrics.
+    """
+    import time
+    try:
+        from skimage.metrics import structural_similarity as ssim
+        from skimage.metrics import peak_signal_noise_ratio as psnr
+        SKIMAGE_AVAILABLE = True
+    except ImportError:
+        print("Warning: scikit-image not available. Install with: pip install scikit-image")
+        print("SSIM and PSNR metrics will not be computed.")
+        SKIMAGE_AVAILABLE = False
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load metadata
+    df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
+    
+    # Get perturbed samples (non-DMSO)
+    perturbed_df = df[df['CPD_NAME'].str.upper() != 'DMSO'].copy()
+    if len(perturbed_df) == 0:
+        print("Error: No perturbed samples found in CSV.")
+        return None
+    
+    # Sample up to num_samples
+    num_samples = min(num_samples, len(perturbed_df))
+    eval_df = perturbed_df.sample(n=num_samples, random_state=42).reset_index(drop=True)
+    
+    print(f"Evaluating on {num_samples} samples...")
+    
+    # Load paths.csv if available
+    paths_lookup = {}
+    paths_by_rel = {}
+    paths_by_basename = {}
+    
+    if paths_csv:
+        paths_csv_path = Path(paths_csv)
+    else:
+        paths_csv_path = Path("paths.csv")
+        if not paths_csv_path.exists():
+            paths_csv_path = Path(data_dir) / "paths.csv"
+    
+    if paths_csv_path.exists():
+        print(f"Loading paths.csv...")
+        paths_df = pd.read_csv(paths_csv_path)
+        for _, row in paths_df.iterrows():
+            filename = row['filename']
+            rel_path = row['relative_path']
+            basename = Path(filename).stem
+            if filename not in paths_lookup:
+                paths_lookup[filename] = []
+            paths_lookup[filename].append(rel_path)
+            paths_by_rel[rel_path] = row.to_dict()
+            if basename not in paths_by_basename:
+                paths_by_basename[basename] = []
+            paths_by_basename[basename].append(rel_path)
+    
+    results = []
+    data_dir_path = Path(data_dir).resolve()
+    config = Config()
+    
+    def find_file_path(row):
+        """Find file path using paths.csv lookup"""
+        path = row.get('image_path') or row.get('SAMPLE_KEY')
+        if not path:
+            return None
+        
+        path_obj = Path(path)
+        filename = path_obj.name
+        basename = path_obj.stem
+        
+        # Try paths.csv lookup
+        if paths_lookup:
+            if filename in paths_lookup:
+                for rel_path in paths_lookup[filename]:
+                    candidate = data_dir_path / rel_path
+                    if candidate.exists():
+                        return candidate
+            if basename in paths_by_basename:
+                for rel_path in paths_by_basename[basename]:
+                    candidate = data_dir_path / rel_path
+                    if candidate.exists():
+                        return candidate
+        
+        # Fallback
+        for candidate in [data_dir_path / path, data_dir_path / (path + '.npy')]:
+            if candidate.exists():
+                return candidate
+        return None
+    
+    def load_image_file(file_path):
+        """Load and normalize image"""
+        try:
+            img = np.load(file_path)
+            if img.ndim == 3 and img.shape[-1] == 3:
+                img = img.transpose(2, 0, 1)
+            img = torch.from_numpy(img).float()
+            if img.max() > 1.0:
+                img = (img / 127.5) - 1.0
+            return torch.clamp(img, -1, 1)
+        except:
+            return None
+    
+    successful = 0
+    failed = 0
+    
+    for idx, row in eval_df.iterrows():
+        if (idx + 1) % 100 == 0:
+            print(f"  Processed {idx + 1}/{num_samples} samples...")
+        
+        try:
+            # Find target file
+            target_path = find_file_path(row)
+            if target_path is None:
+                failed += 1
+                continue
+            
+            # Load target image
+            target_img = load_image_file(target_path)
+            if target_img is None:
+                failed += 1
+                continue
+            
+            # Find control (DMSO) from same batch
+            batch = row['BATCH']
+            control_candidates = df[(df['BATCH'] == batch) & (df['CPD_NAME'].str.upper() == 'DMSO')]
+            if len(control_candidates) == 0:
+                failed += 1
+                continue
+            
+            control_row = control_candidates.sample(1).iloc[0]
+            control_path = find_file_path(control_row)
+            if control_path is None:
+                failed += 1
+                continue
+            
+            control_img = load_image_file(control_path)
+            if control_img is None:
+                failed += 1
+                continue
+            
+            # Get fingerprint
+            smiles = row.get('SMILES', '')
+            fp = encoder.encode(smiles)
+            fp_tensor = torch.from_numpy(fp).float().unsqueeze(0)
+            
+            # Generate prediction
+            ctrl_tensor = control_img.unsqueeze(0).to(config.device)
+            fp_tensor = fp_tensor.to(config.device)
+            
+            with torch.no_grad():
+                generated = model.sample(ctrl_tensor, fp_tensor)
+            
+            # Compute metrics
+            real_tensor = target_img.unsqueeze(0).to(config.device)
+            generated_np = ((generated[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+            real_np = ((real_tensor[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+            
+            # MSE
+            mse = F.mse_loss(generated, real_tensor).item()
+            
+            # SSIM and PSNR (if available)
+            if SKIMAGE_AVAILABLE:
+                gen_gray = np.mean(generated_np, axis=2)
+                real_gray = np.mean(real_np, axis=2)
+                ssim_val = ssim(real_gray, gen_gray, data_range=255)
+                psnr_val = psnr(real_np, generated_np, data_range=255)
+            else:
+                ssim_val = 0.0
+                psnr_val = 0.0
+            
+            results.append({
+                'sample_idx': idx,
+                'compound': row['CPD_NAME'],
+                'batch': batch,
+                'mse': mse,
+                'ssim': ssim_val,
+                'psnr': psnr_val,
+                'smiles': smiles
+            })
+            
+            successful += 1
+            
+        except Exception as e:
+            print(f"  Error processing sample {idx}: {e}")
+            failed += 1
+            continue
+    
+    # Save results
+    results_df = pd.DataFrame(results)
+    results_csv = os.path.join(output_dir, "evaluation_results.csv")
+    results_df.to_csv(results_csv, index=False)
+    
+    # Compute summary statistics
+    summary = {
+        'total_samples': num_samples,
+        'successful': successful,
+        'failed': failed,
+        'mean_mse': results_df['mse'].mean(),
+        'std_mse': results_df['mse'].std(),
+        'mean_ssim': results_df['ssim'].mean(),
+        'std_ssim': results_df['ssim'].std(),
+        'mean_psnr': results_df['psnr'].mean(),
+        'std_psnr': results_df['psnr'].std(),
+    }
+    
+    summary_df = pd.DataFrame([summary])
+    summary_csv = os.path.join(output_dir, "evaluation_summary.csv")
+    summary_df.to_csv(summary_csv, index=False)
+    
+    print(f"\n{'='*60}")
+    print(f"Evaluation Complete!")
+    print(f"{'='*60}")
+    print(f"Total samples: {num_samples}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+    print(f"\nMetrics:")
+    print(f"  MSE:  {summary['mean_mse']:.6f} ± {summary['std_mse']:.6f}")
+    print(f"  SSIM: {summary['mean_ssim']:.4f} ± {summary['std_ssim']:.4f}")
+    print(f"  PSNR: {summary['mean_psnr']:.2f} ± {summary['std_psnr']:.2f}")
+    print(f"\nResults saved to: {results_csv}")
+    print(f"Summary saved to: {summary_csv}")
+    
+    return results_df, summary_df
+
+# ============================================================================
 # MAIN INFERENCE
 # ============================================================================
 
@@ -387,6 +618,9 @@ def main():
     parser.add_argument("--metadata_file", type=str, default="metadata/bbbc021_df_all.csv")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     parser.add_argument("--output_path", type=str, default="inference_video.mp4")
+    parser.add_argument("--batch_eval", action="store_true", help="Run batch evaluation on 1000 samples")
+    parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples for batch evaluation (default: 1000)")
+    parser.add_argument("--eval_output_dir", type=str, default="evaluation_results", help="Output directory for evaluation results")
     args = parser.parse_args()
 
     config = Config()
@@ -403,7 +637,22 @@ def main():
         print(f"Warning: Unexpected keys in checkpoint: {len(unexpected_keys)} keys")
     model.eval()
     
-    # 2. Load Data
+    # 2. Check if batch evaluation mode
+    if args.batch_eval:
+        print("Running batch evaluation mode...")
+        encoder = MorganFingerprintEncoder()
+        evaluate_batch(
+            model, 
+            args.data_dir, 
+            args.metadata_file, 
+            encoder, 
+            args.paths_csv,
+            num_samples=args.num_samples,
+            output_dir=args.eval_output_dir
+        )
+        return
+    
+    # 3. Single sample inference mode
     encoder = MorganFingerprintEncoder()
     data = load_data_sample(args.data_dir, args.metadata_file, encoder, paths_csv=args.paths_csv)
     if data is None: return
@@ -413,16 +662,16 @@ def main():
     real_target = real_target.to(config.device)
     fp = fp.to(config.device)
     
-    # 3. Generate Video Frames
+    # 4. Generate Video Frames
     print(f"Generating diffusion trajectory for {compound_name}...")
     gen_frames = model.sample_trajectory(ctrl, fp, num_frames=60)
     
-    # 4. Prepare Static Images for Comparison
+    # 5. Prepare Static Images for Comparison
     # Convert Control and Real Target to [0, 255] numpy images
     ctrl_img = ((ctrl[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
     real_img = ((real_target[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
     
-    # 5. Stitch Frames Together
+    # 6. Stitch Frames Together
     final_video = []
     separator = np.zeros((96, 2, 3), dtype=np.uint8) # Black line separator
     
@@ -431,7 +680,7 @@ def main():
         combined = np.hstack([ctrl_img, separator, frame, separator, real_img])
         final_video.append(combined)
         
-    # 6. Save
+    # 7. Save
     imageio.mimsave(args.output_path, final_video, fps=10)
     print(f"Video saved to {args.output_path}")
     print("Left: Source (DMSO) | Middle: Generated Prediction | Right: Real Ground Truth")
