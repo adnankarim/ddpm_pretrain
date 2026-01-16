@@ -737,9 +737,9 @@ def main():
             save_image(samples, grid_path, nrow=4, normalize=True, value_range=(-1, 1))
             print(f"  ✓ Sample grid saved to: {grid_path}", flush=True)
             
-            # Generate video
+            # Generate video (with ground truth comparison)
             video_path = f"{config.output_dir}/plots/video_{epoch+1}.mp4"
-            generate_video(model, video_path, num_frames=60)
+            generate_video(model, dataset, video_path, num_frames=60)
             
             print("="*60 + "\n", flush=True)
             
