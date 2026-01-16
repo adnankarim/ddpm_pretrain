@@ -188,7 +188,49 @@ def load_data_sample(data_dir, metadata_file, encoder):
     # 3. Load Images
     def load_img(row):
         path = row.get('image_path') or row.get('SAMPLE_KEY')
-        full_path = Path(data_dir) / path if (Path(data_dir) / path).exists() else Path(data_dir) / (path + '.npy')
+        if not path:
+            raise ValueError(f"No image path found in row: {row.get('CPD_NAME', 'unknown')}")
+        
+        print(f"  Looking for image with path: {path}")
+        
+        # Try multiple path variations
+        data_dir_path = Path(data_dir).resolve()
+        possible_paths = [
+            data_dir_path / path,  # Direct path
+            data_dir_path / (path + '.npy'),  # With .npy extension
+            Path(path).resolve() if Path(path).is_absolute() else None,  # Absolute path
+            data_dir_path / Path(path).name,  # Just filename
+            data_dir_path / (Path(path).name + '.npy'),  # Just filename with .npy
+        ]
+        
+        # Remove None values
+        possible_paths = [p for p in possible_paths if p is not None]
+        
+        full_path = None
+        for p in possible_paths:
+            if p.exists():
+                full_path = p
+                print(f"  Found image at: {full_path}")
+                break
+        
+        # If still not found, try recursive search
+        search_pattern = None
+        if full_path is None:
+            search_pattern = Path(path).name + '.npy' if not path.endswith('.npy') else Path(path).name
+            matches = list(data_dir_path.rglob(search_pattern))
+            if matches:
+                full_path = matches[0]
+                print(f"  Found image via recursive search at: {full_path}")
+        
+        if full_path is None:
+            print(f"Error: Could not find image file. Tried paths:")
+            for p in possible_paths:
+                exists = "✓" if p.exists() else "✗"
+                print(f"  {exists} {p}")
+            if search_pattern:
+                print(f"  Also searched recursively for: {search_pattern}")
+            raise FileNotFoundError(f"Image file not found for: {row.get('CPD_NAME', 'unknown')} (path: {path})")
+        
         img = np.load(full_path)
         if img.ndim == 3 and img.shape[-1] == 3: img = img.transpose(2, 0, 1) # HWC to CHW
         img = torch.from_numpy(img).float()
