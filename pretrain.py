@@ -168,21 +168,44 @@ class BBBC021TrainOnlyDataset(Dataset):
             print(f"Loading paths.csv optimization...")
             p_df = pd.read_csv(paths_csv)
             for _, row in p_df.iterrows():
-                self.paths_lookup[row['filename']] = row['relative_path']
+                # Store as string to avoid Path object issues
+                self.paths_lookup[str(row['filename'])] = str(row['relative_path'])
 
     def _find_file(self, path_str):
+        if not path_str:
+            return None
+            
+        # Convert to string if it's a Path
+        path_str = str(path_str)
+        
         # 1. Try direct
-        p = self.data_dir / path_str
-        if p.exists(): return p
+        try:
+            p = self.data_dir / path_str
+            if p.exists(): 
+                return p
+        except Exception:
+            pass
         
         # 2. Try adding extension
-        p_ext = self.data_dir / (path_str + ".npy")
-        if p_ext.exists(): return p_ext
+        try:
+            p_ext = self.data_dir / (path_str + ".npy")
+            if p_ext.exists(): 
+                return p_ext
+        except Exception:
+            pass
         
         # 3. Try lookup
-        fname = Path(path_str).name
-        if fname in self.paths_lookup:
-            return self.data_dir / self.paths_lookup[fname]
+        try:
+            fname = Path(path_str).name
+            if fname in self.paths_lookup:
+                rel_path = self.paths_lookup[fname]
+                # Ensure rel_path is a string
+                rel_path = str(rel_path)
+                candidate = self.data_dir / rel_path
+                if candidate.exists():
+                    return candidate
+        except Exception:
+            pass
             
         return None
 
@@ -193,14 +216,27 @@ class BBBC021TrainOnlyDataset(Dataset):
         meta = self.metadata[idx]
         path_str = meta.get('image_path') or meta.get('SAMPLE_KEY')
         
+        if not path_str:
+            raise ValueError(
+                f"CRITICAL: No image path found in metadata!\n"
+                f"  Index: {idx}\n"
+                f"  Metadata keys: {list(meta.keys())}"
+            )
+        
         full_path = self._find_file(path_str)
         
         if full_path is None or not full_path.exists():
-            # Robust skip during training
-            return self.__getitem__(np.random.randint(0, len(self)))
+            raise FileNotFoundError(
+                f"CRITICAL: Image file not found!\n"
+                f"  Index: {idx}\n"
+                f"  Path from metadata: {path_str}\n"
+                f"  Data directory: {self.data_dir}\n"
+                f"  Data directory exists: {self.data_dir.exists()}\n"
+                f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
+            )
 
         try:
-            img = np.load(full_path)
+            img = np.load(str(full_path))  # Convert Path to string for np.load
             if img.ndim == 3 and img.shape[-1] == 3: 
                 img = img.transpose(2, 0, 1)
             img = torch.from_numpy(img).float()
@@ -213,8 +249,13 @@ class BBBC021TrainOnlyDataset(Dataset):
                 
             return torch.clamp(img, -1, 1)
             
-        except Exception:
-            return self.__getitem__(np.random.randint(0, len(self)))
+        except Exception as e:
+            raise RuntimeError(
+                f"CRITICAL: Failed to load image file!\n"
+                f"  Index: {idx}\n"
+                f"  File path: {full_path}\n"
+                f"  Original error: {type(e).__name__}: {str(e)}"
+            ) from e
 
 # ============================================================================
 # ARCHITECTURE (MODERN U-NET)
