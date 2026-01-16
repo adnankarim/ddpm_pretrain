@@ -157,7 +157,7 @@ class MorganFingerprintEncoder:
         arr = (np.random.rand(self.n_bits) > 0.5).astype(np.float32)
         return arr
 
-def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
+def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None, split='test'):
     """
     Finds a random Perturbed sample and its paired Control sample from the CSV.
     Uses paths.csv if available for efficient file lookup.
@@ -167,8 +167,20 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
         metadata_file: Path to metadata CSV file
         encoder: Fingerprint encoder
         paths_csv: Optional path to paths.csv file (auto-detected if None)
+        split: Data split to use ('train', 'val', 'test', or None for all)
     """
     df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
+    
+    # Filter by split if SPLIT column exists
+    if split and 'SPLIT' in df.columns:
+        split_df = df[df['SPLIT'].str.upper() == split.upper()].copy()
+        if len(split_df) > 0:
+            df = split_df
+        else:
+            # Try lowercase
+            split_df = df[df['SPLIT'].str.lower() == split.lower()].copy()
+            if len(split_df) > 0:
+                df = split_df
     
     # Load paths.csv if available for efficient file lookup
     paths_lookup = {}  # filename -> list of relative_paths
@@ -208,31 +220,6 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
         
         print(f"  Loaded {len(paths_lookup)} unique filenames from paths.csv")
         print(f"  Total files in paths.csv: {len(paths_df)}")
-        
-        # Try to match metadata entries with paths.csv entries
-        print("  Matching metadata entries with paths.csv...")
-        matched = 0
-        for idx, meta_row in df.iterrows():
-            meta_path = meta_row.get('image_path') or meta_row.get('SAMPLE_KEY') or ''
-            if not meta_path:
-                continue
-            
-            # Try to find matching file
-            meta_filename = Path(meta_path).name
-            meta_basename = Path(meta_path).stem
-            
-            found = False
-            if meta_filename in paths_lookup:
-                matched += 1
-                found = True
-            elif meta_basename in paths_by_basename:
-                matched += 1
-                found = True
-            elif any(meta_filename in rel or meta_basename in rel for rel in paths_by_rel.keys()):
-                matched += 1
-                found = True
-        
-        print(f"  Matched {matched}/{len(df)} metadata entries with paths.csv")
     else:
         print("  Note: paths.csv not found, will use fallback path resolution")
     
@@ -444,7 +431,7 @@ def calculate_fid(real_images, generated_images, device='cuda'):
     
     return fid
 
-def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results"):
+def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results", split='test'):
     """
     Evaluate model on multiple samples and compute metrics.
     """
@@ -463,6 +450,25 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     # Load metadata
     df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
     
+    # Filter by split if specified
+    if split and 'SPLIT' in df.columns:
+        split_df = df[df['SPLIT'].str.upper() == split.upper()].copy()
+        if len(split_df) > 0:
+            print(f"Found {len(split_df)} samples in {split.upper()} split")
+            df = split_df
+        else:
+            # Try lowercase
+            split_df = df[df['SPLIT'].str.lower() == split.lower()].copy()
+            if len(split_df) > 0:
+                print(f"Found {len(split_df)} samples in {split.lower()} split")
+                df = split_df
+            else:
+                print(f"Warning: No {split} split found, using all data")
+    elif 'SPLIT' in df.columns:
+        print("Note: SPLIT column found but no split specified, using all data")
+    else:
+        print("Note: No SPLIT column found, using all data")
+    
     # Get perturbed samples (non-DMSO)
     perturbed_df = df[df['CPD_NAME'].str.upper() != 'DMSO'].copy()
     if len(perturbed_df) == 0:
@@ -473,7 +479,7 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     num_samples = min(num_samples, len(perturbed_df))
     eval_df = perturbed_df.sample(n=num_samples, random_state=42).reset_index(drop=True)
     
-    print(f"Evaluating on {num_samples} samples...")
+    print(f"Evaluating on {num_samples} samples from test split...")
     
     # Load paths.csv if available
     paths_lookup = {}
@@ -705,6 +711,7 @@ def main():
     parser.add_argument("--batch_eval", action="store_true", help="Run batch evaluation on 1000 samples")
     parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples for batch evaluation (default: 1000)")
     parser.add_argument("--eval_output_dir", type=str, default="evaluation_results", help="Output directory for evaluation results")
+    parser.add_argument("--split", type=str, default="test", help="Data split to use: 'train', 'val', 'test', or 'all' (default: 'test')")
     args = parser.parse_args()
 
     config = Config()
@@ -732,13 +739,14 @@ def main():
             encoder, 
             args.paths_csv,
             num_samples=args.num_samples,
-            output_dir=args.eval_output_dir
+            output_dir=args.eval_output_dir,
+            split=args.split if args.split.lower() != 'all' else None
         )
         return
     
     # 3. Single sample inference mode
     encoder = MorganFingerprintEncoder()
-    data = load_data_sample(args.data_dir, args.metadata_file, encoder, paths_csv=args.paths_csv)
+    data = load_data_sample(args.data_dir, args.metadata_file, encoder, paths_csv=args.paths_csv, split=args.split if args.split.lower() != 'all' else None)
     if data is None: return
     
     ctrl, real_target, fp, compound_name = data
