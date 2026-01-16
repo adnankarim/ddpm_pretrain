@@ -412,17 +412,86 @@ class BBBC021LoRADataset(Dataset):
         }
 
 # ============================================================================
+# LOGGING UTILS
+# ============================================================================
+
+class TrainingLogger:
+    """
+    Logs training metrics to CSV and generates plots every epoch.
+    """
+    def __init__(self, save_dir):
+        self.save_dir = save_dir
+        self.history = {
+            'epoch': [],
+            'train_loss': [],
+            'learning_rate': []
+        }
+        self.csv_path = os.path.join(save_dir, "training_history.csv")
+        self.plot_path = os.path.join(save_dir, "training_loss.png")
+        
+    def update(self, epoch, loss, lr=None):
+        """
+        Update logger with training loss and learning rate.
+        """
+        self.history['epoch'].append(epoch)
+        self.history['train_loss'].append(loss)
+        self.history['learning_rate'].append(lr if lr is not None else 0)
+        
+        # Save to CSV immediately
+        df = pd.DataFrame(self.history)
+        df.to_csv(self.csv_path, index=False)
+        
+        # Generate Plot
+        self._plot_loss()
+        
+    def _plot_loss(self):
+        """Plot training loss curve with learning rate"""
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        
+        # Loss on left y-axis
+        color = '#1f77b4'
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('MSE Loss', color=color)
+        line1 = ax1.plot(self.history['epoch'], self.history['train_loss'], 
+                        label='Training Loss', color=color, linewidth=2)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_yscale('log')  # Log scale for diffusion loss
+        ax1.grid(True, which="both", ls="-", alpha=0.2)
+        
+        # Learning rate on right y-axis
+        if any(lr > 0 for lr in self.history['learning_rate']):
+            ax2 = ax1.twinx()
+            color2 = '#ff7f0e'
+            ax2.set_ylabel('Learning Rate', color=color2)
+            line2 = ax2.plot(self.history['epoch'], self.history['learning_rate'], 
+                            label='Learning Rate', color=color2, linewidth=2, linestyle='--')
+            ax2.tick_params(axis='y', labelcolor=color2)
+            ax2.set_yscale('log')
+        
+        plt.title(f'Stable Diffusion LoRA Training (Epoch {self.history["epoch"][-1]})')
+        plt.tight_layout()
+        plt.savefig(self.plot_path, dpi=150)
+        plt.close()
+
+# ============================================================================
 # MAIN TRAINING
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Fine-tune Stable Diffusion with LoRA on BBBC021")
     parser.add_argument("--output_dir", type=str, default=Config.output_dir)
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     args = parser.parse_args()
     
     config = Config()
     config.output_dir = args.output_dir
     os.makedirs(f"{config.output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{config.output_dir}/validation", exist_ok=True)
+    os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
+    
+    # Initialize Logger
+    logger = TrainingLogger(config.output_dir)
     
     if WANDB_AVAILABLE: wandb.init(project="bbbc021-sd-lora", config=config.__dict__)
 
@@ -467,7 +536,50 @@ def main():
     unet.to(config.device) # UNet usually kept in float32 for training stability, or mixed precision context
 
     # 6. Dataset & Loader
-    dataset = BBBC021LoRADataset(config.data_dir, config.metadata_file, tokenizer, size=config.image_size)
+    print("\nLoading Dataset...", flush=True)
+    dataset = BBBC021LoRADataset(config.data_dir, config.metadata_file, tokenizer, size=config.image_size, split='train', paths_csv=args.paths_csv)
+    print(f"Training Images: {len(dataset):,}")
+    
+    # Log paths.csv status
+    print(f"\n{'='*60}", flush=True)
+    print(f"File Path Resolution Status:", flush=True)
+    print(f"{'='*60}", flush=True)
+    if len(dataset.paths_lookup) > 0:
+        print(f"  ✓ paths.csv loaded successfully", flush=True)
+        print(f"  - Unique filenames in lookup: {len(dataset.paths_lookup):,}", flush=True)
+        print(f"  - Total paths indexed: {len(dataset.paths_by_rel):,}", flush=True)
+        print(f"  - Basename lookups: {len(dataset.paths_by_basename):,}", flush=True)
+    else:
+        print(f"  ⚠ paths.csv not found - using fallback path resolution", flush=True)
+    print(f"  - Data directory: {dataset.data_dir}", flush=True)
+    print(f"  - Data directory exists: {dataset.data_dir.exists()}", flush=True)
+    print(f"{'='*60}\n", flush=True)
+    
+    # Save a random dataset sample image
+    print("Saving random dataset sample image...", flush=True)
+    try:
+        import random
+        random_idx = random.randint(0, len(dataset) - 1)
+        sample = dataset[random_idx]
+        
+        # Get pixel values and convert to image
+        pixel_values = sample['pixel_values']  # Already normalized to [-1, 1]
+        img_np = ((pixel_values.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+        img_np = np.clip(img_np, 0, 255)
+        
+        img_pil = Image.fromarray(img_np)
+        sample_filename = f"lora_dataset_sample.jpg"
+        absolute_path = os.path.abspath(sample_filename)
+        img_pil.save(absolute_path, "JPEG", quality=95)
+        print(f"  ✓ Saved random sample to: {absolute_path}", flush=True)
+        print(f"  (Current working directory: {os.getcwd()})", flush=True)
+        print(f"  Image shape: {pixel_values.shape}", flush=True)
+    except Exception as e:
+        print(f"  ⚠ Warning: Could not save sample image: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+    
     train_dataloader = DataLoader(
         dataset, 
         batch_size=config.batch_size, 
@@ -485,12 +597,40 @@ def main():
         eps=1e-08,
     )
     
+    # Learning Rate Scheduler - Cosine Annealing
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.epochs,  # Full training cycle
+        eta_min=1e-6  # Minimum learning rate
+    )
+    
     noise_scheduler = DDPMScheduler.from_pretrained(config.pretrained_model_name_or_path, subfolder="scheduler")
+    
+    # Resume training if requested
+    start_epoch = 0
+    ckpt_path = f"{config.output_dir}/checkpoints/latest.pt"
+    if args.resume and os.path.exists(ckpt_path):
+        print(f"Resuming from {ckpt_path}...")
+        try:
+            ckpt = torch.load(ckpt_path, map_location=config.device)
+            # Load LoRA weights
+            if 'lora_state_dict' in ckpt:
+                unet.load_state_dict(ckpt['lora_state_dict'], strict=False)
+            optimizer.load_state_dict(ckpt['optimizer'])
+            if 'scheduler' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt.get('epoch', 0)
+            print(f"  Resumed from epoch {start_epoch}, current LR: {scheduler.get_last_lr()[0]:.2e}")
+        except Exception as e:
+            print(f"  Warning: Could not load checkpoint: {e}")
+            print(f"  Starting from epoch 1...")
     
     print("\nStarting LoRA Fine-Tuning...")
     
     global_step = 0
-    for epoch in range(config.epochs):
+    epoch_losses = []
+    
+    for epoch in range(start_epoch, config.epochs):
         unet.train()
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}")
         epoch_losses = []
