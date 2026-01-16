@@ -395,7 +395,15 @@ def main():
     
     print("Initializing Modern U-Net (From Scratch)...")
     model = UnconditionalDiffusion(config)
-    optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr)
+    optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr, weight_decay=0.01)
+    
+    # Learning Rate Scheduler - Cosine Annealing (recommended for diffusion models)
+    # Gradually reduces LR from initial to near-zero over training
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.epochs,  # Full training cycle
+        eta_min=1e-6  # Minimum learning rate
+    )
     
     start_epoch = 0
     ckpt_path = f"{config.output_dir}/checkpoints/latest.pt"
@@ -404,7 +412,10 @@ def main():
         ckpt = torch.load(ckpt_path, map_location=config.device)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch']
+        print(f"  Resumed from epoch {start_epoch}, current LR: {scheduler.get_last_lr()[0]:.2e}")
 
     print("Starting Training...")
     
@@ -426,10 +437,19 @@ def main():
                 print(f"Epoch {epoch+1} [{batch_idx}/{len(loader)}] Loss: {loss.item():.4f}", end='\r')
         
         avg_loss = np.mean(losses)
-        print(f"\nEpoch {epoch+1}/{config.epochs} | Avg Loss: {avg_loss:.5f}")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"\nEpoch {epoch+1}/{config.epochs} | Avg Loss: {avg_loss:.5f} | LR: {current_lr:.2e}")
         
-        logger.update(epoch+1, avg_loss)
-        if WANDB_AVAILABLE: wandb.log({"loss": avg_loss, "epoch": epoch+1})
+        # Step scheduler
+        scheduler.step()
+        
+        logger.update(epoch+1, avg_loss, current_lr)
+        if WANDB_AVAILABLE: 
+            wandb.log({
+                "loss": avg_loss, 
+                "epoch": epoch+1,
+                "learning_rate": current_lr
+            })
         
         # Evaluation
         if (epoch + 1) % config.eval_freq == 0:
@@ -454,10 +474,11 @@ def main():
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
                 'epoch': epoch+1,
                 'config': config.__dict__ 
             }, f"{config.output_dir}/checkpoints/latest.pt")
-            print("Checkpoint Saved.")
+            print(f"Checkpoint Saved. (LR: {scheduler.get_last_lr()[0]:.2e})")
 
 if __name__ == "__main__":
     main()
