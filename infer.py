@@ -431,7 +431,7 @@ def calculate_fid(real_images, generated_images, device='cuda'):
     
     return fid
 
-def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results", split='test'):
+def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_samples=1000, output_dir="evaluation_results", split='test', generate_videos=True, num_videos=10):
     """
     Evaluate model on multiple samples and compute metrics.
     """
@@ -446,6 +446,9 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         SKIMAGE_AVAILABLE = False
     
     os.makedirs(output_dir, exist_ok=True)
+    videos_dir = os.path.join(output_dir, "videos")
+    if generate_videos:
+        os.makedirs(videos_dir, exist_ok=True)
     
     # Load metadata
     df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
@@ -511,8 +514,17 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     results = []
     real_images_list = []  # For FID calculation
     generated_images_list = []  # For FID calculation
+    video_samples = []  # Store samples for video generation
     data_dir_path = Path(data_dir).resolve()
     config = Config()
+    
+    # Select samples for video generation (first num_videos or random)
+    video_indices = set()
+    if generate_videos and num_videos > 0:
+        num_videos = min(num_videos, num_samples)
+        # Select evenly spaced samples for videos
+        video_indices = set(np.linspace(0, num_samples - 1, num_videos, dtype=int))
+        print(f"Will generate videos for {num_videos} samples (indices: {sorted(video_indices)})")
     
     def find_file_path(row):
         """Find file path using paths.csv lookup"""
@@ -628,6 +640,18 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
             real_images_list.append(real_tensor.cpu())
             generated_images_list.append(generated.cpu())
             
+            # Store sample info for video generation if selected
+            if generate_videos and idx in video_indices:
+                video_samples.append({
+                    'idx': idx,
+                    'compound': row['CPD_NAME'],
+                    'batch': batch,
+                    'ctrl_tensor': ctrl_tensor,
+                    'fp_tensor': fp_tensor,
+                    'real_tensor': real_tensor,
+                    'generated': generated
+                })
+            
             results.append({
                 'sample_idx': idx,
                 'compound': row['CPD_NAME'],
@@ -635,7 +659,8 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
                 'mse': mse,
                 'ssim': ssim_val,
                 'psnr': psnr_val,
-                'smiles': smiles
+                'smiles': smiles,
+                'video_generated': 'yes' if (generate_videos and idx in video_indices) else 'no'
             })
             
             successful += 1
@@ -649,6 +674,35 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     results_df = pd.DataFrame(results)
     results_csv = os.path.join(output_dir, "evaluation_results.csv")
     results_df.to_csv(results_csv, index=False)
+    
+    # Generate videos for selected samples
+    if generate_videos and len(video_samples) > 0:
+        print(f"\nGenerating videos for {len(video_samples)} samples...")
+        for i, sample in enumerate(video_samples):
+            try:
+                print(f"  Generating video {i+1}/{len(video_samples)}: {sample['compound']} (idx {sample['idx']})...")
+                # Generate trajectory frames
+                gen_frames = model.sample_trajectory(sample['ctrl_tensor'], sample['fp_tensor'], num_frames=60)
+                
+                # Prepare static images
+                ctrl_img = ((sample['ctrl_tensor'][0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                real_img = ((sample['real_tensor'][0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                
+                # Stitch frames together
+                final_video = []
+                separator = np.zeros((96, 2, 3), dtype=np.uint8)
+                
+                for frame in gen_frames:
+                    combined = np.hstack([ctrl_img, separator, frame, separator, real_img])
+                    final_video.append(combined)
+                
+                # Save video
+                video_filename = f"sample_{sample['idx']:04d}_{sample['compound'].replace('/', '_')}.mp4"
+                video_path = os.path.join(videos_dir, video_filename)
+                imageio.mimsave(video_path, final_video, fps=10)
+                print(f"    Saved: {video_path}")
+            except Exception as e:
+                print(f"    Error generating video for sample {sample['idx']}: {e}")
     
     # Calculate FID if we have enough samples
     fid_score = None
@@ -694,6 +748,8 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         print(f"  FID:  {fid_score:.4f}")
     print(f"\nResults saved to: {results_csv}")
     print(f"Summary saved to: {summary_csv}")
+    if generate_videos and len(video_samples) > 0:
+        print(f"Videos saved to: {videos_dir}")
     
     return results_df, summary_df
 
@@ -708,10 +764,12 @@ def main():
     parser.add_argument("--metadata_file", type=str, default="metadata/bbbc021_df_all.csv")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     parser.add_argument("--output_path", type=str, default="inference_video.mp4")
-    parser.add_argument("--batch_eval", action="store_true", help="Run batch evaluation on 1000 samples")
+    parser.add_argument("--batch_eval", action="store_true", help="Run batch evaluation on 1000 samples (default mode)")
     parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples for batch evaluation (default: 1000)")
     parser.add_argument("--eval_output_dir", type=str, default="evaluation_results", help="Output directory for evaluation results")
     parser.add_argument("--split", type=str, default="test", help="Data split to use: 'train', 'val', 'test', or 'all' (default: 'test')")
+    parser.add_argument("--no_videos", action="store_true", help="Disable video generation during batch evaluation")
+    parser.add_argument("--num_videos", type=int, default=10, help="Number of videos to generate during batch evaluation (default: 10)")
     args = parser.parse_args()
 
     config = Config()
@@ -740,7 +798,9 @@ def main():
             args.paths_csv,
             num_samples=args.num_samples,
             output_dir=args.eval_output_dir,
-            split=args.split if args.split.lower() != 'all' else None
+            split=args.split if args.split.lower() != 'all' else None,
+            generate_videos=not args.no_videos,
+            num_videos=args.num_videos
         )
         return
     
