@@ -541,6 +541,61 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
         if debug:
             print(f"      Looking for: path={path}, filename={filename}, basename={basename}")
         
+        # Parse SAMPLE_KEY format: Week7_34681_7_3338_348.0 -> Week7/34681/7_3338_348.0.npy
+        # Format: Week{week}_{batch}_{table}_{image}_{object}.0
+        if '_' in path and path.startswith('Week'):
+            parts = path.replace('.0', '').split('_')
+            if len(parts) >= 5:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1]  # 34681
+                table_part = parts[2]  # 7
+                image_part = parts[3]  # 3338
+                object_part = parts[4]  # 348
+                
+                # Construct expected filename: table_image_object.0.npy
+                expected_filename = f"{table_part}_{image_part}_{object_part}.0.npy"
+                expected_dir = f"{week_part}/{batch_part}"
+                
+                if debug:
+                    print(f"      Parsed SAMPLE_KEY: week={week_part}, batch={batch_part}, filename={expected_filename}")
+                
+                # Try to find in paths.csv by searching for this filename in the expected directory
+                if paths_lookup and expected_filename in paths_lookup:
+                    for rel_path in paths_lookup[expected_filename]:
+                        rel_path_str = str(rel_path)
+                        # Check if this path is in the expected directory
+                        if expected_dir in rel_path_str or f"{week_part}/{batch_part}" in rel_path_str:
+                            # Handle path resolution
+                            candidates = []
+                            if data_dir_path.name in rel_path_str:
+                                if rel_path_str.startswith(data_dir_path.name + '/'):
+                                    rel_path_clean = rel_path_str[len(data_dir_path.name) + 1:]
+                                    candidates.append(data_dir_path / rel_path_clean)
+                                candidates.append(data_dir_path.parent / rel_path)
+                            candidates.append(Path(rel_path).resolve())
+                            candidates.append(data_dir_path / rel_path)
+                            candidates.append(data_dir_path.parent / rel_path)
+                            
+                            candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                            for candidate in candidates:
+                                if candidate.exists():
+                                    if debug:
+                                        print(f"      Found via SAMPLE_KEY parsing: {candidate}")
+                                    return candidate
+                
+                # Also try direct directory search
+                search_dir = data_dir_path / week_part / batch_part
+                if not search_dir.exists():
+                    # Try with bbc021_all prefix
+                    search_dir = data_dir_path.parent / week_part / batch_part
+                
+                if search_dir.exists():
+                    candidate = search_dir / expected_filename
+                    if candidate.exists():
+                        if debug:
+                            print(f"      Found via direct directory search: {candidate}")
+                        return candidate
+        
         # Try paths.csv lookup
         if paths_lookup:
             # First, try searching for SAMPLE_KEY in relative_path (not just filename)
