@@ -162,6 +162,7 @@ class BBBC021Dataset(Dataset):
         self.data_dir = Path(data_dir).resolve()
         self.image_size = image_size
         self.encoder = encoder
+        self._first_load_logged = False  # Track if we've logged the first successful load
         
         # Robust CSV loading
         csv_full_path = os.path.join(data_dir, metadata_file)
@@ -424,7 +425,15 @@ class BBBC021Dataset(Dataset):
             )
             
         try:
+            # Get file size before loading
+            file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
+            
             img = np.load(full_path)
+            original_shape = img.shape
+            original_dtype = img.dtype
+            original_min = float(img.min())
+            original_max = float(img.max())
+            
             # Handle [H, W, C] -> [C, H, W]
             if img.ndim == 3 and img.shape[-1] == 3: 
                 img = img.transpose(2, 0, 1)
@@ -437,6 +446,24 @@ class BBBC021Dataset(Dataset):
                 img = (img * 2.0) - 1.0
                 
             img = torch.clamp(img, -1, 1)
+            
+            # Log details for first successful load (or first few)
+            if not self._first_load_logged or idx < 3:
+                print(f"\n{'='*60}", flush=True)
+                print(f"✓ Successfully loaded image #{idx}", flush=True)
+                print(f"{'='*60}", flush=True)
+                print(f"  Compound: {meta.get('CPD_NAME', 'unknown')}", flush=True)
+                print(f"  File path: {full_path}", flush=True)
+                print(f"  File size: {file_size_bytes:,} bytes ({file_size_bytes / 1024:.2f} KB)", flush=True)
+                print(f"  Original shape: {original_shape} (dtype: {original_dtype})", flush=True)
+                print(f"  Original range: [{original_min:.2f}, {original_max:.2f}]", flush=True)
+                print(f"  Processed shape: {img.shape} (dtype: {img.dtype})", flush=True)
+                print(f"  Processed range: [{img.min():.2f}, {img.max():.2f}]", flush=True)
+                print(f"  Fingerprint shape: {self.fingerprints.get(meta.get('CPD_NAME', 'DMSO'), np.zeros(1024)).shape}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                if idx >= 3:
+                    self._first_load_logged = True
+                    
         except Exception as e:
             # Show the actual error instead of silently failing
             raise RuntimeError(
@@ -675,6 +702,21 @@ def main():
     if len(train_ds) == 0: train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='', encoder=encoder, paths_csv=args.paths_csv)
     val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder, paths_csv=args.paths_csv)
     if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
+    
+    # Log paths.csv status
+    print(f"\n{'='*60}", flush=True)
+    print(f"File Path Resolution Status:", flush=True)
+    print(f"{'='*60}", flush=True)
+    if len(train_ds.paths_lookup) > 0:
+        print(f"  ✓ paths.csv loaded successfully", flush=True)
+        print(f"  - Unique filenames in lookup: {len(train_ds.paths_lookup):,}", flush=True)
+        print(f"  - Total paths indexed: {len(train_ds.paths_by_rel):,}", flush=True)
+        print(f"  - Basename lookups: {len(train_ds.paths_by_basename):,}", flush=True)
+    else:
+        print(f"  ⚠ paths.csv not found - using fallback path resolution", flush=True)
+    print(f"  - Data directory: {train_ds.data_dir}", flush=True)
+    print(f"  - Data directory exists: {train_ds.data_dir.exists()}", flush=True)
+    print(f"{'='*60}\n", flush=True)
 
     # Print dataset details
     print(f"\n{'='*60}", flush=True)
