@@ -446,15 +446,19 @@ def main():
         img_np = ((img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
         img_np = np.clip(img_np, 0, 255)
         
-        # Save as JPG
+        # Save as JPG in current working directory (make path absolute)
         img_pil = Image.fromarray(img_np)
-        sample_filename = f"dataset_sample_{sample['compound'].replace('/', '_')}.jpg"
-        img_pil.save(sample_filename, "JPEG", quality=95)
-        print(f"  Saved random sample to: {sample_filename}")
+        sample_filename = f"dataset_sample_{sample['compound'].replace('/', '_').replace(' ', '_')}.jpg"
+        sample_path = os.path.abspath(sample_filename)  # Get absolute path
+        img_pil.save(sample_path, "JPEG", quality=95)
+        print(f"  Saved random sample to: {sample_path}")
+        print(f"  (Current working directory: {os.getcwd()})")
         print(f"  Compound: {sample['compound']}")
         print(f"  Image shape: {img_tensor.shape}")
     except Exception as e:
         print(f"  Warning: Could not save sample image: {e}")
+        import traceback
+        traceback.print_exc()
 
     train_loader = PairedDataLoader(train_ds, config.batch_size, shuffle=True)
     val_loader = PairedDataLoader(val_ds, batch_size=8, shuffle=True)
