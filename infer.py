@@ -37,16 +37,10 @@ except ImportError:
 class ModifiedDiffusersUNet(nn.Module):
     def __init__(self, image_size=96, fingerprint_dim=1024):
         super().__init__()
-        # Load base to get correct shapes
+        # Load base with default architecture (matches training script)
         self.unet = UNet2DModel.from_pretrained(
             "google/ddpm-cifar10-32",
             sample_size=image_size,
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),
-            down_block_types=("DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"),
-            up_block_types=("UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D"),
             class_embed_type="identity"
         )
         
@@ -59,10 +53,14 @@ class ModifiedDiffusersUNet(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding
         )
+        with torch.no_grad():
+            new_conv.weight[:, :3, :, :] = old_conv.weight
+            new_conv.weight[:, 3:, :, :] = 0.0
+            new_conv.bias = old_conv.bias
         self.unet.conv_in = new_conv
 
-        # Re-apply Projection surgery
-        target_dim = 128 * 4 
+        # Re-apply Projection surgery - get dimension from model
+        target_dim = self.unet.time_embedding.linear_1.out_features
         self.fingerprint_proj = nn.Sequential(
             nn.Linear(fingerprint_dim, 512),
             nn.SiLU(),
@@ -210,7 +208,7 @@ def load_data_sample(data_dir, metadata_file, encoder):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_path", type=str,default="ddpm_diffusers_results/checkpoints/latest.pt", required=True, help="Path to latest.pt")
+    parser.add_argument("--checkpoint_path", type=str, default="ddpm_diffusers_results/checkpoints/latest.pt", help="Path to checkpoint file (default: ddpm_diffusers_results/checkpoints/latest.pt)")
     parser.add_argument("--data_dir", type=str, default="./data/bbbc021_all")
     parser.add_argument("--metadata_file", type=str, default="metadata/bbbc021_df_all.csv")
     parser.add_argument("--output_path", type=str, default="inference_video.mp4")
