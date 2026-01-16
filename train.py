@@ -158,8 +158,8 @@ class MorganFingerprintEncoder:
         return arr
 
 class BBBC021Dataset(Dataset):
-    def __init__(self, data_dir, metadata_file, image_size=96, split='train', encoder=None):
-        self.data_dir = Path(data_dir)
+    def __init__(self, data_dir, metadata_file, image_size=96, split='train', encoder=None, paths_csv=None):
+        self.data_dir = Path(data_dir).resolve()
         self.image_size = image_size
         self.encoder = encoder
         
@@ -182,6 +182,44 @@ class BBBC021Dataset(Dataset):
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
                 self.fingerprints[cpd] = self.encoder.encode(smiles)
+        
+        # Load paths.csv for robust file lookup (same as infer.py)
+        self.paths_lookup = {}  # filename -> list of relative_paths
+        self.paths_by_rel = {}  # relative_path -> full info
+        self.paths_by_basename = {}  # basename (without extension) -> list of paths
+        
+        if paths_csv:
+            paths_csv_path = Path(paths_csv)
+        else:
+            paths_csv_path = Path("paths.csv")
+            if not paths_csv_path.exists():
+                paths_csv_path = Path(data_dir) / "paths.csv"
+        
+        if paths_csv_path.exists():
+            print(f"Loading file paths from {paths_csv_path}...")
+            paths_df = pd.read_csv(paths_csv_path)
+            
+            for _, row in paths_df.iterrows():
+                filename = row['filename']
+                rel_path = row['relative_path']
+                basename = Path(filename).stem  # filename without extension
+                
+                # Lookup by exact filename
+                if filename not in self.paths_lookup:
+                    self.paths_lookup[filename] = []
+                self.paths_lookup[filename].append(rel_path)
+                
+                # Lookup by relative path
+                self.paths_by_rel[rel_path] = row.to_dict()
+                
+                # Lookup by basename (for matching without extension)
+                if basename not in self.paths_by_basename:
+                    self.paths_by_basename[basename] = []
+                self.paths_by_basename[basename].append(rel_path)
+            
+            print(f"  Loaded {len(self.paths_lookup)} unique filenames from paths.csv")
+        else:
+            print("  Note: paths.csv not found, will use fallback path resolution")
 
     def _group_by_batch(self):
         groups = {}
@@ -208,26 +246,181 @@ class BBBC021Dataset(Dataset):
 
     def __len__(self): return len(self.metadata)
 
+    def _find_file_path(self, path):
+        """
+        Robust file path finding using paths.csv lookup (same logic as infer.py).
+        Returns Path object if found, None otherwise.
+        """
+        if not path:
+            return None
+        
+        path_obj = Path(path)
+        filename = path_obj.name
+        basename = path_obj.stem  # filename without extension
+        
+        # Strategy 1: Parse SAMPLE_KEY format (Week7_34681_7_3338_348.0 -> Week7/34681/7_3338_348.0.npy)
+        if '_' in path and path.startswith('Week'):
+            parts = path.replace('.0', '').split('_')
+            if len(parts) >= 5:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1]  # 34681
+                table_part = parts[2]  # 7
+                image_part = parts[3]  # 3338
+                object_part = parts[4]  # 348
+                
+                # Construct expected filename: table_image_object.0.npy
+                expected_filename = f"{table_part}_{image_part}_{object_part}.0.npy"
+                expected_dir = f"{week_part}/{batch_part}"
+                
+                # Try to find in paths.csv
+                if self.paths_lookup and expected_filename in self.paths_lookup:
+                    for rel_path in self.paths_lookup[expected_filename]:
+                        rel_path_str = str(rel_path)
+                        # Check if this path is in the expected directory
+                        if expected_dir in rel_path_str or f"{week_part}/{batch_part}" in rel_path_str:
+                            # Handle path resolution (same as infer.py)
+                            candidates = []
+                            if self.data_dir.name in rel_path_str:
+                                if rel_path_str.startswith(self.data_dir.name + '/'):
+                                    rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                                    candidates.append(self.data_dir / rel_path_clean)
+                                candidates.append(self.data_dir.parent / rel_path)
+                            candidates.append(Path(rel_path).resolve())
+                            candidates.append(self.data_dir / rel_path)
+                            candidates.append(self.data_dir.parent / rel_path)
+                            
+                            candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                            for candidate in candidates:
+                                if candidate.exists():
+                                    return candidate
+                
+                # Also try direct directory search
+                search_dir = self.data_dir / week_part / batch_part
+                if not search_dir.exists():
+                    search_dir = self.data_dir.parent / week_part / batch_part
+                
+                if search_dir.exists():
+                    candidate = search_dir / expected_filename
+                    if candidate.exists():
+                        return candidate
+        
+        # Strategy 2: Search paths.csv by SAMPLE_KEY in relative_path
+        if self.paths_lookup:
+            for rel_path_key, rel_path_info in self.paths_by_rel.items():
+                if path in rel_path_key or path.replace('.0', '') in rel_path_key:
+                    rel_path = rel_path_info['relative_path']
+                    candidates = []
+                    
+                    rel_path_str = str(rel_path)
+                    if self.data_dir.name in rel_path_str:
+                        if rel_path_str.startswith(self.data_dir.name + '/'):
+                            rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                            candidates.append(self.data_dir / rel_path_clean)
+                        candidates.append(self.data_dir.parent / rel_path)
+                    candidates.append(Path(rel_path).resolve())
+                    candidates.append(self.data_dir / rel_path)
+                    candidates.append(self.data_dir.parent / rel_path)
+                    
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    for candidate in candidates:
+                        if candidate.exists():
+                            return candidate
+        
+        # Strategy 3: Exact filename match in paths.csv
+        if self.paths_lookup and filename in self.paths_lookup:
+            for rel_path in self.paths_lookup[filename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Strategy 4: Basename match in paths.csv
+        if self.paths_lookup and basename in self.paths_by_basename:
+            for rel_path in self.paths_by_basename[basename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Fallback: Direct path matching
+        for candidate in [self.data_dir / path, self.data_dir / (path + '.npy')]:
+            if candidate.exists():
+                return candidate
+        
+        # Last resort: Recursive search
+        search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
+        matches = list(self.data_dir.rglob(search_pattern))
+        if matches:
+            return matches[0]
+        
+        # Also try recursive search for SAMPLE_KEY in directory structure
+        if '_' in path:
+            parts = path.split('_')
+            if len(parts) >= 2:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1] if len(parts) > 1 else None  # 34681
+                
+                if batch_part:
+                    search_dir = self.data_dir / week_part / batch_part
+                    if search_dir.exists():
+                        search_pattern = path if path.endswith('.npy') else path + '.npy'
+                        matches = list(search_dir.rglob(search_pattern))
+                        if matches:
+                            return matches[0]
+        
+        return None
+
     def __getitem__(self, idx):
         meta = self.metadata[idx]
         path = meta.get('image_path') or meta.get('SAMPLE_KEY')
         
-        # Try finding the file
-        full_path = self.data_dir / path
-        if not full_path.exists():
-            full_path = self.data_dir / (str(path) + '.npy')
+        if not path:
+            raise ValueError(
+                f"CRITICAL: No image path found in metadata!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  Metadata keys: {list(meta.keys())}"
+            )
+        
+        # Use robust path finding (same as infer.py)
+        full_path = self._find_file_path(path)
         
         # CRITICAL: Check if file exists before attempting to load
-        if not full_path.exists():
+        if full_path is None or not full_path.exists():
             raise FileNotFoundError(
                 f"CRITICAL: Image file not found!\n"
                 f"  Index: {idx}\n"
                 f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
                 f"  Path from metadata: {path}\n"
-                f"  Attempted path 1: {self.data_dir / path}\n"
-                f"  Attempted path 2: {full_path}\n"
                 f"  Data directory: {self.data_dir}\n"
-                f"  Data directory exists: {self.data_dir.exists()}"
+                f"  Data directory exists: {self.data_dir.exists()}\n"
+                f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
             )
             
         try:
@@ -477,10 +670,10 @@ def main():
     sys.stdout.flush()  # Ensure output is flushed
     
     encoder = MorganFingerprintEncoder()
-    train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder)
-    if len(train_ds) == 0: train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='', encoder=encoder)
-    val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder)
-    if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder)
+    train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder, paths_csv=args.paths_csv)
+    if len(train_ds) == 0: train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='', encoder=encoder, paths_csv=args.paths_csv)
+    val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder, paths_csv=args.paths_csv)
+    if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
 
     # Print dataset details
     print(f"\n{'='*60}", flush=True)
