@@ -573,12 +573,14 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
     
     for idx, row in eval_df.iterrows():
         if (idx + 1) % 100 == 0:
-            print(f"  Processed {idx + 1}/{num_samples} samples...")
+            print(f"  Processed {idx + 1}/{num_samples} samples... (Successful: {successful}, Failed: {failed})")
         
         try:
             # Find target file
             target_path = find_file_path(row)
             if target_path is None:
+                if failed < 5:  # Print first few failures for debugging
+                    print(f"    Failed to find target file for sample {idx}: {row.get('CPD_NAME', 'unknown')}")
                 failed += 1
                 continue
             
@@ -592,17 +594,23 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
             batch = row['BATCH']
             control_candidates = df[(df['BATCH'] == batch) & (df['CPD_NAME'].str.upper() == 'DMSO')]
             if len(control_candidates) == 0:
+                if failed < 5:  # Print first few failures for debugging
+                    print(f"    No control (DMSO) found for batch {batch} (sample {idx})")
                 failed += 1
                 continue
             
             control_row = control_candidates.sample(1).iloc[0]
             control_path = find_file_path(control_row)
             if control_path is None:
+                if failed < 5:  # Print first few failures for debugging
+                    print(f"    Failed to find control file for batch {batch} (sample {idx})")
                 failed += 1
                 continue
             
             control_img = load_image_file(control_path)
             if control_img is None:
+                if failed < 5:  # Print first few failures for debugging
+                    print(f"    Failed to load control image from {control_path} (sample {idx})")
                 failed += 1
                 continue
             
@@ -669,6 +677,20 @@ def evaluate_batch(model, data_dir, metadata_file, encoder, paths_csv, num_sampl
             print(f"  Error processing sample {idx}: {e}")
             failed += 1
             continue
+    
+    # Check if we have any successful results
+    if len(results) == 0:
+        print(f"\n{'='*60}")
+        print(f"ERROR: No samples were successfully processed!")
+        print(f"{'='*60}")
+        print(f"Total samples attempted: {num_samples}")
+        print(f"Successful: {successful}")
+        print(f"Failed: {failed}")
+        print(f"\nThis usually means:")
+        print(f"  - Files not found (check paths.csv and data directory)")
+        print(f"  - Control samples missing for batches")
+        print(f"  - Image loading errors")
+        return None, None
     
     # Save results
     results_df = pd.DataFrame(results)
