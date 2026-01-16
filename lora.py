@@ -628,7 +628,6 @@ def main():
     print("\nStarting LoRA Fine-Tuning...")
     
     global_step = 0
-    epoch_losses = []
     
     for epoch in range(start_epoch, config.epochs):
         unet.train()
