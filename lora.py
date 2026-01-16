@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.utils import save_image
 from pathlib import Path
@@ -537,8 +537,18 @@ def main():
 
     # 6. Dataset & Loader
     print("\nLoading Dataset...", flush=True)
-    dataset = BBBC021LoRADataset(config.data_dir, config.metadata_file, tokenizer, size=config.image_size, split='train', paths_csv=args.paths_csv)
-    print(f"Training Images: {len(dataset):,}")
+    # Load ALL data (not just 'train' split) to sample 10% from all weeks
+    dataset_full = BBBC021LoRADataset(config.data_dir, config.metadata_file, tokenizer, size=config.image_size, split='', paths_csv=args.paths_csv)
+    print(f"Total Images Available: {len(dataset_full):,}")
+    
+    # Sample 10% of the dataset randomly
+    import random
+    random.seed(42)  # For reproducibility
+    total_size = len(dataset_full)
+    sample_size = max(1, int(total_size * 0.10))  # At least 1 sample
+    indices = random.sample(range(total_size), sample_size)
+    dataset = Subset(dataset_full, indices)
+    print(f"Using 10% of dataset: {len(dataset):,} images ({sample_size/total_size*100:.1f}%)", flush=True)
     
     # Log paths.csv status
     print(f"\n{'='*60}", flush=True)
