@@ -380,6 +380,9 @@ def main():
     if WANDB_AVAILABLE: wandb.init(project="bbbc021-diffusers-pretrain", config=config.__dict__)
 
     print("Loading Dataset...")
+    import sys
+    sys.stdout.flush()  # Ensure output is flushed
+    
     encoder = MorganFingerprintEncoder()
     train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder)
     if len(train_ds) == 0: train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='', encoder=encoder)
@@ -390,30 +393,42 @@ def main():
     print(f"\n{'='*60}")
     print(f"Dataset Details:")
     print(f"{'='*60}")
-    print(f"Train split: {len(train_ds)} samples")
-    print(f"Val/Test split: {len(val_ds)} samples")
-    print(f"Total samples: {len(train_ds) + len(val_ds)}")
+    sys.stdout.flush()
     
-    # Count compounds
-    train_compounds = len(set([m['CPD_NAME'] for m in train_ds.metadata]))
-    val_compounds = len(set([m['CPD_NAME'] for m in val_ds.metadata]))
-    print(f"Train compounds: {train_compounds}")
-    print(f"Val/Test compounds: {val_compounds}")
-    
-    # Count batches
-    train_batches = len(set([m['BATCH'] for m in train_ds.metadata]))
-    val_batches = len(set([m['BATCH'] for m in val_ds.metadata]))
-    print(f"Train batches: {train_batches}")
-    print(f"Val/Test batches: {val_batches}")
-    
-    # Count DMSO vs perturbed
-    train_dmso = sum([1 for m in train_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
-    train_perturbed = len(train_ds.metadata) - train_dmso
-    val_dmso = sum([1 for m in val_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
-    val_perturbed = len(val_ds.metadata) - val_dmso
-    print(f"Train - DMSO: {train_dmso}, Perturbed: {train_perturbed}")
-    print(f"Val/Test - DMSO: {val_dmso}, Perturbed: {val_perturbed}")
-    print(f"{'='*60}\n")
+    try:
+        print(f"Train split: {len(train_ds)} samples")
+        print(f"Val/Test split: {len(val_ds)} samples")
+        print(f"Total samples: {len(train_ds) + len(val_ds)}")
+        sys.stdout.flush()
+        
+        # Count compounds
+        train_compounds = len(set([m['CPD_NAME'] for m in train_ds.metadata]))
+        val_compounds = len(set([m['CPD_NAME'] for m in val_ds.metadata]))
+        print(f"Train compounds: {train_compounds}")
+        print(f"Val/Test compounds: {val_compounds}")
+        sys.stdout.flush()
+        
+        # Count batches
+        train_batches = len(set([m['BATCH'] for m in train_ds.metadata]))
+        val_batches = len(set([m['BATCH'] for m in val_ds.metadata]))
+        print(f"Train batches: {train_batches}")
+        print(f"Val/Test batches: {val_batches}")
+        sys.stdout.flush()
+        
+        # Count DMSO vs perturbed
+        train_dmso = sum([1 for m in train_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
+        train_perturbed = len(train_ds.metadata) - train_dmso
+        val_dmso = sum([1 for m in val_ds.metadata if m['CPD_NAME'].upper() == 'DMSO'])
+        val_perturbed = len(val_ds.metadata) - val_dmso
+        print(f"Train - DMSO: {train_dmso}, Perturbed: {train_perturbed}")
+        print(f"Val/Test - DMSO: {val_dmso}, Perturbed: {val_perturbed}")
+        print(f"{'='*60}\n")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"Error printing dataset details: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
 
     # Save a random dataset image as JPG
     print("Saving random dataset sample image...")
