@@ -103,6 +103,7 @@ class TrainingLogger:
         self.csv_path = os.path.join(save_dir, "training_history.csv")
         self.plot_path = os.path.join(save_dir, "training_loss.png")
         self.metrics_plot_path = os.path.join(save_dir, "training_metrics.png")
+        self.metrics_csv_path = os.path.join(save_dir, "evaluation_metrics.csv")
         
     def update(self, epoch, loss, metrics=None):
         """
