@@ -358,7 +358,19 @@ def load_checkpoint(model, optimizer, path):
 # ============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Train DDPM model on BBBC021 dataset")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file to resume from (default: auto-loads latest.pt)")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for results (default: ddpm_diffusers_results)")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    args = parser.parse_args()
+    
     config = Config()
+    
+    # Override output directory if specified
+    if args.output_dir:
+        config.output_dir = args.output_dir
+        print(f"Using output directory: {config.output_dir}")
+    
     os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
     os.makedirs(f"{config.output_dir}/checkpoints", exist_ok=True)
     
@@ -435,8 +447,21 @@ def main():
     model = DiffusionModel(config)
     optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr)
 
-    start_epoch = load_checkpoint(model, optimizer, f"{config.output_dir}/checkpoints/latest.pt")
-    print(f"Starting training from epoch {start_epoch+1}...")
+    # Load checkpoint
+    checkpoint_path = args.checkpoint if args.checkpoint else f"{config.output_dir}/checkpoints/latest.pt"
+    if args.resume or args.checkpoint:
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
+        if start_epoch > 0:
+            print(f"Resuming training from epoch {start_epoch+1}...")
+        else:
+            print(f"Starting training from epoch 1 (checkpoint not found or empty)...")
+    else:
+        # Only auto-load if checkpoint exists
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path)
+        if start_epoch > 0:
+            print(f"Found checkpoint, resuming from epoch {start_epoch+1}...")
+        else:
+            print(f"Starting training from epoch 1...")
 
     for epoch in range(start_epoch, config.epochs):
         model.model.train()
