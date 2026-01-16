@@ -170,7 +170,10 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
     df = pd.read_csv(os.path.join(data_dir, metadata_file)) if os.path.exists(os.path.join(data_dir, metadata_file)) else pd.read_csv(metadata_file)
     
     # Load paths.csv if available for efficient file lookup
-    paths_lookup = {}
+    paths_lookup = {}  # filename -> list of relative_paths
+    paths_by_rel = {}  # relative_path -> full info
+    paths_by_basename = {}  # basename (without extension) -> list of paths
+    
     if paths_csv:
         paths_csv_path = Path(paths_csv)
     else:
@@ -182,14 +185,53 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
     if paths_csv_path.exists():
         print(f"Loading file paths from {paths_csv_path}...")
         paths_df = pd.read_csv(paths_csv_path)
-        # Create lookup by filename (most common case)
+        
+        # Create multiple lookup strategies
         for _, row in paths_df.iterrows():
             filename = row['filename']
             rel_path = row['relative_path']
+            basename = Path(filename).stem  # filename without extension
+            
+            # Lookup by exact filename
             if filename not in paths_lookup:
                 paths_lookup[filename] = []
             paths_lookup[filename].append(rel_path)
+            
+            # Lookup by relative path
+            paths_by_rel[rel_path] = row.to_dict()
+            
+            # Lookup by basename (for matching without extension)
+            if basename not in paths_by_basename:
+                paths_by_basename[basename] = []
+            paths_by_basename[basename].append(rel_path)
+        
         print(f"  Loaded {len(paths_lookup)} unique filenames from paths.csv")
+        print(f"  Total files in paths.csv: {len(paths_df)}")
+        
+        # Try to match metadata entries with paths.csv entries
+        print("  Matching metadata entries with paths.csv...")
+        matched = 0
+        for idx, meta_row in df.iterrows():
+            meta_path = meta_row.get('image_path') or meta_row.get('SAMPLE_KEY') or ''
+            if not meta_path:
+                continue
+            
+            # Try to find matching file
+            meta_filename = Path(meta_path).name
+            meta_basename = Path(meta_path).stem
+            
+            found = False
+            if meta_filename in paths_lookup:
+                matched += 1
+                found = True
+            elif meta_basename in paths_by_basename:
+                matched += 1
+                found = True
+            elif any(meta_filename in rel or meta_basename in rel for rel in paths_by_rel.keys()):
+                matched += 1
+                found = True
+        
+        print(f"  Matched {matched}/{len(df)} metadata entries with paths.csv")
     else:
         print("  Note: paths.csv not found, will use fallback path resolution")
     
@@ -227,35 +269,65 @@ def load_data_sample(data_dir, metadata_file, encoder, paths_csv=None):
         data_dir_path = Path(data_dir).resolve()
         full_path = None
         
-        # First, try using paths.csv lookup
+        # First, try using paths.csv lookup (multiple strategies)
         if paths_lookup:
-            # Try to match by filename
             path_obj = Path(path)
             filename = path_obj.name
-            # Remove .npy extension if present for matching
-            filename_base = filename.replace('.npy', '')
+            basename = path_obj.stem  # filename without extension
+            filename_no_ext = filename.replace('.npy', '').replace('.NPY', '')
             
-            # Try exact filename match
+            # Strategy 1: Exact filename match
             if filename in paths_lookup:
                 for rel_path in paths_lookup[filename]:
                     candidate = data_dir_path / rel_path
                     if candidate.exists():
                         full_path = candidate
-                        print(f"  Found image via paths.csv lookup: {full_path}")
+                        print(f"  Found image via paths.csv (exact filename): {full_path}")
                         break
             
-            # Try matching without extension
+            # Strategy 2: Match by basename (without extension)
+            if full_path is None and basename in paths_by_basename:
+                for rel_path in paths_by_basename[basename]:
+                    candidate = data_dir_path / rel_path
+                    if candidate.exists():
+                        full_path = candidate
+                        print(f"  Found image via paths.csv (basename match): {full_path}")
+                        break
+            
+            # Strategy 3: Match filename without extension
             if full_path is None:
                 for key in paths_lookup.keys():
-                    if key.replace('.npy', '') == filename_base:
+                    key_basename = Path(key).stem
+                    if key_basename == filename_no_ext or key_basename == basename:
                         for rel_path in paths_lookup[key]:
                             candidate = data_dir_path / rel_path
                             if candidate.exists():
                                 full_path = candidate
-                                print(f"  Found image via paths.csv (extension match): {full_path}")
+                                print(f"  Found image via paths.csv (no-ext match): {full_path}")
                                 break
                         if full_path:
                             break
+            
+            # Strategy 4: Check if path from metadata matches any relative_path
+            if full_path is None:
+                # Try direct relative path match (path from metadata is a rel_path key)
+                if path in paths_by_rel:
+                    rel_path = path  # path is already the rel_path key
+                    candidate = data_dir_path / rel_path
+                    if candidate.exists():
+                        full_path = candidate
+                        print(f"  Found image via paths.csv (direct path match): {full_path}")
+                
+                # Try partial path matching (path contains or is contained in rel_path)
+                if full_path is None:
+                    for rel_path_key in paths_by_rel.keys():
+                        # Check if metadata path is part of relative path or vice versa
+                        if path in rel_path_key or rel_path_key.endswith(path) or path.endswith(rel_path_key):
+                            candidate = data_dir_path / rel_path_key
+                            if candidate.exists():
+                                full_path = candidate
+                                print(f"  Found image via paths.csv (partial path match): {full_path}")
+                                break
         
         # Fallback: Try multiple path variations
         if full_path is None:
