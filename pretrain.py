@@ -88,27 +88,43 @@ class Config:
 class TrainingLogger:
     def __init__(self, save_dir):
         self.save_dir = save_dir
-        self.history = {'epoch': [], 'loss': []}
+        self.history = {'epoch': [], 'loss': [], 'learning_rate': []}
         self.csv_path = os.path.join(save_dir, "training_history.csv")
         self.plot_path = os.path.join(save_dir, "training_loss.png")
         
-    def update(self, epoch, loss):
+    def update(self, epoch, loss, lr=None):
         self.history['epoch'].append(epoch)
         self.history['loss'].append(loss)
+        self.history['learning_rate'].append(lr if lr is not None else 0)
         
         # Save CSV
         df = pd.DataFrame(self.history)
         df.to_csv(self.csv_path, index=False)
         
-        # Plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.history['epoch'], self.history['loss'], label='Reconstruction Loss', color='#1f77b4', linewidth=2)
-        plt.title('Unconditional Training Dynamics (Train Set Only)')
-        plt.xlabel('Epoch')
-        plt.ylabel('MSE Loss')
-        plt.yscale('log')
-        plt.grid(True, which="both", alpha=0.2)
-        plt.legend()
+        # Plot with dual y-axis for loss and learning rate
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        
+        # Loss on left y-axis
+        color = '#1f77b4'
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('MSE Loss', color=color)
+        line1 = ax1.plot(self.history['epoch'], self.history['loss'], 
+                        label='Reconstruction Loss', color=color, linewidth=2)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_yscale('log')
+        ax1.grid(True, which="both", alpha=0.2)
+        
+        # Learning rate on right y-axis
+        if any(lr > 0 for lr in self.history['learning_rate']):
+            ax2 = ax1.twinx()
+            color2 = '#ff7f0e'
+            ax2.set_ylabel('Learning Rate', color=color2)
+            line2 = ax2.plot(self.history['epoch'], self.history['learning_rate'], 
+                            label='Learning Rate', color=color2, linewidth=2, linestyle='--')
+            ax2.tick_params(axis='y', labelcolor=color2)
+            ax2.set_yscale('log')
+        
+        plt.title(f'Unconditional Training Dynamics (Epoch {epoch})')
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
