@@ -640,10 +640,18 @@ class ModifiedDiffusersUNet(nn.Module):
     def __init__(self, image_size=96, fingerprint_dim=1024):
         super().__init__()
         base_model_id = Config.base_model_id
-        print(f"Loading base architecture from {base_model_id}...")
+        print(f"Attempting to load base architecture from {base_model_id}...")
         
-        # Load pretrained UNet weights
-        unet_pre = UNet2DModel.from_pretrained(base_model_id)
+        # Try to load pretrained UNet weights, with fallback
+        try:
+            unet_pre = UNet2DModel.from_pretrained(base_model_id)
+            print(f"  ✓ Successfully loaded pretrained model from {base_model_id}")
+        except Exception as e:
+            print(f"  ⚠ Warning: Could not load {base_model_id}: {e}")
+            print(f"  Falling back to google/ddpm-cifar10-32...")
+            base_model_id = "google/ddpm-cifar10-32"
+            unet_pre = UNet2DModel.from_pretrained(base_model_id)
+            print(f"  ✓ Loaded fallback model from {base_model_id}")
         
         # Rebuild a UNet with YOUR desired sample_size and channels
         # This ensures config matches your training setup (96x96, 6 channels)
