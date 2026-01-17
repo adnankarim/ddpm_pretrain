@@ -810,6 +810,10 @@ def calculate_metrics(model, val_loader, device, num_samples=8):
     except ImportError:
         SKIMAGE_AVAILABLE = False
     
+    # Collect all real and generated images for FID
+    all_real_images = []
+    all_generated_images = []
+    
     sample_count = 0
     with torch.no_grad():
         for batch in val_loader:
