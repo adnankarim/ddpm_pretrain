@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
 from pathlib import Path
 from PIL import Image
@@ -62,9 +62,8 @@ class Config:
     metadata_file = "metadata/bbbc021_df_all.csv"
     image_size = 96
     
-    # Architecture (Modern U-Net for 96x96)
-    # Initialized from scratch
-    channels = (128, 256, 512, 512)
+    # Architecture (Using pretrained DDPM model)
+    pretrained_model_id = "anton-l/ddpm-butterflies-128"
     
     # Diffusion
     timesteps = 1000
@@ -439,30 +438,15 @@ class UnconditionalDiffusion(nn.Module):
         super().__init__()
         self.cfg = config
         
-        # Initialize Modern U-Net from Scratch
-        # No conditioning inputs (in_channels=3)
-        self.model = UNet2DModel(
-            sample_size=config.image_size,
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            block_out_channels=config.channels,
-            down_block_types=(
-                "DownBlock2D", 
-                "DownBlock2D", 
-                "AttnDownBlock2D",  # Attention at 24x24
-                "AttnDownBlock2D",  # Attention at 12x12
-            ),
-            up_block_types=(
-                "AttnUpBlock2D", 
-                "AttnUpBlock2D", 
-                "UpBlock2D", 
-                "UpBlock2D"
-            ),
-            resnet_time_scale_shift="scale_shift", 
-            act_fn="silu", 
-            norm_num_groups=32,
+        # Load pretrained U-Net from anton-l/ddpm-butterflies-128
+        # The pretrained model is for 128x128, but we'll use it for 96x96 (should work with resizing)
+        print(f"Loading pretrained model from {config.pretrained_model_id}...")
+        self.model = UNet2DModel.from_pretrained(
+            config.pretrained_model_id,
+            sample_size=config.image_size,  # Use our image size (96x96)
+            ignore_mismatched_sizes=True  # Allow size mismatch
         ).to(config.device)
+        print("  ✓ Pretrained model loaded successfully")
         
         # Diffusion Schedule
         self.timesteps = config.timesteps
@@ -617,37 +601,29 @@ def main():
     print(f"BBBC021 UNCONDITIONAL TRAINING (TRAIN SPLIT ONLY)")
     print(f"{'='*60}")
     
-    # Load Train Split from all weeks
-    dataset_full = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train', paths_csv=None)
-    print(f"Total Train Images Available: {len(dataset_full):,}")
+    # Load ONLY Train Split
+    dataset = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train', paths_csv=None)
+    print(f"Training Images: {len(dataset):,}")
     
-    # Sample a subset from train samples (10% by default)
-    import random
-    random.seed(42)  # For reproducibility
-    total_size = len(dataset_full)
-    sample_size = max(1, int(total_size * 0.10))  # 10% of train samples
-    indices = random.sample(range(total_size), sample_size)
-    dataset = Subset(dataset_full, indices)
-    print(f"Using subset of train samples: {len(dataset):,} images ({sample_size/total_size*100:.1f}%)", flush=True)
-    
-    # Log paths.csv status (access through dataset_full since Subset doesn't have these attributes)
+    # Log paths.csv status
     print(f"\n{'='*60}", flush=True)
     print(f"File Path Resolution Status:", flush=True)
     print(f"{'='*60}", flush=True)
-    if len(dataset_full.paths_lookup) > 0:
+    if len(dataset.paths_lookup) > 0:
         print(f"  ✓ paths.csv loaded successfully", flush=True)
-        print(f"  - Unique filenames in lookup: {len(dataset_full.paths_lookup):,}", flush=True)
-        print(f"  - Total paths indexed: {len(dataset_full.paths_by_rel):,}", flush=True)
-        print(f"  - Basename lookups: {len(dataset_full.paths_by_basename):,}", flush=True)
+        print(f"  - Unique filenames in lookup: {len(dataset.paths_lookup):,}", flush=True)
+        print(f"  - Total paths indexed: {len(dataset.paths_by_rel):,}", flush=True)
+        print(f"  - Basename lookups: {len(dataset.paths_by_basename):,}", flush=True)
     else:
         print(f"  ⚠ paths.csv not found - using fallback path resolution", flush=True)
-    print(f"  - Data directory: {dataset_full.data_dir}", flush=True)
-    print(f"  - Data directory exists: {dataset_full.data_dir.exists()}", flush=True)
+    print(f"  - Data directory: {dataset.data_dir}", flush=True)
+    print(f"  - Data directory exists: {dataset.data_dir.exists()}", flush=True)
     print(f"{'='*60}\n", flush=True)
     
     # Save a random dataset sample image
     print("\nSaving random dataset sample image...", flush=True)
     try:
+        import random
         random_idx = random.randint(0, len(dataset) - 1)
         sample_img = dataset[random_idx]
         
