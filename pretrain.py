@@ -617,9 +617,18 @@ def main():
     print(f"BBBC021 UNCONDITIONAL TRAINING (TRAIN SPLIT ONLY)")
     print(f"{'='*60}")
     
-    # Load ONLY Train Split
-    dataset = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train', paths_csv=None)
-    print(f"Training Images: {len(dataset):,}")
+    # Load Train Split from all weeks
+    dataset_full = BBBC021TrainOnlyDataset(config.data_dir, config.metadata_file, split='train', paths_csv=None)
+    print(f"Total Train Images Available: {len(dataset_full):,}")
+    
+    # Sample a subset from train samples (10% by default)
+    import random
+    random.seed(42)  # For reproducibility
+    total_size = len(dataset_full)
+    sample_size = max(1, int(total_size * 0.10))  # 10% of train samples
+    indices = random.sample(range(total_size), sample_size)
+    dataset = Subset(dataset_full, indices)
+    print(f"Using subset of train samples: {len(dataset):,} images ({sample_size/total_size*100:.1f}%)", flush=True)
     
     # Log paths.csv status (access through dataset_full since Subset doesn't have these attributes)
     print(f"\n{'='*60}", flush=True)
@@ -639,7 +648,6 @@ def main():
     # Save a random dataset sample image
     print("\nSaving random dataset sample image...", flush=True)
     try:
-        import random
         random_idx = random.randint(0, len(dataset) - 1)
         sample_img = dataset[random_idx]
         
