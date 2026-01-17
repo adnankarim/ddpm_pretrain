@@ -713,7 +713,9 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, prompt, sa
     with torch.no_grad():
         # 1. Prepare Inputs
         # VAE always requires float32, even when model uses fp16
-        ctrl_latents = vae.encode(control.unsqueeze(0).to(device, dtype=torch.float32)).latent_dist.mode() * vae.config.scaling_factor
+        # Explicitly convert control to float32 to avoid dtype mismatch
+        control_float32 = control.unsqueeze(0).to(device).float()
+        ctrl_latents = vae.encode(control_float32).latent_dist.mode() * vae.config.scaling_factor
         fp = fingerprint.unsqueeze(0).to(device)
         
         # 2. Setup Noise
