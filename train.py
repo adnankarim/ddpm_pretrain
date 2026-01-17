@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 
 # --- NEW IMPORTS ---
 try:
-    from diffusers import UNet2DModel
+    from diffusers import UNet2DModel, DDPMScheduler
     DIFFUSERS_AVAILABLE = True
 except ImportError:
     print("CRITICAL: 'diffusers' library not found. Install with: pip install diffusers")
@@ -734,12 +734,11 @@ class DiffusionModel(nn.Module):
 
     def forward(self, x0, control, fingerprint):
         b = x0.shape[0]
-        t = torch.randint(0, self.timesteps, (b,), device=self.cfg.device)
+        t = torch.randint(0, self.timesteps, (b,), device=self.cfg.device).long()
         noise = torch.randn_like(x0)
         
-        # Forward Diffusion: q(x_t | x_0)
-        xt = self.sqrt_alpha_bar[t].view(-1,1,1,1) * x0 + \
-             self.sqrt_one_minus_alpha_bar[t].view(-1,1,1,1) * noise
+        # Forward Diffusion: Use scheduler's add_noise for consistency
+        xt = self.noise_scheduler.add_noise(x0, noise, t)
         
         # Prediction
         noise_pred = self.model(xt, t, control, fingerprint)
@@ -748,26 +747,23 @@ class DiffusionModel(nn.Module):
         return F.mse_loss(noise_pred, noise)
 
     @torch.no_grad()
-    def sample(self, control, fingerprint):
-        """Generate a sample using reverse diffusion"""
+    def sample(self, control, fingerprint, num_inference_steps=None):
+        """Generate a sample using reverse diffusion with DDPMScheduler"""
         self.model.eval()
-        b = control.shape[0]
-        xt = torch.randn_like(control)
+        b, c, h, w = control.shape
+        xt = torch.randn((b, 3, h, w), device=self.cfg.device)
         
-        # Reverse Diffusion: p(x_{t-1} | x_t)
-        for i in reversed(range(self.timesteps)):
-            t = torch.full((b,), i, device=self.cfg.device, dtype=torch.long)
-            noise_pred = self.model(xt, t, control, fingerprint)
-            
-            alpha = 1 - torch.linspace(self.cfg.beta_start, self.cfg.beta_end, self.timesteps).to(self.cfg.device)[i]
-            alpha_bar = self.alpha_bar[i]
-            beta = 1 - alpha
-            z = torch.randn_like(xt) if i > 0 else 0
-            
-            # Update step
-            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
-            xt = torch.clamp(xt, -1, 1)
-        return xt
+        # Use scheduler for consistent sampling
+        steps = num_inference_steps or self.timesteps
+        self.noise_scheduler.set_timesteps(steps, device=self.cfg.device)
+        
+        for t in self.noise_scheduler.timesteps:
+            t_batch = torch.full((b,), t, device=self.cfg.device, dtype=torch.long)
+            noise_pred = self.model(xt, t_batch, control, fingerprint)
+            xt = self.noise_scheduler.step(noise_pred, t, xt).prev_sample
+        
+        # Clamp only once at the end
+        return xt.clamp(-1, 1)
 
 # ============================================================================
 # METRICS CALCULATION
