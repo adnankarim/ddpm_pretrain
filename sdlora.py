@@ -720,7 +720,10 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
         latents = torch.randn_like(target_latents)
         
         for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
-            timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
+            # FIX: Force t to be a valid index (0-999)
+            t_val = t.item() if isinstance(t, torch.Tensor) else t
+            t_val = min(t_val, noise_scheduler.config.num_train_timesteps - 1)
+            timestep = torch.full((latents.shape[0],), t_val, device=config.device, dtype=torch.long)
             
             # A. ControlNet Step
             down_block_res_samples, mid_block_res_sample = controlnet(
@@ -749,8 +752,8 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
                     mid_block_additional_residual=mid_block_res_sample,
                 ).sample
             
-            # C. Scheduler Step
-            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+            # C. Scheduler Step (use t_val to avoid index error)
+            latents = noise_scheduler.step(noise_pred, t_val, latents).prev_sample
         
         # 4. Decode Generated Images
         fake_imgs = vae.decode((latents / vae.config.scaling_factor).float()).sample
