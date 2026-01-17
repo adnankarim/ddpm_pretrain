@@ -1137,8 +1137,8 @@ def main():
             
         # --- EVALUATION ---
         if (epoch + 1) % config.eval_freq == 0:
-            # Use the reusable evaluation function
-            run_evaluation(model, vae, noise_scheduler, dataset, config, logger, epoch+1)
+            # Use the reusable evaluation function (always use train split during training)
+            run_evaluation(model, vae, noise_scheduler, dataset, config, logger, epoch+1, "train")
 
 if __name__ == "__main__":
     main()
