@@ -663,8 +663,9 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
     model.eval()
     
     # Encode Control
+    # VAE requires float32, so convert if needed
     with torch.no_grad():
-        ctrl_latents = vae.encode(control.unsqueeze(0)).latent_dist.mode() * vae.config.scaling_factor
+        ctrl_latents = vae.encode(control.unsqueeze(0).float()).latent_dist.mode() * vae.config.scaling_factor
         fp = fingerprint.unsqueeze(0)
         
         # Start from noise
