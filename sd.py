@@ -86,7 +86,7 @@ class Config:
     # Training
     epochs = 200
     batch_size = 64  # Lower batch size due to 512x512 resolution
-    lr = 1e-4       # Lower LR for fine-tuning pre-trained weights
+    lr = 1e-5       # Lower LR for fine-tuning pre-trained weights (was 1e-4, too high)
     save_freq = 5
     eval_freq = 1
     
@@ -668,41 +668,39 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
     
     model.eval()
     
-    # Infer device from input tensor (more explicit)
-    device = control.device
-    
-    # Encode Control
-    # VAE requires float32, so convert if needed
+    # 1. Prepare Inputs
     with torch.no_grad():
-        ctrl_latents = vae.encode(control.unsqueeze(0).float()).latent_dist.mode() * vae.config.scaling_factor
+        # Ensure correct dtype and device
+        dtype = model.unet.dtype if hasattr(model, 'unet') else torch.float32
+        
+        ctrl_latents = vae.encode(control.unsqueeze(0).to(dtype=dtype)).latent_dist.mode() * vae.config.scaling_factor
         fp = fingerprint.unsqueeze(0)
         
-        # Start from noise
+        # 2. Setup Noise
         latents = torch.randn_like(ctrl_latents)
         frames = []
         
-        # Sample frames at equidistant timesteps
-        save_steps = np.linspace(0, noise_scheduler.config.num_train_timesteps - 1, num_frames, dtype=int)
+        # 3. Setup Scheduler
+        noise_scheduler.set_timesteps(1000)
+        save_steps = np.linspace(0, 999, num_frames, dtype=int)
         
-        # Reverse diffusion loop
-        for i, t in enumerate(reversed(noise_scheduler.timesteps)):
-            # Create timestep tensor for model (batch_size=1,)
-            timestep = torch.full((1,), t, device=device, dtype=torch.long)
+        # FIX: Iterate directly. Do NOT use reversed() - timesteps are already [999, 998, ..., 0]
+        for t in tqdm(noise_scheduler.timesteps, desc="  Generating Video", leave=False):
+            timestep = torch.full((1,), t, device=latents.device, dtype=torch.long)
             
             # Predict noise
             noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
             
-            # DDPM step - pass scalar timestep to avoid tensor boolean ambiguity
+            # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
             
             # Save frame if at capture point
-            if t in save_steps or i == len(noise_scheduler.timesteps) - 1:
+            if t.item() in save_steps or t.item() == noise_scheduler.timesteps[-1].item():
                 # Decode to image
-                with torch.no_grad():
-                    decoded = vae.decode(latents / vae.config.scaling_factor).sample
-                    decoded = (decoded / 2 + 0.5).clamp(0, 1)
-                    img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    frames.append(img_np)
+                decoded = vae.decode(latents / vae.config.scaling_factor).sample
+                decoded = (decoded / 2 + 0.5).clamp(0, 1)
+                img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                frames.append(img_np)
         
         # Also decode control for side-by-side comparison
         ctrl_decoded = vae.decode(ctrl_latents / vae.config.scaling_factor).sample
@@ -718,13 +716,13 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
             combined = np.hstack([frame, separator, ctrl_np])
             final_frames.append(combined)
         
-        # Save video (only if imageio is available - already checked at function start)
-        if IMAGEIO_AVAILABLE:
+        # 4. Save Video
+        if IMAGEIO_AVAILABLE and final_frames:
             import imageio
             imageio.mimsave(save_path, final_frames, fps=10)
             print(f"  ✓ Video saved to: {save_path}")
         else:
-            print(f"  ⚠ Skipping video save (imageio not available)")
+            print(f"  ⚠ Skipping video save (imageio not available or no frames)")
 
 def load_checkpoint(model, optimizer, path, scheduler=None):
     if not os.path.exists(path): 
@@ -1126,6 +1124,17 @@ def main():
         
         # Checkpointing
         if (epoch + 1) % config.save_freq == 0:
+            # Save specific epoch checkpoint (unique file for every evaluated epoch)
+            epoch_path = f"{config.output_dir}/checkpoints/checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'epoch': epoch+1,
+                'config': config.__dict__
+            }, epoch_path)
+            
+            # Update 'latest' for resuming
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
@@ -1133,7 +1142,8 @@ def main():
                 'epoch': epoch+1,
                 'config': config.__dict__
             }, f"{config.output_dir}/checkpoints/latest.pt")
-            print(f"Checkpoint Saved. (LR: {current_lr:.2e})", flush=True)
+            
+            print(f"  ✓ Saved checkpoint: {epoch_path} (LR: {current_lr:.2e})", flush=True)
             
         # --- EVALUATION ---
         if (epoch + 1) % config.eval_freq == 0:
