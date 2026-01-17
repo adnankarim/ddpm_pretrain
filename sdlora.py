@@ -1,22 +1,25 @@
 """
 ================================================================================
-BBBC021 STABLE DIFFUSION: PARTIAL FINE-TUNING (Conditional)
+BBBC021 CONTROLNET + LoRA + DRUG CONDITIONING (Gold Standard Architecture)
 ================================================================================
-Strategy: Sparse Fine-Tuning
+Strategy: ControlNet + LoRA (No Input Surgery - Preserves Pretrained Weights)
 --------------------------------------------------------------------------------
-This script transforms Stable Diffusion into a Drug-Conditioned Generator.
-It freezes most of the pre-trained weights to preserve visual knowledge, 
-but unfreezes specific layers to learn biological drug effects.
+This is the "Gold Standard" architecture that fixes the "Static/Garbage" problem:
+
+1. **Frozen Brain:** Main U-Net is 100% frozen. Never breaks pretrained weights.
+2. **ControlNet:** Separate trainable encoder that guides U-Net via residuals.
+3. **Zero-Convolution:** ControlNet initializes to zero, so Epoch 0 = Standard SD.
+4. **LoRA:** Injected into U-Net for style learning (~1% trainable).
+5. **Dual Conditioning:** CLIP text + Multi-token drug fingerprint.
 
 Architecture:
 1. VAE: Frozen (Encodes pixels -> latents)
-2. U-Net: Partially Unfrozen
-   - conv_in: Trained (Adapts to 8-channel input)
-   - attn2 (Cross-Attn): Trained (Learns "Drug -> Visual" mapping)
-   - conv_out: Trained (Refines biological texture)
-   - ResNets/Self-Attn: FROZEN (Keeps pre-trained knowledge)
-   
-Input: [Noisy Latents (4ch) + Control Latents (4ch)] + Drug Fingerprint
+2. Text Encoder: Frozen (CLIP embeddings)
+3. U-Net: Frozen + LoRA adapters (Trainable ~1%)
+4. ControlNet: Trainable (Learns structure from control images)
+5. Drug Projector: Trainable (Multi-token projection for voice balance)
+
+Input: [Noisy Latents] + [Control Pixel Image] + [CLIP Text + Drug Tokens]
 Output: Denoised Latents (Target Cell)
 ================================================================================
 """
@@ -43,7 +46,12 @@ import matplotlib.pyplot as plt
 
 # --- Dependencies ---
 try:
-    from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+    from diffusers import (
+        AutoencoderKL, 
+        DDPMScheduler, 
+        UNet2DConditionModel,
+        ControlNetModel
+    )
     from transformers import CLIPTextModel, CLIPTokenizer
     DIFFUSERS_AVAILABLE = True
 except ImportError:
@@ -94,14 +102,14 @@ class Config:
     # Training
     epochs = 200
     batch_size = 64  # Lower batch size due to 512x512 resolution
-    lr = 1e-4       # Higher LR is safe for LoRA + Input Surgery
-    save_freq = 1
-    eval_freq = 1
+    lr = 1e-5       # 1e-5 is perfect for ControlNet + LoRA
+    save_freq = 5
+    eval_freq = 5
     
     # Token Strategy (Fixes Flaw #1: Voice Imbalance)
     num_drug_tokens = 4  # Give drug 4 "words" of attention instead of 1
     
-    output_dir = "sd_hybrid_lora_results"
+    output_dir = "controlnet_lora_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mixed_precision = "fp16"
 
@@ -159,7 +167,7 @@ class TrainingLogger:
             ax2.tick_params(axis='y', labelcolor=color2)
             ax2.set_yscale('log')
         
-        plt.title(f'Stable Diffusion Partial Fine-Tuning (Epoch {epoch})')
+        plt.title(f'ControlNet + LoRA Training (Epoch {epoch})')
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
@@ -172,147 +180,29 @@ class TrainingLogger:
         df.to_csv(self.metrics_csv_path, mode='a', header=False, index=False)
         print(f"  📊 Metrics logged to {self.metrics_csv_path}")
 
-    def log_metrics(self, epoch, metrics_dict):
-        """Appends evaluation metrics to a separate CSV"""
-        new_row = {'epoch': epoch}
-        new_row.update(metrics_dict)
-        df = pd.DataFrame([new_row])
-        df.to_csv(self.metrics_csv_path, mode='a', header=False, index=False)
-        print(f"  📊 Metrics logged to {self.metrics_csv_path}")
-
 # ============================================================================
-# ARCHITECTURE: CONDITIONAL STABLE DIFFUSION
+# ARCHITECTURE: DRUG PROJECTOR
 # ============================================================================
 
-class HybridLoRADiffusion(nn.Module):
+class DrugProjector(nn.Module):
     """
-    Hybrid Architecture: LoRA + Input Surgery + Dual Conditioning
-    
-    Fixes:
-    1. Voice Imbalance: Multi-token drug projection (4 tokens instead of 1)
-    2. Uses CLIP text encoder for better conditioning
-    3. LoRA for efficient fine-tuning
+    Drug Projector: Projects fingerprint to multi-token embeddings
+    Fixes Flaw #1: Voice Imbalance by giving drug 4 tokens instead of 1
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
-        print(f"Loading Hybrid Architecture (LoRA + Input Surgery + Dual Conditioning)...")
-        
-        # 1. Load Components
-        self.unet = UNet2DConditionModel.from_pretrained(config.model_id, subfolder="unet")
-        self.text_encoder = CLIPTextModel.from_pretrained(config.model_id, subfolder="text_encoder")
-        self.tokenizer = CLIPTokenizer.from_pretrained(config.model_id, subfolder="tokenizer")
-        
-        # Freeze Text Encoder
-        self.text_encoder.requires_grad_(False)
-        print("  ✓ Text Encoder loaded and frozen")
-        
-        # 2. INPUT SURGERY (4 channels -> 8 channels)
-        print("  ✓ Performing Input Surgery (4->8 channels)...")
-        old_conv = self.unet.conv_in
-        new_conv = nn.Conv2d(
-            8, old_conv.out_channels, 
-            kernel_size=old_conv.kernel_size, 
-            padding=old_conv.padding
-        )
-        with torch.no_grad():
-            new_conv.weight[:, :4, :, :] = old_conv.weight
-            new_conv.weight[:, 4:, :, :] = 0.0  # Zero-init control
-            new_conv.bias = old_conv.bias
-        self.unet.conv_in = new_conv
-        
-        # 3. LoRA INJECTION
-        print("  ✓ Injecting LoRA Adapters...")
-        lora_config = LoraConfig(
-            r=32,  # Higher rank for complex biology
-            lora_alpha=32,
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],  # Cross-attention layers
-            lora_dropout=0.0,
-            bias="none"
-        )
-        self.unet = get_peft_model(self.unet, lora_config)
-        self.unet.print_trainable_parameters()
-        
-        # 4. MULTI-TOKEN DRUG PROJECTION (Fixes Flaw #1: Voice Imbalance)
-        # Projects 1024 -> (4 * 768) to give drug "more voice" (4 tokens instead of 1)
-        print(f"  ✓ Multi-Token Drug Projection: {config.fingerprint_dim} -> {config.num_drug_tokens} tokens (768 dim each)")
-        self.drug_proj = nn.Sequential(
+        # Projects 1024 -> (4 * 768)
+        self.net = nn.Sequential(
             nn.Linear(config.fingerprint_dim, 768 * config.num_drug_tokens),
             nn.SiLU(),
             nn.Linear(768 * config.num_drug_tokens, 768 * config.num_drug_tokens)
         )
-        
-        # 5. UNFREEZE SPECIFIC LAYERS
-        # PEFT handles LoRA, but we must manually unfreeze the surgery layers
-        if hasattr(self.unet, 'base_model'):
-            # PEFT wraps the model
-            self.unet.base_model.model.conv_in.requires_grad_(True)
-        else:
-            self.unet.conv_in.requires_grad_(True)
-        self.drug_proj.requires_grad_(True)
-        
-        self._print_stats()
-
-    def _print_stats(self):
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.parameters())
-        print(f"  Total Parameters: {total:,}")
-        print(f"  Trainable Parameters: {trainable:,} ({(trainable/total)*100:.2f}%)")
-        
-        # Store for later access
-        self.total_params = total
-        self.trainable_params = trainable
-        self.frozen_params = total - trainable
-
-    def forward(self, noisy_latents, timesteps, control_latents, fingerprint, text_prompts):
-        """
-        Forward pass with dual conditioning (CLIP text + Drug fingerprint)
-        
-        Args:
-            noisy_latents: [B, 4, H, W] - Noisy target latents
-            timesteps: [B] - Diffusion timesteps
-            control_latents: [B, 4, H, W] - Control image latents
-            fingerprint: [B, 1024] - Drug fingerprint
-            text_prompts: List[str] - Text prompts for CLIP encoding
-        """
-        # A. Text Embeddings (CLIP)
-        tokens = self.tokenizer(
-            text_prompts, 
-            padding="max_length", 
-            max_length=self.tokenizer.model_max_length,
-            truncation=True, 
-            return_tensors="pt"
-        ).input_ids.to(fingerprint.device)
-        text_emb = self.text_encoder(tokens)[0]  # [B, 77, 768]
-        
-        # B. Drug Embeddings (Multi-Token) - Fixes Flaw #1
-        drug_emb = self.drug_proj(fingerprint)  # [B, N*768] where N=num_drug_tokens
-        drug_emb = drug_emb.view(-1, self.config.num_drug_tokens, 768)  # [B, N, 768]
-        
-        # C. Concatenate Context (77 text tokens + N drug tokens)
-        # Note: SD can handle length > 77 via cross-attention
-        # This gives drug "more voice" (4 votes instead of 1)
-        context = torch.cat([text_emb, drug_emb], dim=1)  # [B, 77+N, 768]
-        
-        # D. Input Sandwich (Noise + Control)
-        unet_input = torch.cat([noisy_latents, control_latents], dim=1)  # [B, 8, H, W]
-        
-        # E. Forward Pass
-        if hasattr(self.unet, 'base_model'):
-            # PEFT wrapped model
-            noise_pred = self.unet.base_model.model(
-                unet_input, 
-                timesteps, 
-                encoder_hidden_states=context
-            ).sample
-        else:
-            noise_pred = self.unet(
-                unet_input, 
-                timesteps, 
-                encoder_hidden_states=context
-            ).sample
-        
-        return noise_pred
+    
+    def forward(self, fingerprint):
+        x = self.net(fingerprint)
+        # Reshape to [Batch, Num_Tokens, 768]
+        return x.view(-1, self.config.num_drug_tokens, 768)
 
 # ============================================================================
 # DATASET & ENCODER
@@ -643,8 +533,8 @@ class PairedBBBC021Dataset(Dataset):
         fp = self.fingerprints.get(cpd, np.zeros(1024))
         
         return {
-            'control': ctrl_img,
-            'target': trt_img,
+            'control': ctrl_img,  # Pixel space for ControlNet
+            'target': trt_img,    # Pixel space (will be encoded to latents)
             'fingerprint': torch.from_numpy(fp).float(),
             'prompt': "fluorescence microscopy image of a cell"  # Static prompt for style
         }
@@ -689,15 +579,19 @@ def calculate_metrics(real_imgs, gen_imgs, noise_pred=None, noise_real=None):
         
     return metrics
 
-def generate_video(model, vae, noise_scheduler, control, fingerprint, prompt, save_path, device, num_frames=40):
+def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_encoder, control, fingerprint, prompt, save_path, device, num_frames=40):
     """
-    Generates video of denoising process (FIXED: No reversed timesteps)
+    Generates video of denoising process using ControlNet + LoRA
     
     Args:
-        model: HybridLoRADiffusion model
+        unet: U-Net with LoRA (frozen base, trainable LoRA)
+        controlnet: ControlNet model (trainable)
         vae: VAE encoder/decoder
-        noise_scheduler: DDPMScheduler
-        control: Control image tensor [3, H, W]
+        scheduler: DDPMScheduler
+        drug_proj: DrugProjector module
+        tokenizer: CLIPTokenizer
+        text_encoder: CLIPTextModel
+        control: Control image tensor [3, H, W] (pixel space)
         fingerprint: Drug fingerprint tensor [1024]
         prompt: Text prompt string
         save_path: Path to save video
@@ -708,50 +602,80 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, prompt, sa
         print("  Warning: imageio not available. Skipping video generation.")
         return
     
-    model.eval()
+    unet.eval()
+    controlnet.eval()
     
     with torch.no_grad():
         # 1. Prepare Inputs
-        # VAE always requires float32, even when model uses fp16
-        # Explicitly convert control to float32 to avoid dtype mismatch
-        control_float32 = control.unsqueeze(0).to(device).float()
-        ctrl_latents = vae.encode(control_float32).latent_dist.mode() * vae.config.scaling_factor
-        fp = fingerprint.unsqueeze(0).to(device)
+        # Control Image (keep in pixel space for ControlNet)
+        ctrl_pixel = control.unsqueeze(0).to(device)  # [1, 3, H, W]
         
-        # 2. Setup Noise
-        latents = torch.randn_like(ctrl_latents)
-        frames = []
+        # Latents for U-Net
+        weight_dtype = next(unet.parameters()).dtype
+        latents = torch.randn((1, 4, 64, 64), device=device, dtype=weight_dtype)
+        
+        # 2. Prepare Context (Text + Drug)
+        tokens = tokenizer(
+            [prompt], 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt"
+        ).input_ids.to(device)
+        text_emb = text_encoder(tokens)[0]  # [1, 77, 768]
+        
+        drug_emb = drug_proj(fingerprint.unsqueeze(0).to(device))  # [1, N, 768]
+        context = torch.cat([text_emb, drug_emb], dim=1)  # [1, 77+N, 768]
         
         # 3. Setup Scheduler
-        noise_scheduler.set_timesteps(1000)
+        scheduler.set_timesteps(1000)
+        frames = []
         save_steps = np.linspace(0, 999, num_frames, dtype=int)
         
-        # FIX: Iterate directly. Do NOT use reversed() - timesteps are already [999, 998, ..., 0]
-        for t in tqdm(noise_scheduler.timesteps, desc="  Generating Video", leave=False):
-            timestep = torch.full((1,), t, device=device, dtype=torch.long)
+        # 4. Loop (FIXED: No reversed timesteps)
+        for t in tqdm(scheduler.timesteps, desc="  Generating Video", leave=False):
+            t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
             
-            # Predict noise (pass prompt as list)
-            noise_pred = model(
-                latents.float(), 
-                timestep, 
-                ctrl_latents.float(), 
-                fp, 
-                [prompt]
+            # A. ControlNet Step (takes pixel image)
+            down_block_res_samples, mid_block_res_sample = controlnet(
+                latents,
+                t_tensor,
+                encoder_hidden_states=context,
+                controlnet_cond=ctrl_pixel,  # Pass Pixel Image!
+                return_dict=False,
             )
             
-            # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
-            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+            # B. U-Net Step (uses ControlNet residuals)
+            if hasattr(unet, 'base_model'):
+                # PEFT wrapped model
+                noise_pred = unet.base_model.model(
+                    latents,
+                    t_tensor,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
+            else:
+                noise_pred = unet(
+                    latents,
+                    t_tensor,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
             
-            # Save frame if at capture point
-            if t.item() in save_steps or t.item() == noise_scheduler.timesteps[-1].item():
-                # Decode to image
-                decoded = vae.decode(latents / vae.config.scaling_factor).sample
+            # C. Scheduler Step
+            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            
+            # D. Save Frame
+            if t.item() in save_steps or t.item() == 0:
+                # Decode to image (VAE requires float32)
+                decoded = vae.decode((latents / vae.config.scaling_factor).float()).sample
                 decoded = (decoded / 2 + 0.5).clamp(0, 1)
                 img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 frames.append(img_np)
         
         # Also decode control for side-by-side comparison
-        ctrl_decoded = vae.decode(ctrl_latents / vae.config.scaling_factor).sample
+        ctrl_decoded = vae.decode(vae.encode(ctrl_pixel.float()).latent_dist.mode() / vae.config.scaling_factor).sample
         ctrl_decoded = (ctrl_decoded / 2 + 0.5).clamp(0, 1)
         ctrl_np = (ctrl_decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         
@@ -764,7 +688,7 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, prompt, sa
             combined = np.hstack([frame, separator, ctrl_np])
             final_frames.append(combined)
         
-        # 4. Save Video
+        # 5. Save Video
         if IMAGEIO_AVAILABLE and final_frames:
             import imageio
             imageio.mimsave(save_path, final_frames, fps=10)
@@ -772,13 +696,21 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, prompt, sa
         else:
             print(f"  ⚠ Skipping video save (imageio not available or no frames)")
 
-def load_checkpoint(model, optimizer, path, scheduler=None):
+def load_checkpoint(unet, controlnet, drug_proj, optimizer, path, scheduler=None):
     if not os.path.exists(path): 
         return 0
     print(f"Loading checkpoint: {path}")
-    ckpt = torch.load(path, map_location=model.cfg.device if hasattr(model, 'cfg') else 'cpu')
-    model.load_state_dict(ckpt['model'])
-    optimizer.load_state_dict(ckpt['optimizer'])
+    ckpt = torch.load(path, map_location='cpu')
+    
+    # Load separate components
+    if 'unet' in ckpt:
+        unet.load_state_dict(ckpt['unet'], strict=False)
+    if 'controlnet' in ckpt:
+        controlnet.load_state_dict(ckpt['controlnet'], strict=False)
+    if 'drug_proj' in ckpt:
+        drug_proj.load_state_dict(ckpt['drug_proj'], strict=False)
+    if 'optimizer' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer'])
     if scheduler is not None and 'scheduler' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler'])
     return ckpt.get('epoch', 0)
@@ -787,26 +719,17 @@ def load_checkpoint(model, optimizer, path, scheduler=None):
 # MAIN
 # ============================================================================
 
-def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch=None, eval_split="train"):
+def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, dataset, config, logger, checkpoint_epoch=None, eval_split="train"):
     """
     Run evaluation: generate video, grid, and metrics without training.
-    
-    Args:
-        model: The trained model
-        vae: VAE encoder/decoder
-        noise_scheduler: Diffusion noise scheduler
-        dataset: Dataset to evaluate on
-        config: Configuration object
-        logger: TrainingLogger instance
-        checkpoint_epoch: Epoch number from checkpoint (for logging)
-        eval_split: Data split name (for logging and file naming)
     """
     print("\n" + "="*60, flush=True)
     epoch_label = f"Epoch {checkpoint_epoch}" if checkpoint_epoch else "Evaluation"
     print(f"EVALUATION ({epoch_label}) - Split: {eval_split}", flush=True)
     print("="*60, flush=True)
     
-    model.eval()
+    unet.eval()
+    controlnet.eval()
     
     # Create dataloader for evaluation
     eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
@@ -818,35 +741,60 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
     ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
     target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
     fp = sample_batch['fingerprint'][:4].to(config.device)
+    prompts = sample_batch['prompt']
     
     with torch.no_grad():
-        # 1. Encode Control and Target
-        ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
+        # 1. Encode Target to Latents
         target_latents = vae.encode(target_img.float()).latent_dist.mode() * vae.config.scaling_factor
         
-        # 2. Run Reverse Diffusion Process (Full Sampling Loop)
-        print("  Running reverse diffusion sampling...", flush=True)
-        latents = torch.randn_like(ctrl_latents)
+        # 2. Prepare Context (Text + Drug)
+        tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
+        text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
+        drug_emb = drug_proj(fp)  # [B, N, 768]
+        context = torch.cat([text_emb, drug_emb], dim=1)  # [B, 77+N, 768]
         
-        # Use scheduler for proper sampling
-        default_prompt = "fluorescence microscopy image of a cell"
-        prompts = [default_prompt] * latents.shape[0]
+        # 3. Run Reverse Diffusion Process (Full Sampling Loop)
+        print("  Running reverse diffusion sampling...", flush=True)
+        latents = torch.randn_like(target_latents)
         
         for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
-            # Create timestep tensor for model (batch_size,)
             timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
             
-            # Predict noise (with prompts)
-            noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp, prompts)
+            # A. ControlNet Step
+            down_block_res_samples, mid_block_res_sample = controlnet(
+                latents,
+                timestep,
+                encoder_hidden_states=context,
+                controlnet_cond=ctrl_img,  # Pixel image
+                return_dict=False,
+            )
             
-            # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
+            # B. U-Net Step
+            if hasattr(unet, 'base_model'):
+                noise_pred = unet.base_model.model(
+                    latents,
+                    timestep,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
+            else:
+                noise_pred = unet(
+                    latents,
+                    timestep,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
+            
+            # C. Scheduler Step
             latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
         
-        # 3. Decode Generated Images
-        fake_imgs = vae.decode(latents / vae.config.scaling_factor).sample
+        # 4. Decode Generated Images
+        fake_imgs = vae.decode((latents / vae.config.scaling_factor).float()).sample
         fake_imgs = (fake_imgs / 2 + 0.5).clamp(0, 1)
         
-        # 4. Calculate Metrics
+        # 5. Calculate Metrics
         real_imgs_norm = (target_img / 2 + 0.5).clamp(0, 1)
         
         # Also compute noise prediction metrics during forward pass
@@ -854,10 +802,31 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
                                 (target_latents.shape[0],), device=config.device).long()
         noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
-        # Use default prompt for metrics calculation
-        default_prompt = "fluorescence microscopy image of a cell"
-        prompts = [default_prompt] * target_latents.shape[0]
-        noise_pred_forward = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp, prompts)
+        
+        # Forward pass for metrics
+        down_res, mid_res = controlnet(
+            noisy_target,
+            timesteps,
+            encoder_hidden_states=context,
+            controlnet_cond=ctrl_img,
+            return_dict=False,
+        )
+        if hasattr(unet, 'base_model'):
+            noise_pred_forward = unet.base_model.model(
+                noisy_target,
+                timesteps,
+                encoder_hidden_states=context,
+                down_block_additional_residuals=down_res,
+                mid_block_additional_residual=mid_res,
+            ).sample
+        else:
+            noise_pred_forward = unet(
+                noisy_target,
+                timesteps,
+                encoder_hidden_states=context,
+                down_block_additional_residuals=down_res,
+                mid_block_additional_residual=mid_res,
+            ).sample
         
         metrics = calculate_metrics(real_imgs_norm, fake_imgs, noise_pred_forward, noise)
         
@@ -878,18 +847,16 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
         if checkpoint_epoch:
             logger.log_metrics(checkpoint_epoch, metrics)
         else:
-            logger.log_metrics(0, metrics)  # Use epoch 0 for standalone evaluation
+            logger.log_metrics(0, metrics)
         
-        # 5. Save Image Grid
+        # 6. Save Image Grid
         grid = torch.cat([
             (ctrl_img / 2 + 0.5).clamp(0, 1)[:4],
             fake_imgs[:4],
-            real_imgs_norm[:4]  # Show target again for comparison
+            real_imgs_norm[:4]
         ], dim=0)
         
-        # Create filename with split info
         split_suffix = f"_{eval_split}" if eval_split != "train" else ""
-        
         if checkpoint_epoch:
             grid_path = f"{config.output_dir}/plots/eval_epoch_{checkpoint_epoch}{split_suffix}.png"
         else:
@@ -898,15 +865,14 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
         save_image(grid, grid_path, nrow=4, normalize=False)
         print(f"  ✓ Sample grid saved to: {grid_path}", flush=True)
         
-        # 6. Generate Video
+        # 7. Generate Video
         if checkpoint_epoch:
             video_path = f"{config.output_dir}/plots/video_eval_epoch_{checkpoint_epoch}{split_suffix}.mp4"
         else:
             video_path = f"{config.output_dir}/plots/video_eval_latest{split_suffix}.mp4"
         
-        # Generate video with prompt
-        default_prompt = "fluorescence microscopy image of a cell"
-        generate_video(model, vae, noise_scheduler, ctrl_img[0], fp[0], default_prompt, video_path, config.device)
+        generate_video(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, 
+                      ctrl_img[0], fp[0], prompts[0], video_path, config.device)
         
         print("="*60 + "\n", flush=True)
         
@@ -924,13 +890,13 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
             wandb.log(wandb_metrics)
 
 def main():
-    parser = argparse.ArgumentParser(description="Partial Fine-Tuning of Stable Diffusion for Drug-Conditioned Generation")
+    parser = argparse.ArgumentParser(description="ControlNet + LoRA for Drug-Conditioned Generation")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file")
     parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (generate video, grid, and metrics)")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation (default: uses latest.pt from output_dir)")
-    parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation (default: train)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation")
+    parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation")
     args = parser.parse_args()
     
     config = Config()
@@ -943,78 +909,81 @@ def main():
     logger = TrainingLogger(config.output_dir)
     
     if WANDB_AVAILABLE: 
-        wandb.init(project="bbbc021-sd-partial", config=config.__dict__)
+        wandb.init(project="bbbc021-controlnet-lora", config=config.__dict__)
 
-    # 1. Load VAE (Frozen)
-    print("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device)
+    # 1. Load Standard Components (All Frozen)
+    print("Loading Components...")
+    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    
+    vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device, dtype=weight_dtype)
+    text_encoder = CLIPTextModel.from_pretrained(config.model_id, subfolder="text_encoder").to(config.device)
+    tokenizer = CLIPTokenizer.from_pretrained(config.model_id, subfolder="tokenizer")
+    unet = UNet2DConditionModel.from_pretrained(config.model_id, subfolder="unet").to(config.device, dtype=weight_dtype)
+    
+    # Freeze everything initially
     vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+    print("  ✓ VAE, Text Encoder, and U-Net loaded and frozen")
     
-    # 2. Load Model (Hybrid: LoRA + Input Surgery + Dual Conditioning)
-    model = HybridLoRADiffusion(config).to(config.device)
+    # 2. Setup ControlNet (Initialized from U-Net weights for fast convergence)
+    print("Creating ControlNet from U-Net...")
+    controlnet = ControlNetModel.from_unet(unet)
+    controlnet.to(config.device, dtype=weight_dtype)
+    controlnet.requires_grad_(True)  # ControlNet is TRAINABLE
+    print("  ✓ ControlNet created and trainable")
     
-    # Store config in model for checkpoint loading
-    model.cfg = config
+    # 3. Inject LoRA into U-Net (Trainable)
+    print("Injecting LoRA into U-Net...")
+    lora_config = LoraConfig(
+        r=16, 
+        lora_alpha=16, 
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],  # Cross-attention layers
+        lora_dropout=0.0,
+        bias="none"
+    )
+    unet = get_peft_model(unet, lora_config)
+    unet.print_trainable_parameters()
+    print("  ✓ LoRA adapters injected")
+    
+    # 4. Drug Projector (Trainable)
+    print("Creating Drug Projector...")
+    drug_proj = DrugProjector(config).to(config.device, dtype=weight_dtype)
+    print(f"  ✓ Drug Projector: {config.fingerprint_dim} -> {config.num_drug_tokens} tokens (768 dim each)")
     
     # Model Summary
     print(f"\n{'='*60}", flush=True)
     print(f"Model Summary:", flush=True)
     print(f"{'='*60}", flush=True)
     
-    # Use stored values from model if available, otherwise calculate
-    if hasattr(model, 'total_params'):
-        total_params = model.total_params
-        trainable_params = model.trainable_params
-        frozen_params = model.frozen_params
-    else:
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        frozen_params = total_params - trainable_params
+    total_params = sum(p.numel() for p in [unet, controlnet, drug_proj])
+    trainable_params = sum(p.numel() for p in [unet, controlnet, drug_proj] if p.requires_grad)
+    frozen_params = total_params - trainable_params
     
     print(f"  Total Parameters:     {total_params:,}", flush=True)
     print(f"  Trainable Parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)", flush=True)
     print(f"  Frozen Parameters:    {frozen_params:,} ({frozen_params/total_params*100:.2f}%)", flush=True)
-    
-    # Print model architecture summary
-    print(f"\n  Model Architecture:", flush=True)
-    print(f"    - U-Net: UNet2DConditionModel (Stable Diffusion v1.5)", flush=True)
-    print(f"    - Input Channels: 8 (4 noise + 4 control latents)", flush=True)
-    print(f"    - Drug Projection: {config.fingerprint_dim} -> 768", flush=True)
-    print(f"    - Partial Fine-Tuning: Input, Cross-Attention, Output layers", flush=True)
-    
-    # PyTorch Model Summary
-    print(f"\n  PyTorch Model Structure:", flush=True)
-    print(f"    Model Type: {type(model).__name__}", flush=True)
-    print(f"    UNet Type: {type(model.unet).__name__}", flush=True)
-    print(f"    Drug Projection: {type(model.drug_proj).__name__}", flush=True)
-    
-    # Try to use torchsummary if available
-    try:
-        from torchsummary import summary
-        print(f"\n  Note: torchsummary available (model too complex for detailed summary)", flush=True)
-    except ImportError:
-        print(f"\n  Note: Install torchsummary for detailed layer info: pip install torchsummary", flush=True)
-    
+    print(f"\n  Architecture:", flush=True)
+    print(f"    - U-Net: Frozen + LoRA adapters", flush=True)
+    print(f"    - ControlNet: Trainable (from U-Net weights)", flush=True)
+    print(f"    - Drug Projector: Trainable (multi-token)", flush=True)
     print(f"{'='*60}\n", flush=True)
     
-    # 3. Optimizer (Only Trainable Params)
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()), 
-        lr=config.lr,
-        weight_decay=0.01
-    )
+    # 5. Optimizer (Train ControlNet + LoRA + DrugProj)
+    params = list(controlnet.parameters()) + list(unet.parameters()) + list(drug_proj.parameters())
+    optimizer = torch.optim.AdamW(params, lr=config.lr, weight_decay=0.01)
     
-    # 4. Learning Rate Scheduler
+    # 6. Learning Rate Scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
         T_max=config.epochs,
         eta_min=1e-6
     )
     
-    # 5. Scheduler (Noise)
+    # 7. Noise Scheduler
     noise_scheduler = DDPMScheduler.from_pretrained(config.model_id, subfolder="scheduler")
     
-    # 6. Data
+    # 8. Data
     print("\nLoading Dataset...")
     dataset = PairedBBBC021Dataset(
         config.data_dir, 
@@ -1046,19 +1015,16 @@ def main():
         
         if not os.path.exists(checkpoint_path):
             print(f"ERROR: Checkpoint not found at {checkpoint_path}")
-            print(f"Please provide a valid checkpoint path with --checkpoint or ensure latest.pt exists")
             return
         
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
-        ckpt = torch.load(checkpoint_path, map_location=config.device)
-        model.load_state_dict(ckpt['model'], strict=False)
-        checkpoint_epoch = ckpt.get('epoch', 0)
+        start_epoch = load_checkpoint(unet, controlnet, drug_proj, optimizer, checkpoint_path, scheduler)
+        checkpoint_epoch = start_epoch
         print(f"  Loaded checkpoint from epoch {checkpoint_epoch}")
         
         # Load dataset for evaluation
         eval_split = args.eval_split.lower()
-        print(f"\nLoading Dataset for Evaluation (split: {eval_split})...")
         dataset = PairedBBBC021Dataset(
             config.data_dir, 
             config.metadata_file, 
@@ -1069,7 +1035,8 @@ def main():
         print(f"  Dataset loaded: {len(dataset)} samples from '{eval_split}' split")
         
         # Run evaluation
-        run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch, eval_split)
+        run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, 
+                      dataset, config, logger, checkpoint_epoch, eval_split)
         print("Evaluation complete!")
         return
     
@@ -1077,60 +1044,104 @@ def main():
     checkpoint_path = f"{config.output_dir}/checkpoints/latest.pt"
     start_epoch = 0
     if args.resume:
-        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
+        start_epoch = load_checkpoint(unet, controlnet, drug_proj, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
             print(f"Resuming training from epoch {start_epoch+1}...")
             print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
             print(f"Starting training from epoch 1...")
     else:
-        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
+        start_epoch = load_checkpoint(unet, controlnet, drug_proj, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
             print(f"Found checkpoint, resuming from epoch {start_epoch+1}...")
             print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
             print(f"Starting training from epoch 1...")
     
-    print("Starting Training...")
-    
-    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    print("Starting Training (ControlNet + LoRA)...")
     
     for epoch in range(start_epoch, config.epochs):
-        model.train()
+        unet.train()
+        controlnet.train()
+        drug_proj.train()
         epoch_losses = []
         progress = tqdm(loader, desc=f"Epoch {epoch+1}")
         
         for batch in progress:
-            ctrl_img = batch['control'].to(config.device, dtype=weight_dtype)
-            target_img = batch['target'].to(config.device, dtype=weight_dtype)
+            # Inputs (all in pixel space)
+            ctrl_pixel = batch['control'].to(config.device, dtype=weight_dtype)
+            target_pixel = batch['target'].to(config.device, dtype=weight_dtype)
             fp = batch['fingerprint'].to(config.device)
-            prompts = batch['prompt']  # List of text prompts
+            prompts = batch['prompt']
             
             optimizer.zero_grad()
             
-            # A. Encode Images to Latents (VAE)
-            # VAE requires float32, so convert images if they're in float16
+            # A. Prepare Latents (Target)
             with torch.no_grad():
-                # Control: Use Mode (Deterministic)
-                ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
-                # Target: Use Sample (Stochastic)
-                target_latents = vae.encode(target_img.float()).latent_dist.sample() * vae.config.scaling_factor
+                target_latents = vae.encode(target_pixel.float()).latent_dist.sample() * vae.config.scaling_factor
+                target_latents = target_latents.to(dtype=weight_dtype)
             
-            # B. Add Noise
+            # B. Prepare Context (Text + Drug)
+            with torch.no_grad():
+                tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
+                text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
+            
+            drug_emb = drug_proj(fp)  # [B, N, 768]
+            context = torch.cat([text_emb, drug_emb], dim=1)  # [B, 77+N, 768]
+            
+            # C. Add Noise
             noise = torch.randn_like(target_latents)
-            timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, 
-                (target_latents.shape[0],), device=config.device
-            ).long()
-            noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                                    (target_latents.shape[0],), device=config.device).long()
+            noisy_latents = noise_scheduler.add_noise(target_latents, noise, timesteps)
             
-            # C. Forward Pass (with dual conditioning: CLIP text + drug fingerprint)
+            # D. Forward Pass
+            # 1. ControlNet calculates residuals from Pixel Image
+            down_block_res_samples, mid_block_res_sample = controlnet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=context,
+                controlnet_cond=ctrl_pixel,  # Pass Pixel Image directly!
+                return_dict=False,
+            )
+            
+            # 2. U-Net uses residuals
             if config.mixed_precision == "fp16":
                 with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    noise_pred = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp, prompts)
+                    if hasattr(unet, 'base_model'):
+                        noise_pred = unet.base_model.model(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=context,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
+                        ).sample
+                    else:
+                        noise_pred = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=context,
+                            down_block_additional_residuals=down_block_res_samples,
+                            mid_block_additional_residual=mid_block_res_sample,
+                        ).sample
                     loss = F.mse_loss(noise_pred.float(), noise.float())
             else:
-                noise_pred = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp, prompts)
+                if hasattr(unet, 'base_model'):
+                    noise_pred = unet.base_model.model(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=context,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                    ).sample
+                else:
+                    noise_pred = unet(
+                        noisy_latents,
+                        timesteps,
+                        encoder_hidden_states=context,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                    ).sample
                 loss = F.mse_loss(noise_pred, noise)
             
             # Check for NaN
@@ -1142,7 +1153,7 @@ def main():
             loss.backward()
             
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
             
             optimizer.step()
             
@@ -1181,10 +1192,12 @@ def main():
         
         # Checkpointing
         if (epoch + 1) % config.save_freq == 0:
-            # Save specific epoch checkpoint (unique file for every evaluated epoch)
+            # Save separate components
             epoch_path = f"{config.output_dir}/checkpoints/checkpoint_epoch_{epoch+1}.pt"
             torch.save({
-                'model': model.state_dict(),
+                'unet': unet.state_dict(),
+                'controlnet': controlnet.state_dict(),
+                'drug_proj': drug_proj.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'epoch': epoch+1,
@@ -1193,7 +1206,9 @@ def main():
             
             # Update 'latest' for resuming
             torch.save({
-                'model': model.state_dict(),
+                'unet': unet.state_dict(),
+                'controlnet': controlnet.state_dict(),
+                'drug_proj': drug_proj.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'epoch': epoch+1,
@@ -1204,8 +1219,8 @@ def main():
             
         # --- EVALUATION ---
         if (epoch + 1) % config.eval_freq == 0:
-            # Use the reusable evaluation function (always use train split during training)
-            run_evaluation(model, vae, noise_scheduler, dataset, config, logger, epoch+1, "train")
+            run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, 
+                          dataset, config, logger, epoch+1, "train")
 
 if __name__ == "__main__":
     main()
