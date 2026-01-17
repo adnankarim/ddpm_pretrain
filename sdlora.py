@@ -103,7 +103,7 @@ class Config:
     epochs = 200
     batch_size = 64  # Lower batch size due to 512x512 resolution
     lr = 1e-5       # 1e-5 is perfect for ControlNet + LoRA
-    save_freq = 5
+    save_freq = 51
     eval_freq = 5
     
     # Token Strategy (Fixes Flaw #1: Voice Imbalance)
@@ -623,7 +623,9 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
         ).input_ids.to(device)
         text_emb = text_encoder(tokens)[0]  # [1, 77, 768]
         
-        drug_emb = drug_proj(fingerprint.unsqueeze(0).to(device))  # [1, N, 768]
+        # Convert fingerprint to match drug_proj dtype
+        weight_dtype = next(drug_proj.parameters()).dtype
+        drug_emb = drug_proj(fingerprint.unsqueeze(0).to(device, dtype=weight_dtype))  # [1, N, 768]
         context = torch.cat([text_emb, drug_emb], dim=1)  # [1, 77+N, 768]
         
         # 3. Setup Scheduler
@@ -750,7 +752,9 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
         # 2. Prepare Context (Text + Drug)
         tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
         text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
-        drug_emb = drug_proj(fp)  # [B, N, 768]
+        # Convert fingerprint to match drug_proj dtype
+        weight_dtype = next(drug_proj.parameters()).dtype
+        drug_emb = drug_proj(fp.to(dtype=weight_dtype))  # [B, N, 768]
         context = torch.cat([text_emb, drug_emb], dim=1)  # [B, 77+N, 768]
         
         # 3. Run Reverse Diffusion Process (Full Sampling Loop)
@@ -1088,7 +1092,8 @@ def main():
                 tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
                 text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
             
-            drug_emb = drug_proj(fp)  # [B, N, 768]
+            # Convert fingerprint to match drug_proj dtype
+            drug_emb = drug_proj(fp.to(dtype=weight_dtype))  # [B, N, 768]
             context = torch.cat([text_emb, drug_emb], dim=1)  # [B, 77+N, 768]
             
             # C. Add Noise
