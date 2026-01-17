@@ -741,13 +741,23 @@ def load_checkpoint(model, optimizer, path, scheduler=None):
 # MAIN
 # ============================================================================
 
-def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch=None):
+def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch=None, eval_split="train"):
     """
     Run evaluation: generate video, grid, and metrics without training.
+    
+    Args:
+        model: The trained model
+        vae: VAE encoder/decoder
+        noise_scheduler: Diffusion noise scheduler
+        dataset: Dataset to evaluate on
+        config: Configuration object
+        logger: TrainingLogger instance
+        checkpoint_epoch: Epoch number from checkpoint (for logging)
+        eval_split: Data split name (for logging and file naming)
     """
     print("\n" + "="*60, flush=True)
     epoch_label = f"Epoch {checkpoint_epoch}" if checkpoint_epoch else "Evaluation"
-    print(f"EVALUATION ({epoch_label})", flush=True)
+    print(f"EVALUATION ({epoch_label}) - Split: {eval_split}", flush=True)
     print("="*60, flush=True)
     
     model.eval()
@@ -825,19 +835,22 @@ def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpo
             real_imgs_norm[:4]  # Show target again for comparison
         ], dim=0)
         
+        # Create filename with split info
+        split_suffix = f"_{eval_split}" if eval_split != "train" else ""
+        
         if checkpoint_epoch:
-            grid_path = f"{config.output_dir}/plots/eval_epoch_{checkpoint_epoch}.png"
+            grid_path = f"{config.output_dir}/plots/eval_epoch_{checkpoint_epoch}{split_suffix}.png"
         else:
-            grid_path = f"{config.output_dir}/plots/eval_latest.png"
+            grid_path = f"{config.output_dir}/plots/eval_latest{split_suffix}.png"
         
         save_image(grid, grid_path, nrow=4, normalize=False)
         print(f"  ✓ Sample grid saved to: {grid_path}", flush=True)
         
         # 6. Generate Video
         if checkpoint_epoch:
-            video_path = f"{config.output_dir}/plots/video_eval_epoch_{checkpoint_epoch}.mp4"
+            video_path = f"{config.output_dir}/plots/video_eval_epoch_{checkpoint_epoch}{split_suffix}.mp4"
         else:
-            video_path = f"{config.output_dir}/plots/video_eval_latest.mp4"
+            video_path = f"{config.output_dir}/plots/video_eval_latest{split_suffix}.mp4"
         
         generate_video(model, vae, noise_scheduler, ctrl_img[0], fp[0], video_path)
         
@@ -863,6 +876,7 @@ def main():
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file")
     parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (generate video, grid, and metrics)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation (default: uses latest.pt from output_dir)")
+    parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation (default: train)")
     args = parser.parse_args()
     
     config = Config()
@@ -989,18 +1003,19 @@ def main():
         print(f"  Loaded checkpoint from epoch {checkpoint_epoch}")
         
         # Load dataset for evaluation
-        print("\nLoading Dataset for Evaluation...")
+        eval_split = args.eval_split.lower()
+        print(f"\nLoading Dataset for Evaluation (split: {eval_split})...")
         dataset = PairedBBBC021Dataset(
             config.data_dir, 
             config.metadata_file, 
             size=config.image_size,
-            split='train',
+            split=eval_split,
             paths_csv=args.paths_csv
         )
-        print(f"  Dataset loaded: {len(dataset)} samples")
+        print(f"  Dataset loaded: {len(dataset)} samples from '{eval_split}' split")
         
         # Run evaluation
-        run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch)
+        run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch, eval_split)
         print("Evaluation complete!")
         return
     
