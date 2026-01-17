@@ -633,11 +633,14 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
         # 3. Setup Scheduler
         scheduler.set_timesteps(1000)
         frames = []
+        # Use iteration indices for frame saving (0 to len(timesteps)-1)
         save_steps = np.linspace(0, len(scheduler.timesteps) - 1, num_frames, dtype=int)
         
         # 4. Loop (FIXED: No reversed timesteps)
         for i, t in enumerate(tqdm(scheduler.timesteps, desc="  Generating Video", leave=False)):
-            t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
+            # Convert t to scalar if it's a tensor (scheduler expects scalar)
+            t_scalar = t.item() if isinstance(t, torch.Tensor) else int(t)
+            t_tensor = torch.full((1,), t_scalar, device=device, dtype=torch.long)
             
             # A. ControlNet Step (takes pixel image)
             down_block_res_samples, mid_block_res_sample = controlnet(
@@ -667,12 +670,11 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
                     mid_block_additional_residual=mid_block_res_sample,
                 ).sample
             
-            # C. Scheduler Step (t must be a valid timestep value, not index)
-            # The scheduler expects the actual timestep value from scheduler.timesteps
-            latents = scheduler.step(noise_pred, t.item() if isinstance(t, torch.Tensor) else t, latents).prev_sample
+            # C. Scheduler Step (t_scalar must be a valid timestep value: 0-999)
+            latents = scheduler.step(noise_pred, t_scalar, latents).prev_sample
             
-            # D. Save Frame
-            if t.item() in save_steps or t.item() == 0:
+            # D. Save Frame (use iteration index, not timestep value)
+            if i in save_steps or i == len(scheduler.timesteps) - 1:
                 # Decode to image (VAE requires float32)
                 decoded = vae.decode((latents / vae.config.scaling_factor).float()).sample
                 decoded = (decoded / 2 + 0.5).clamp(0, 1)
