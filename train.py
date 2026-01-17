@@ -849,7 +849,7 @@ def calculate_fid(real_images, fake_images, device):
         print(f"  Warning: FID calculation failed: {e}", flush=True)
         return None
 
-def calculate_metrics(model, val_loader, device, num_samples=8):
+def calculate_metrics(model, val_loader, device, num_samples=1000):
     """
     Calculate evaluation metrics on validation set.
     
