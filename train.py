@@ -60,7 +60,8 @@ class Config:
     image_size = 96
     
     # Architecture (Modified Diffusers)
-    base_model_id = "anton-l/ddpm-butterflies-128"  # Pretrained on natural images (butterflies) 
+    # Note: anton-l/ddpm-butterflies-128 doesn't exist, will fallback to google/ddpm-cifar10-32
+    base_model_id = "google/ddpm-cifar10-32"  # Pretrained DDPM model (will try anton-l/ddpm-butterflies-128 first if available) 
     
     # Embeddings
     perturbation_emb_dim = 128 
