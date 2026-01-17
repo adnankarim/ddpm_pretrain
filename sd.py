@@ -668,6 +668,9 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
     
     model.eval()
     
+    # Infer device from input tensor (more explicit)
+    device = control.device
+    
     # Encode Control
     # VAE requires float32, so convert if needed
     with torch.no_grad():
@@ -684,7 +687,7 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
         # Reverse diffusion loop
         for i, t in enumerate(reversed(noise_scheduler.timesteps)):
             # Create timestep tensor for model (batch_size=1,)
-            timestep = torch.full((1,), t, device=latents.device, dtype=torch.long)
+            timestep = torch.full((1,), t, device=device, dtype=torch.long)
             
             # Predict noise
             noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
@@ -715,8 +718,13 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
             combined = np.hstack([frame, separator, ctrl_np])
             final_frames.append(combined)
         
-        imageio.mimsave(save_path, final_frames, fps=10)
-        print(f"  ✓ Video saved to: {save_path}")
+        # Save video (only if imageio is available - already checked at function start)
+        if IMAGEIO_AVAILABLE:
+            import imageio
+            imageio.mimsave(save_path, final_frames, fps=10)
+            print(f"  ✓ Video saved to: {save_path}")
+        else:
+            print(f"  ⚠ Skipping video save (imageio not available)")
 
 def load_checkpoint(model, optimizer, path, scheduler=None):
     if not os.path.exists(path): 
