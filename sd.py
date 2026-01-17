@@ -255,6 +255,11 @@ class DrugConditionedStableDiffusion(nn.Module):
         self.total_params = total
         self.trainable_params = trainable
         self.frozen_params = frozen
+        
+        # Store for later access
+        self.total_params = total
+        self.trainable_params = trainable
+        self.frozen_params = frozen
 
     def forward(self, noisy_latents, timesteps, control_latents, fingerprint):
         # 1. Project Drug Fingerprint
