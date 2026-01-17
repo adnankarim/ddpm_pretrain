@@ -87,7 +87,7 @@ class Config:
     
     output_dir = "sd_lora_cell_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mixed_precision = "fp16" # "no", "fp16", "bf16"
+    mixed_precision = "no" # "no", "fp16", "bf16" - Changed to "no" for stability (fp16 can cause NaN with LoRA)
 
 # ============================================================================
 # DATASET (ADAPTED FOR SD)
@@ -667,12 +667,13 @@ def main():
             
             # E. Predict Noise (UNet + LoRA)
             # The UNet takes noisy latents, timestep, and text embeddings
-            # Note: We cast input to float32 if unet is float32
+            # Use float32 for all components to avoid dtype mismatches with LoRA
             if config.mixed_precision == "fp16":
-                with torch.cuda.amp.autocast():
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    model_pred = unet(noisy_latents.float(), timesteps, encoder_hidden_states.float()).sample
             else:
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                # Use float32 for all components to avoid dtype mismatches
+                model_pred = unet(noisy_latents.float(), timesteps, encoder_hidden_states.float()).sample
 
             # F. Loss & Backprop
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
@@ -701,9 +702,21 @@ def main():
         # Step scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
-        avg_loss = np.mean(epoch_losses)
+        
+        # Filter out NaN/Inf losses before computing average
+        valid_losses = [l for l in epoch_losses if not (np.isnan(l) or np.isinf(l))]
+        if valid_losses:
+            avg_loss = np.mean(valid_losses)
+        else:
+            avg_loss = float('nan')
+            print(f"\n⚠️  WARNING: All losses in epoch {epoch+1} were NaN/Inf!", flush=True)
         
         print(f"\nEpoch {epoch+1}/{config.epochs} | Avg Loss: {avg_loss:.5f} | LR: {current_lr:.2e}", flush=True)
+        
+        # Stop training if loss is NaN
+        if np.isnan(avg_loss) or np.isinf(avg_loss):
+            print(f"\n❌ Training stopped due to NaN/Inf loss. Check learning rate and model stability.", flush=True)
+            break
         
         # Logging & Plotting
         logger.update(epoch+1, avg_loss, current_lr)
