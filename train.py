@@ -725,12 +725,15 @@ class DiffusionModel(nn.Module):
             fingerprint_dim=config.fingerprint_dim
         ).to(config.device)
         
+        # Use Diffusers' DDPMScheduler for consistent training/sampling
+        self.noise_scheduler = DDPMScheduler(
+            num_train_timesteps=config.timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule="linear",
+            prediction_type="epsilon",
+        )
         self.timesteps = config.timesteps
-        beta = torch.linspace(config.beta_start, config.beta_end, config.timesteps).to(config.device)
-        alpha = 1. - beta
-        self.alpha_bar = torch.cumprod(alpha, dim=0)
-        self.sqrt_alpha_bar = torch.sqrt(self.alpha_bar)
-        self.sqrt_one_minus_alpha_bar = torch.sqrt(1. - self.alpha_bar)
 
     def forward(self, x0, control, fingerprint):
         b = x0.shape[0]
