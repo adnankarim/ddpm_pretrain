@@ -870,11 +870,12 @@ def main():
             optimizer.zero_grad()
             
             # A. Encode Images to Latents (VAE)
+            # VAE requires float32, so convert images if they're in float16
             with torch.no_grad():
                 # Control: Use Mode (Deterministic)
-                ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
+                ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
                 # Target: Use Sample (Stochastic)
-                target_latents = vae.encode(target_img).latent_dist.sample() * vae.config.scaling_factor
+                target_latents = vae.encode(target_img.float()).latent_dist.sample() * vae.config.scaling_factor
             
             # B. Add Noise
             noise = torch.randn_like(target_latents)
