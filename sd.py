@@ -967,8 +967,9 @@ def main():
             
             with torch.no_grad():
                 # 1. Encode Control and Target
-                ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
-                target_latents = vae.encode(target_img).latent_dist.mode() * vae.config.scaling_factor
+                # VAE requires float32, so convert images if they're in float16
+                ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
+                target_latents = vae.encode(target_img.float()).latent_dist.mode() * vae.config.scaling_factor
                 
                 # 2. Run Reverse Diffusion Process (Full Sampling Loop)
                 print("  Running reverse diffusion sampling...", flush=True)
