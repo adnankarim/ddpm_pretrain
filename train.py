@@ -1059,10 +1059,24 @@ def load_checkpoint(model, optimizer, path, scheduler=None):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DDPM model on BBBC021 dataset")
+    parser = argparse.ArgumentParser(
+        description="Train DDPM model on BBBC021 dataset",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train from scratch
+  python train.py --output_dir ./results
+
+  # Resume training (runs evaluation first, then continues)
+  python train.py --resume --output_dir ./results
+
+  # Resume from specific checkpoint
+  python train.py --checkpoint ./results/checkpoints/checkpoint_epoch_10.pt
+        """
+    )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file to resume from (default: auto-loads latest.pt)")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for results (default: ddpm_diffusers_results)")
-    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
+    parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint (runs evaluation first before continuing)")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     args = parser.parse_args()
     
