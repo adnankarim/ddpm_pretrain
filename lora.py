@@ -550,19 +550,19 @@ def main():
     dataset = Subset(dataset_full, indices)
     print(f"Using 10% of dataset: {len(dataset):,} images ({sample_size/total_size*100:.1f}%)", flush=True)
     
-    # Log paths.csv status
+    # Log paths.csv status (access through dataset_full since Subset doesn't have these attributes)
     print(f"\n{'='*60}", flush=True)
     print(f"File Path Resolution Status:", flush=True)
     print(f"{'='*60}", flush=True)
-    if len(dataset.paths_lookup) > 0:
+    if len(dataset_full.paths_lookup) > 0:
         print(f"  ✓ paths.csv loaded successfully", flush=True)
-        print(f"  - Unique filenames in lookup: {len(dataset.paths_lookup):,}", flush=True)
-        print(f"  - Total paths indexed: {len(dataset.paths_by_rel):,}", flush=True)
-        print(f"  - Basename lookups: {len(dataset.paths_by_basename):,}", flush=True)
+        print(f"  - Unique filenames in lookup: {len(dataset_full.paths_lookup):,}", flush=True)
+        print(f"  - Total paths indexed: {len(dataset_full.paths_by_rel):,}", flush=True)
+        print(f"  - Basename lookups: {len(dataset_full.paths_by_basename):,}", flush=True)
     else:
         print(f"  ⚠ paths.csv not found - using fallback path resolution", flush=True)
-    print(f"  - Data directory: {dataset.data_dir}", flush=True)
-    print(f"  - Data directory exists: {dataset.data_dir.exists()}", flush=True)
+    print(f"  - Data directory: {dataset_full.data_dir}", flush=True)
+    print(f"  - Data directory exists: {dataset_full.data_dir.exists()}", flush=True)
     print(f"{'='*60}\n", flush=True)
     
     # Save a random dataset sample image
