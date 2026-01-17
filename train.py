@@ -100,6 +100,7 @@ class TrainingLogger:
             'mse_loss': [],
             'psnr': [],
             'ssim': [],
+            'fid': [],
             'learning_rate': []
         }
         self.csv_path = os.path.join(save_dir, "training_history.csv")
@@ -128,10 +129,12 @@ class TrainingLogger:
             self.history['kl_divergence'].append(metrics.get('kl_divergence', None))
             self.history['psnr'].append(metrics.get('psnr', None))
             self.history['ssim'].append(metrics.get('ssim', None))
+            self.history['fid'].append(metrics.get('fid', None))
         else:
             self.history['kl_divergence'].append(None)
             self.history['psnr'].append(None)
             self.history['ssim'].append(None)
+            self.history['fid'].append(None)
         
         # Save to CSV immediately
         df = pd.DataFrame(self.history)
@@ -144,7 +147,8 @@ class TrainingLogger:
                 'kl_divergence': metrics.get('kl_divergence'),
                 'mse_gen_real': metrics.get('mse'),
                 'psnr': metrics.get('psnr'),
-                'ssim': metrics.get('ssim')
+                'ssim': metrics.get('ssim'),
+                'fid': metrics.get('fid')
             }])
             metrics_csv = os.path.join(self.save_dir, "evaluation_metrics.csv")
             # Append to file if it exists, otherwise create new
@@ -834,6 +838,10 @@ def calculate_metrics(model, val_loader, device, num_samples=8):
             mse = F.mse_loss(generated, real_t).item()
             metrics['mse'].append(mse)
             
+            # Collect images for FID (keep on device for efficiency)
+            all_real_images.append(real_t)
+            all_generated_images.append(generated)
+            
             # Calculate PSNR and SSIM if available
             if SKIMAGE_AVAILABLE:
                 for i in range(generated.shape[0]):
@@ -855,12 +863,25 @@ def calculate_metrics(model, val_loader, device, num_samples=8):
             
             sample_count += generated.shape[0]
     
+    # Calculate FID if we have enough samples
+    fid_score = None
+    if len(all_real_images) > 0 and len(all_generated_images) > 0:
+        real_stack = torch.cat(all_real_images, dim=0).to(device)
+        fake_stack = torch.cat(all_generated_images, dim=0).to(device)
+        # Need at least 2 samples for FID
+        if real_stack.shape[0] >= 2 and fake_stack.shape[0] >= 2:
+            print("  Calculating FID...", flush=True)
+            fid_score = calculate_fid(real_stack, fake_stack, device)
+            if fid_score is not None:
+                metrics['fid'].append(fid_score)
+    
     # Average metrics
     result = {
         'kl_divergence': np.mean(metrics['kl_divergence']) if metrics['kl_divergence'] else None,
         'mse': np.mean(metrics['mse']) if metrics['mse'] else None,
         'psnr': np.mean(metrics['psnr']) if metrics['psnr'] else None,
-        'ssim': np.mean(metrics['ssim']) if metrics['ssim'] else None
+        'ssim': np.mean(metrics['ssim']) if metrics['ssim'] else None,
+        'fid': fid_score if fid_score is not None else None
     }
     
     return result
@@ -1104,6 +1125,8 @@ def main():
                 print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
             if metrics['ssim'] is not None:
                 print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+            if metrics['fid'] is not None:
+                print(f"    FID:               {metrics['fid']:.2f}", flush=True)
             print(f"  {'-'*58}", flush=True)
             print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
             print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
@@ -1149,17 +1172,29 @@ def main():
                     log_dict['psnr'] = metrics['psnr']
                 if metrics['ssim'] is not None:
                     log_dict['ssim'] = metrics['ssim']
+                if metrics['fid'] is not None:
+                    log_dict['fid'] = metrics['fid']
             wandb.log(log_dict)
 
-        # CHECKPOINTING
-        if (epoch + 1) % config.save_freq == 0:
-            torch.save({
-                'model': model.state_dict(), 
-                'optimizer': optimizer.state_dict(), 
-                'scheduler': scheduler.state_dict(),
-                'epoch': epoch+1
-            }, f"{config.output_dir}/checkpoints/latest.pt")
-            print(f"Checkpoint Saved. (LR: {current_lr:.2e})", flush=True)
+        # CHECKPOINTING (Save every epoch)
+        # Save epoch-specific checkpoint
+        epoch_checkpoint_path = f"{config.output_dir}/checkpoints/checkpoint_epoch_{epoch+1}.pt"
+        torch.save({
+            'model': model.state_dict(), 
+            'optimizer': optimizer.state_dict(), 
+            'scheduler': scheduler.state_dict(),
+            'epoch': epoch+1
+        }, epoch_checkpoint_path)
+        
+        # Also update latest.pt for easy resuming
+        torch.save({
+            'model': model.state_dict(), 
+            'optimizer': optimizer.state_dict(), 
+            'scheduler': scheduler.state_dict(),
+            'epoch': epoch+1
+        }, f"{config.output_dir}/checkpoints/latest.pt")
+        
+        print(f"  ✓ Checkpoint saved: {epoch_checkpoint_path} (LR: {current_lr:.2e})", flush=True)
 
 if __name__ == "__main__":
     main()
