@@ -882,15 +882,41 @@ def calculate_metrics(model, val_loader, device, num_samples=1000):
     # Group by condition (control + fingerprint combination)
     condition_groups = {}  # (ctrl_hash, fp_hash) -> {'real': [...], 'gen': [...]}
     
-    sample_count = 0
+    # Collect all batches first, then randomly sample
+    all_batches = []
     with torch.no_grad():
         for batch in val_loader:
+            all_batches.append(batch)
+    
+    # Flatten all samples and randomly sample
+    all_samples = []
+    for batch in all_batches:
+        b_size = batch['control'].shape[0]
+        for i in range(b_size):
+            all_samples.append({
+                'control': batch['control'][i:i+1],
+                'perturbed': batch['perturbed'][i:i+1],
+                'fingerprint': batch['fingerprint'][i:i+1]
+            })
+    
+    # Randomly sample up to num_samples
+    if len(all_samples) > num_samples:
+        import random
+        random.seed(42)  # For reproducibility
+        sampled_indices = random.sample(range(len(all_samples)), num_samples)
+        all_samples = [all_samples[i] for i in sampled_indices]
+    
+    print(f"  Using {len(all_samples)} samples for evaluation (requested: {num_samples})", flush=True)
+    
+    sample_count = 0
+    with torch.no_grad():
+        for sample in all_samples:
             if sample_count >= num_samples:
                 break
-                
-            ctrl = batch['control'].to(device)
-            real_t = batch['perturbed'].to(device)
-            fp = batch['fingerprint'].to(device)
+            
+            ctrl = sample['control'].to(device)
+            real_t = sample['perturbed'].to(device)
+            fp = sample['fingerprint'].to(device)
             
             # Generate samples (use fewer steps for faster evaluation)
             generated = model.sample(ctrl, fp, num_inference_steps=200)
@@ -1214,7 +1240,7 @@ def main():
             print(f"EVALUATION (Epoch {epoch+1})", flush=True)
             print("="*60, flush=True)
             print("  Calculating metrics on validation set...", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=16)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000)
             
             # Print metrics prominently
             print(f"\n  📊 EVALUATION METRICS:", flush=True)
@@ -1228,7 +1254,9 @@ def main():
             if metrics['ssim'] is not None:
                 print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
             if metrics['fid'] is not None:
-                print(f"    FID:               {metrics['fid']:.2f}", flush=True)
+                print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+            if metrics['cfid'] is not None:
+                print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
             print(f"  {'-'*58}", flush=True)
             print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
             print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
