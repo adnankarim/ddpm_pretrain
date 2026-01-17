@@ -915,7 +915,8 @@ def main():
     print("Loading Components...")
     weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
     
-    vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device, dtype=weight_dtype)
+    # VAE must always be float32 (it doesn't work well with float16)
+    vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device, dtype=torch.float32)
     text_encoder = CLIPTextModel.from_pretrained(config.model_id, subfolder="text_encoder").to(config.device)
     tokenizer = CLIPTokenizer.from_pretrained(config.model_id, subfolder="tokenizer")
     unet = UNet2DConditionModel.from_pretrained(config.model_id, subfolder="unet").to(config.device, dtype=weight_dtype)
