@@ -101,6 +101,7 @@ class TrainingLogger:
             'psnr': [],
             'ssim': [],
             'fid': [],
+            'cfid': [],
             'learning_rate': []
         }
         self.csv_path = os.path.join(save_dir, "training_history.csv")
@@ -130,11 +131,13 @@ class TrainingLogger:
             self.history['psnr'].append(metrics.get('psnr', None))
             self.history['ssim'].append(metrics.get('ssim', None))
             self.history['fid'].append(metrics.get('fid', None))
+            self.history['cfid'].append(metrics.get('cfid', None))
         else:
             self.history['kl_divergence'].append(None)
             self.history['psnr'].append(None)
             self.history['ssim'].append(None)
             self.history['fid'].append(None)
+            self.history['cfid'].append(None)
         
         # Save to CSV immediately
         df = pd.DataFrame(self.history)
@@ -148,7 +151,8 @@ class TrainingLogger:
                 'mse_gen_real': metrics.get('mse'),
                 'psnr': metrics.get('psnr'),
                 'ssim': metrics.get('ssim'),
-                'fid': metrics.get('fid')
+                'fid': metrics.get('fid'),
+                'cfid': metrics.get('cfid')
             }])
             metrics_csv = os.path.join(self.save_dir, "evaluation_metrics.csv")
             # Append to file if it exists, otherwise create new
@@ -1236,6 +1240,8 @@ def main():
                     log_dict['ssim'] = metrics['ssim']
                 if metrics['fid'] is not None:
                     log_dict['fid'] = metrics['fid']
+                if metrics['cfid'] is not None:
+                    log_dict['cfid'] = metrics['cfid']
             wandb.log(log_dict)
 
         # CHECKPOINTING (Save every epoch)
