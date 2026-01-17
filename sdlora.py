@@ -1069,6 +1069,25 @@ def main():
         else:
             print(f"Starting training from epoch 1...")
     
+    # ---------------------------------------------------------
+    # Epoch 0 Sanity Check (Before Training Starts)
+    # ---------------------------------------------------------
+    if start_epoch == 0:
+        print("\n🔎 Running Epoch 0 Sanity Check (Untrained Model)...")
+        print("="*60, flush=True)
+        # Force a video and grid generation immediately to verify base model works
+        run_evaluation(
+            unet, controlnet, vae, noise_scheduler, drug_proj, 
+            tokenizer, text_encoder, dataset, config, logger, 
+            checkpoint_epoch=0,  # Label as Epoch 0
+            eval_split="train"
+        )
+        print("✅ Epoch 0 Check Complete. Check ./controlnet_lora_results/plots/eval_epoch_0.png")
+        print("="*60 + "\n", flush=True)
+    
+    # ---------------------------------------------------------
+    # Start Training Loop
+    # ---------------------------------------------------------
     print("Starting Training (ControlNet + LoRA)...")
     
     for epoch in range(start_epoch, config.epochs):
