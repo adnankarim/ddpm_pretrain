@@ -82,7 +82,7 @@ class Config:
     batch_size = 64  # Lower batch size due to 512x512 resolution
     lr = 1e-4       # Lower LR for fine-tuning pre-trained weights
     save_freq = 5
-    eval_freq = 5
+    eval_freq = 1
     
     output_dir = "sd_partial_finetune_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
