@@ -602,8 +602,100 @@ class PairedBBBC021Dataset(Dataset):
         }
 
 # ============================================================================
-# UTILITIES
+# METRICS & UTILITIES
 # ============================================================================
+
+def calculate_metrics(real_imgs, gen_imgs, noise_pred=None, noise_real=None):
+    """Calculates PSNR, SSIM, MSE, and estimated KL"""
+    metrics = {}
+    
+    # 1. MSE (Pixel Space)
+    metrics['mse'] = F.mse_loss(gen_imgs, real_imgs).item()
+    
+    # 2. KL Divergence Estimate (Latent Space)
+    # KL is proportional to MSE in latent space for DDPMs
+    if noise_pred is not None and noise_real is not None:
+        metrics['kl_div'] = F.mse_loss(noise_pred, noise_real).item()
+    else:
+        metrics['kl_div'] = None
+    
+    # 3. PSNR & SSIM (Requires CPU/Numpy)
+    try:
+        from skimage.metrics import peak_signal_noise_ratio as psnr
+        from skimage.metrics import structural_similarity as ssim
+        
+        # Convert to numpy [0, 255] range
+        real_np = ((real_imgs[0].cpu().permute(1,2,0).numpy() + 1) * 127.5).astype(np.uint8)
+        gen_np = ((gen_imgs[0].cpu().permute(1,2,0).numpy() + 1) * 127.5).astype(np.uint8)
+        
+        # Convert to grayscale for SSIM
+        real_gray = np.mean(real_np, axis=2)
+        gen_gray = np.mean(gen_np, axis=2)
+        
+        metrics['psnr'] = psnr(real_np, gen_np, data_range=255)
+        metrics['ssim'] = ssim(real_gray, gen_gray, data_range=255)
+    except ImportError:
+        print("  Warning: scikit-image not available. Install with: pip install scikit-image")
+        metrics['psnr'] = None
+        metrics['ssim'] = None
+        
+    return metrics
+
+def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path, num_frames=40):
+    """Generates video of denoising process"""
+    if not IMAGEIO_AVAILABLE: 
+        print("  Warning: imageio not available. Skipping video generation.")
+        return
+    
+    model.eval()
+    
+    # Encode Control
+    with torch.no_grad():
+        ctrl_latents = vae.encode(control.unsqueeze(0)).latent_dist.mode() * vae.config.scaling_factor
+        fp = fingerprint.unsqueeze(0)
+        
+        # Start from noise
+        latents = torch.randn_like(ctrl_latents)
+        frames = []
+        
+        # Sample frames at equidistant timesteps
+        save_steps = np.linspace(0, noise_scheduler.config.num_train_timesteps - 1, num_frames, dtype=int)
+        
+        # Reverse diffusion loop
+        for i, t in enumerate(reversed(noise_scheduler.timesteps)):
+            timestep = torch.full((1,), t, device=latents.device, dtype=torch.long)
+            
+            # Predict noise
+            noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
+            
+            # DDPM step
+            latents = noise_scheduler.step(noise_pred, timestep, latents).prev_sample
+            
+            # Save frame if at capture point
+            if t in save_steps or i == len(noise_scheduler.timesteps) - 1:
+                # Decode to image
+                with torch.no_grad():
+                    decoded = vae.decode(latents / vae.config.scaling_factor).sample
+                    decoded = (decoded / 2 + 0.5).clamp(0, 1)
+                    img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                    frames.append(img_np)
+        
+        # Also decode control for side-by-side comparison
+        ctrl_decoded = vae.decode(ctrl_latents / vae.config.scaling_factor).sample
+        ctrl_decoded = (ctrl_decoded / 2 + 0.5).clamp(0, 1)
+        ctrl_np = (ctrl_decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        
+        # Create separator
+        separator = np.zeros((ctrl_np.shape[0], 2, 3), dtype=np.uint8)
+        
+        # Stitch frames: [Generated (changing)] | [Control (static)]
+        final_frames = []
+        for frame in frames:
+            combined = np.hstack([frame, separator, ctrl_np])
+            final_frames.append(combined)
+        
+        imageio.mimsave(save_path, final_frames, fps=10)
+        print(f"  ✓ Video saved to: {save_path}")
 
 def load_checkpoint(model, optimizer, path, scheduler=None):
     if not os.path.exists(path): 
