@@ -1091,6 +1091,8 @@ def main():
             with torch.no_grad():
                 tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
                 text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
+                # Convert text_emb to match weight_dtype (float16 if mixed precision)
+                text_emb = text_emb.to(dtype=weight_dtype)
             
             # Convert fingerprint to match drug_proj dtype
             drug_emb = drug_proj(fp.to(dtype=weight_dtype))  # [B, N, 768]
