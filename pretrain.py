@@ -4,13 +4,15 @@ BBBC021 UNCONDITIONAL PRETRAINING (TRAIN SET ONLY)
 ================================================================================
 Stage 1: Learning the Cell Prior
 --------------------------------------------------------------------------------
-This script trains a generative model on ONLY the 'train' split of the dataset.
-It ignores labels and focuses solely on learning P(x) -- what a cell looks like.
+This script fine-tunes a pretrained DDPM model (anton-l/ddpm-butterflies-128) 
+on ONLY the 'train' split of the dataset. It ignores labels and focuses solely 
+on learning P(x) -- what a cell looks like.
 
 Goal: Create a "Foundation Model" that understands biological textures.
 Input: Random Noise (3 channels)
 Output: Realistic Cell Image (3 channels)
 Data: Train Split Only (No Test Leakage)
+Pretrained Model: anton-l/ddpm-butterflies-128
 ================================================================================
 """
 
