@@ -155,6 +155,14 @@ class TrainingLogger:
         df.to_csv(self.metrics_csv_path, mode='a', header=False, index=False)
         print(f"  📊 Metrics logged to {self.metrics_csv_path}")
 
+    def log_metrics(self, epoch, metrics_dict):
+        """Appends evaluation metrics to a separate CSV"""
+        new_row = {'epoch': epoch}
+        new_row.update(metrics_dict)
+        df = pd.DataFrame([new_row])
+        df.to_csv(self.metrics_csv_path, mode='a', header=False, index=False)
+        print(f"  📊 Metrics logged to {self.metrics_csv_path}")
+
 # ============================================================================
 # ARCHITECTURE: CONDITIONAL STABLE DIFFUSION
 # ============================================================================
@@ -785,35 +793,98 @@ def main():
             }, f"{config.output_dir}/checkpoints/latest.pt")
             print(f"Checkpoint Saved. (LR: {current_lr:.2e})", flush=True)
             
-            # Simple validation visualization
-            if (epoch + 1) % config.eval_freq == 0:
-                model.eval()
-                with torch.no_grad():
-                    # Get a sample batch
-                    sample_batch = next(iter(loader))
-                    ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
-                    target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
-                    fp = sample_batch['fingerprint'][:4].to(config.device)
+        # --- EVALUATION ---
+        if (epoch + 1) % config.eval_freq == 0:
+            print("\n" + "="*60, flush=True)
+            print(f"EVALUATION (Epoch {epoch+1})", flush=True)
+            print("="*60, flush=True)
+            
+            model.eval()
+            
+            # Get a sample batch from training data for evaluation
+            sample_batch = next(iter(loader))
+            ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
+            target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
+            fp = sample_batch['fingerprint'][:4].to(config.device)
+            
+            with torch.no_grad():
+                # 1. Encode Control and Target
+                ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
+                target_latents = vae.encode(target_img).latent_dist.mode() * vae.config.scaling_factor
+                
+                # 2. Run Reverse Diffusion Process (Full Sampling Loop)
+                print("  Running reverse diffusion sampling...", flush=True)
+                latents = torch.randn_like(ctrl_latents)
+                
+                # Use scheduler for proper sampling
+                for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
+                    timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
                     
-                    # Encode to latents
-                    ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
-                    target_latents = vae.encode(target_img).latent_dist.mode() * vae.config.scaling_factor
+                    # Predict noise
+                    noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
                     
-                    # Simple forward pass visualization (not full sampling)
-                    timesteps = torch.zeros((4,), device=config.device, dtype=torch.long)
-                    noise_pred = model(target_latents.float(), timesteps, ctrl_latents.float(), fp)
-                    
-                    # Decode and save
-                    with torch.no_grad():
-                        pred_img = vae.decode((noise_pred / vae.config.scaling_factor).float()).sample
-                        pred_img = (pred_img / 2 + 0.5).clamp(0, 1)
-                        
-                        grid = torch.cat([
-                            (ctrl_img / 2 + 0.5).clamp(0, 1),
-                            pred_img,
-                            (target_img / 2 + 0.5).clamp(0, 1)
-                        ], dim=0)
-                        save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=4, normalize=False)
+                    # Scheduler step
+                    latents = noise_scheduler.step(noise_pred, timestep, latents).prev_sample
+                
+                # 3. Decode Generated Images
+                fake_imgs = vae.decode(latents / vae.config.scaling_factor).sample
+                fake_imgs = (fake_imgs / 2 + 0.5).clamp(0, 1)
+                
+                # 4. Calculate Metrics
+                real_imgs_norm = (target_img / 2 + 0.5).clamp(0, 1)
+                
+                # Also compute noise prediction metrics during forward pass
+                noise = torch.randn_like(target_latents)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                                        (target_latents.shape[0],), device=config.device).long()
+                noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
+                noise_pred_forward = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
+                
+                metrics = calculate_metrics(real_imgs_norm, fake_imgs, noise_pred_forward, noise)
+                
+                # Print metrics
+                print(f"\n  📊 EVALUATION METRICS:", flush=True)
+                print(f"  {'-'*58}", flush=True)
+                if metrics['kl_div'] is not None:
+                    print(f"    KL Divergence:     {metrics['kl_div']:.6f}", flush=True)
+                if metrics['mse'] is not None:
+                    print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+                if metrics['psnr'] is not None:
+                    print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+                if metrics['ssim'] is not None:
+                    print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+                print(f"  {'-'*58}", flush=True)
+                
+                # Log metrics to CSV
+                logger.log_metrics(epoch+1, metrics)
+                
+                # 5. Save Image Grid
+                grid = torch.cat([
+                    (ctrl_img / 2 + 0.5).clamp(0, 1)[:4],
+                    fake_imgs[:4],
+                    real_imgs_norm[:4]  # Show target again for comparison
+                ], dim=0)
+                save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=4, normalize=False)
+                print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
+                
+                # 6. Generate Video
+                video_path = f"{config.output_dir}/plots/video_{epoch+1}.mp4"
+                generate_video(model, vae, noise_scheduler, ctrl_img[0], fp[0], video_path)
+                
+                print("="*60 + "\n", flush=True)
+                
+                # Log to wandb
+                if WANDB_AVAILABLE:
+                    wandb_metrics = {"epoch": epoch+1}
+                    if metrics['kl_div'] is not None:
+                        wandb_metrics['kl_div'] = metrics['kl_div']
+                    if metrics['mse'] is not None:
+                        wandb_metrics['mse_gen_real'] = metrics['mse']
+                    if metrics['psnr'] is not None:
+                        wandb_metrics['psnr'] = metrics['psnr']
+                    if metrics['ssim'] is not None:
+                        wandb_metrics['ssim'] = metrics['ssim']
+                    wandb.log(wandb_metrics)
 
 if __name__ == "__main__":
     main()
