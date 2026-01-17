@@ -816,16 +816,16 @@ def calculate_metrics(model, val_loader, device, num_samples=8):
             real_t = batch['perturbed'].to(device)
             fp = batch['fingerprint'].to(device)
             
-            # Generate samples
-            generated = model.sample(ctrl, fp)
+            # Generate samples (use fewer steps for faster evaluation)
+            generated = model.sample(ctrl, fp, num_inference_steps=200)
             
             # Calculate KL divergence (using forward pass on a sample)
             # Sample a random timestep and compute KL
             b = ctrl.shape[0]
-            t = torch.randint(0, model.timesteps, (b,), device=device)
+            t = torch.randint(0, model.timesteps, (b,), device=device).long()
             noise = torch.randn_like(real_t)
-            xt = model.sqrt_alpha_bar[t].view(-1,1,1,1) * real_t + \
-                 model.sqrt_one_minus_alpha_bar[t].view(-1,1,1,1) * noise
+            # Use scheduler's add_noise for consistency
+            xt = model.noise_scheduler.add_noise(real_t, noise, t)
             noise_pred = model.model(xt, t, ctrl, fp)
             kl = calculate_kl_divergence(noise_pred, noise)
             metrics['kl_divergence'].append(kl)
@@ -870,29 +870,25 @@ def calculate_metrics(model, val_loader, device, num_samples=8):
 # ============================================================================
 
 def generate_video(model, control, fingerprint, save_path):
-    """Generate a video showing the reverse diffusion process"""
+    """Generate a video showing the reverse diffusion process using DDPMScheduler"""
     if not IMAGEIO_AVAILABLE: return
     model.model.eval()
-    xt = torch.randn_like(control)
+    b, c, h, w = control.shape
+    xt = torch.randn((b, 3, h, w), device=model.cfg.device)
     frames = []
     
-    # Capture 40 equidistant frames
-    save_steps = np.linspace(0, model.timesteps-1, 40, dtype=int)
+    # Use scheduler for consistent sampling
+    model.noise_scheduler.set_timesteps(model.timesteps, device=model.cfg.device)
+    save_steps = np.linspace(0, len(model.noise_scheduler.timesteps) - 1, 40, dtype=int)
     
     with torch.no_grad():
-        for i in reversed(range(model.timesteps)):
-            t = torch.full((1,), i, device=model.cfg.device, dtype=torch.long)
-            noise_pred = model.model(xt, t, control, fingerprint)
+        for i, t in enumerate(model.noise_scheduler.timesteps):
+            t_batch = torch.full((b,), t, device=model.cfg.device, dtype=torch.long)
+            noise_pred = model.model(xt, t_batch, control, fingerprint)
+            xt = model.noise_scheduler.step(noise_pred, t, xt).prev_sample
             
-            alpha = 1 - torch.linspace(model.cfg.beta_start, model.cfg.beta_end, model.timesteps).to(model.cfg.device)[i]
-            alpha_bar = model.alpha_bar[i]
-            beta = 1 - alpha
-            z = torch.randn_like(xt) if i > 0 else 0
-            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
-            xt = torch.clamp(xt, -1, 1)
-            
-            if i in save_steps or i==0:
-                img_np = ((xt[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+            if i in save_steps or i == len(model.noise_scheduler.timesteps) - 1:
+                img_np = ((xt[0].cpu().permute(1,2,0).clamp(-1, 1) + 1) * 127.5).numpy().astype(np.uint8)
                 frames.append(img_np)
     
     ctrl_np = ((control[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
@@ -1037,7 +1033,13 @@ def main():
 
     print(f"Initializing Modified Diffusers U-Net...")
     model = DiffusionModel(config)
-    optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr, weight_decay=0.01)
+    
+    # Use parameter groups: higher LR for new layers (fingerprint_proj, conv_in)
+    optimizer = torch.optim.AdamW([
+        {"params": [p for n, p in model.model.unet.named_parameters() if 'conv_in' not in n], "lr": config.lr},
+        {"params": model.model.fingerprint_proj.parameters(), "lr": config.lr * 10},  # 10x LR for new projection
+        {"params": model.model.unet.conv_in.parameters(), "lr": config.lr * 10},  # 10x LR for modified input layer
+    ], weight_decay=0.01)
     
     # Learning Rate Scheduler - Cosine Annealing (recommended for diffusion models)
     # Gradually reduces LR from initial to near-zero over training
@@ -1115,7 +1117,8 @@ def main():
             real_t = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
             
-            fakes = model.sample(ctrl, fp)
+            # Use fewer inference steps for faster evaluation (can increase later)
+            fakes = model.sample(ctrl, fp, num_inference_steps=200)
             
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
