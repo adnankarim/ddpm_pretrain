@@ -1119,44 +1119,25 @@ def main():
                 return_dict=False,
             )
             
-            # 2. U-Net uses residuals
-            if config.mixed_precision == "fp16":
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                    if hasattr(unet, 'base_model'):
-                        noise_pred = unet.base_model.model(
-                            noisy_latents,
-                            timesteps,
-                            encoder_hidden_states=context,
-                            down_block_additional_residuals=down_block_res_samples,
-                            mid_block_additional_residual=mid_block_res_sample,
-                        ).sample
-                    else:
-                        noise_pred = unet(
-                            noisy_latents,
-                            timesteps,
-                            encoder_hidden_states=context,
-                            down_block_additional_residuals=down_block_res_samples,
-                            mid_block_additional_residual=mid_block_res_sample,
-                        ).sample
-                    loss = F.mse_loss(noise_pred.float(), noise.float())
+            # 2. U-Net uses residuals (FP32 - no autocast needed)
+            if hasattr(unet, 'base_model'):
+                noise_pred = unet.base_model.model(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
             else:
-                if hasattr(unet, 'base_model'):
-                    noise_pred = unet.base_model.model(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states=context,
-                        down_block_additional_residuals=down_block_res_samples,
-                        mid_block_additional_residual=mid_block_res_sample,
-                    ).sample
-                else:
-                    noise_pred = unet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states=context,
-                        down_block_additional_residuals=down_block_res_samples,
-                        mid_block_additional_residual=mid_block_res_sample,
-                    ).sample
-                loss = F.mse_loss(noise_pred, noise)
+                noise_pred = unet(
+                    noisy_latents,
+                    timesteps,
+                    encoder_hidden_states=context,
+                    down_block_additional_residuals=down_block_res_samples,
+                    mid_block_additional_residual=mid_block_res_sample,
+                ).sample
+            
+            loss = F.mse_loss(noise_pred, noise)
             
             # Check for NaN
             if torch.isnan(loss) or torch.isinf(loss):
