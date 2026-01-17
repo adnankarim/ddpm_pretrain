@@ -741,11 +741,128 @@ def load_checkpoint(model, optimizer, path, scheduler=None):
 # MAIN
 # ============================================================================
 
+def run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch=None):
+    """
+    Run evaluation: generate video, grid, and metrics without training.
+    """
+    print("\n" + "="*60, flush=True)
+    epoch_label = f"Epoch {checkpoint_epoch}" if checkpoint_epoch else "Evaluation"
+    print(f"EVALUATION ({epoch_label})", flush=True)
+    print("="*60, flush=True)
+    
+    model.eval()
+    
+    # Create dataloader for evaluation
+    eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
+    
+    # Get a sample batch
+    sample_batch = next(iter(eval_loader))
+    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    
+    ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
+    target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
+    fp = sample_batch['fingerprint'][:4].to(config.device)
+    
+    with torch.no_grad():
+        # 1. Encode Control and Target
+        ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
+        target_latents = vae.encode(target_img.float()).latent_dist.mode() * vae.config.scaling_factor
+        
+        # 2. Run Reverse Diffusion Process (Full Sampling Loop)
+        print("  Running reverse diffusion sampling...", flush=True)
+        latents = torch.randn_like(ctrl_latents)
+        
+        # Use scheduler for proper sampling
+        for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
+            # Create timestep tensor for model (batch_size,)
+            timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
+            
+            # Predict noise
+            noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
+            
+            # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
+            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+        
+        # 3. Decode Generated Images
+        fake_imgs = vae.decode(latents / vae.config.scaling_factor).sample
+        fake_imgs = (fake_imgs / 2 + 0.5).clamp(0, 1)
+        
+        # 4. Calculate Metrics
+        real_imgs_norm = (target_img / 2 + 0.5).clamp(0, 1)
+        
+        # Also compute noise prediction metrics during forward pass
+        noise = torch.randn_like(target_latents)
+        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                                (target_latents.shape[0],), device=config.device).long()
+        noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
+        noise_pred_forward = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
+        
+        metrics = calculate_metrics(real_imgs_norm, fake_imgs, noise_pred_forward, noise)
+        
+        # Print metrics
+        print(f"\n  📊 EVALUATION METRICS:", flush=True)
+        print(f"  {'-'*58}", flush=True)
+        if metrics['kl_div'] is not None:
+            print(f"    KL Divergence:     {metrics['kl_div']:.6f}", flush=True)
+        if metrics['mse'] is not None:
+            print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+        if metrics['psnr'] is not None:
+            print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+        if metrics['ssim'] is not None:
+            print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+        print(f"  {'-'*58}", flush=True)
+        
+        # Log metrics to CSV
+        if checkpoint_epoch:
+            logger.log_metrics(checkpoint_epoch, metrics)
+        else:
+            logger.log_metrics(0, metrics)  # Use epoch 0 for standalone evaluation
+        
+        # 5. Save Image Grid
+        grid = torch.cat([
+            (ctrl_img / 2 + 0.5).clamp(0, 1)[:4],
+            fake_imgs[:4],
+            real_imgs_norm[:4]  # Show target again for comparison
+        ], dim=0)
+        
+        if checkpoint_epoch:
+            grid_path = f"{config.output_dir}/plots/eval_epoch_{checkpoint_epoch}.png"
+        else:
+            grid_path = f"{config.output_dir}/plots/eval_latest.png"
+        
+        save_image(grid, grid_path, nrow=4, normalize=False)
+        print(f"  ✓ Sample grid saved to: {grid_path}", flush=True)
+        
+        # 6. Generate Video
+        if checkpoint_epoch:
+            video_path = f"{config.output_dir}/plots/video_eval_epoch_{checkpoint_epoch}.mp4"
+        else:
+            video_path = f"{config.output_dir}/plots/video_eval_latest.mp4"
+        
+        generate_video(model, vae, noise_scheduler, ctrl_img[0], fp[0], video_path)
+        
+        print("="*60 + "\n", flush=True)
+        
+        # Log to wandb
+        if WANDB_AVAILABLE:
+            wandb_metrics = {"eval_epoch": checkpoint_epoch if checkpoint_epoch else 0}
+            if metrics['kl_div'] is not None:
+                wandb_metrics['eval_kl_div'] = metrics['kl_div']
+            if metrics['mse'] is not None:
+                wandb_metrics['eval_mse_gen_real'] = metrics['mse']
+            if metrics['psnr'] is not None:
+                wandb_metrics['eval_psnr'] = metrics['psnr']
+            if metrics['ssim'] is not None:
+                wandb_metrics['eval_ssim'] = metrics['ssim']
+            wandb.log(wandb_metrics)
+
 def main():
     parser = argparse.ArgumentParser(description="Partial Fine-Tuning of Stable Diffusion for Drug-Conditioned Generation")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file")
+    parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (generate video, grid, and metrics)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation (default: uses latest.pt from output_dir)")
     args = parser.parse_args()
     
     config = Config()
@@ -851,7 +968,43 @@ def main():
     
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
     
-    # Load checkpoint
+    # Check if evaluation-only mode
+    if args.eval_only:
+        # Determine checkpoint path
+        if args.checkpoint:
+            checkpoint_path = args.checkpoint
+        else:
+            checkpoint_path = f"{config.output_dir}/checkpoints/latest.pt"
+        
+        if not os.path.exists(checkpoint_path):
+            print(f"ERROR: Checkpoint not found at {checkpoint_path}")
+            print(f"Please provide a valid checkpoint path with --checkpoint or ensure latest.pt exists")
+            return
+        
+        # Load checkpoint
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        ckpt = torch.load(checkpoint_path, map_location=config.device)
+        model.load_state_dict(ckpt['model'], strict=False)
+        checkpoint_epoch = ckpt.get('epoch', 0)
+        print(f"  Loaded checkpoint from epoch {checkpoint_epoch}")
+        
+        # Load dataset for evaluation
+        print("\nLoading Dataset for Evaluation...")
+        dataset = PairedBBBC021Dataset(
+            config.data_dir, 
+            config.metadata_file, 
+            size=config.image_size,
+            split='train',
+            paths_csv=args.paths_csv
+        )
+        print(f"  Dataset loaded: {len(dataset)} samples")
+        
+        # Run evaluation
+        run_evaluation(model, vae, noise_scheduler, dataset, config, logger, checkpoint_epoch)
+        print("Evaluation complete!")
+        return
+    
+    # Load checkpoint for training
     checkpoint_path = f"{config.output_dir}/checkpoints/latest.pt"
     start_epoch = 0
     if args.resume:
@@ -969,98 +1122,8 @@ def main():
             
         # --- EVALUATION ---
         if (epoch + 1) % config.eval_freq == 0:
-            print("\n" + "="*60, flush=True)
-            print(f"EVALUATION (Epoch {epoch+1})", flush=True)
-            print("="*60, flush=True)
-            
-            model.eval()
-            
-            # Get a sample batch from training data for evaluation
-            sample_batch = next(iter(loader))
-            ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
-            target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
-            fp = sample_batch['fingerprint'][:4].to(config.device)
-            
-            with torch.no_grad():
-                # 1. Encode Control and Target
-                # VAE requires float32, so convert images if they're in float16
-                ctrl_latents = vae.encode(ctrl_img.float()).latent_dist.mode() * vae.config.scaling_factor
-                target_latents = vae.encode(target_img.float()).latent_dist.mode() * vae.config.scaling_factor
-                
-                # 2. Run Reverse Diffusion Process (Full Sampling Loop)
-                print("  Running reverse diffusion sampling...", flush=True)
-                latents = torch.randn_like(ctrl_latents)
-                
-                # Use scheduler for proper sampling
-                for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
-                    # Create timestep tensor for model (batch_size,)
-                    timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
-                    
-                    # Predict noise
-                    noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
-                    
-                    # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
-                    latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
-                
-                # 3. Decode Generated Images
-                fake_imgs = vae.decode(latents / vae.config.scaling_factor).sample
-                fake_imgs = (fake_imgs / 2 + 0.5).clamp(0, 1)
-                
-                # 4. Calculate Metrics
-                real_imgs_norm = (target_img / 2 + 0.5).clamp(0, 1)
-                
-                # Also compute noise prediction metrics during forward pass
-                noise = torch.randn_like(target_latents)
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
-                                        (target_latents.shape[0],), device=config.device).long()
-                noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
-                noise_pred_forward = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
-                
-                metrics = calculate_metrics(real_imgs_norm, fake_imgs, noise_pred_forward, noise)
-                
-                # Print metrics
-                print(f"\n  📊 EVALUATION METRICS:", flush=True)
-                print(f"  {'-'*58}", flush=True)
-                if metrics['kl_div'] is not None:
-                    print(f"    KL Divergence:     {metrics['kl_div']:.6f}", flush=True)
-                if metrics['mse'] is not None:
-                    print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
-                if metrics['psnr'] is not None:
-                    print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
-                if metrics['ssim'] is not None:
-                    print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
-                print(f"  {'-'*58}", flush=True)
-                
-                # Log metrics to CSV
-                logger.log_metrics(epoch+1, metrics)
-                
-                # 5. Save Image Grid
-                grid = torch.cat([
-                    (ctrl_img / 2 + 0.5).clamp(0, 1)[:4],
-                    fake_imgs[:4],
-                    real_imgs_norm[:4]  # Show target again for comparison
-                ], dim=0)
-                save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=4, normalize=False)
-                print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
-                
-                # 6. Generate Video
-                video_path = f"{config.output_dir}/plots/video_{epoch+1}.mp4"
-                generate_video(model, vae, noise_scheduler, ctrl_img[0], fp[0], video_path)
-                
-                print("="*60 + "\n", flush=True)
-                
-                # Log to wandb
-                if WANDB_AVAILABLE:
-                    wandb_metrics = {"epoch": epoch+1}
-                    if metrics['kl_div'] is not None:
-                        wandb_metrics['kl_div'] = metrics['kl_div']
-                    if metrics['mse'] is not None:
-                        wandb_metrics['mse_gen_real'] = metrics['mse']
-                    if metrics['psnr'] is not None:
-                        wandb_metrics['psnr'] = metrics['psnr']
-                    if metrics['ssim'] is not None:
-                        wandb_metrics['ssim'] = metrics['ssim']
-                    wandb.log(wandb_metrics)
+            # Use the reusable evaluation function
+            run_evaluation(model, vae, noise_scheduler, dataset, config, logger, epoch+1)
 
 if __name__ == "__main__":
     main()
