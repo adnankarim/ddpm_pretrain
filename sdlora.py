@@ -675,7 +675,7 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
                 frames.append(img_np)
         
         # Also decode control for side-by-side comparison
-        ctrl_decoded = vae.decode(vae.encode(ctrl_pixel.float()).latent_dist.mode() / vae.config.scaling_factor).sample
+        ctrl_decoded = vae.decode(vae.encode(ctrl_pixel.to(dtype=torch.float32)).latent_dist.mode() / vae.config.scaling_factor).sample
         ctrl_decoded = (ctrl_decoded / 2 + 0.5).clamp(0, 1)
         ctrl_np = (ctrl_decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         
@@ -745,7 +745,7 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
     
     with torch.no_grad():
         # 1. Encode Target to Latents
-        target_latents = vae.encode(target_img.float()).latent_dist.mode() * vae.config.scaling_factor
+        target_latents = vae.encode(target_img.to(dtype=torch.float32)).latent_dist.mode() * vae.config.scaling_factor
         
         # 2. Prepare Context (Text + Drug)
         tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
@@ -1080,7 +1080,7 @@ def main():
             
             # A. Prepare Latents (Target)
             with torch.no_grad():
-                target_latents = vae.encode(target_pixel.float()).latent_dist.sample() * vae.config.scaling_factor
+                target_latents = vae.encode(target_pixel.to(dtype=torch.float32)).latent_dist.sample() * vae.config.scaling_factor
                 target_latents = target_latents.to(dtype=weight_dtype)
             
             # B. Prepare Context (Text + Drug)
