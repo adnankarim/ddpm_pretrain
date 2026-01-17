@@ -750,6 +750,47 @@ def main():
     # Store config in model for checkpoint loading
     model.cfg = config
     
+    # Model Summary
+    print(f"\n{'='*60}", flush=True)
+    print(f"Model Summary:", flush=True)
+    print(f"{'='*60}", flush=True)
+    
+    # Use stored values from model if available, otherwise calculate
+    if hasattr(model, 'total_params'):
+        total_params = model.total_params
+        trainable_params = model.trainable_params
+        frozen_params = model.frozen_params
+    else:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+    
+    print(f"  Total Parameters:     {total_params:,}", flush=True)
+    print(f"  Trainable Parameters: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)", flush=True)
+    print(f"  Frozen Parameters:    {frozen_params:,} ({frozen_params/total_params*100:.2f}%)", flush=True)
+    
+    # Print model architecture summary
+    print(f"\n  Model Architecture:", flush=True)
+    print(f"    - U-Net: UNet2DConditionModel (Stable Diffusion v1.5)", flush=True)
+    print(f"    - Input Channels: 8 (4 noise + 4 control latents)", flush=True)
+    print(f"    - Drug Projection: {config.fingerprint_dim} -> 768", flush=True)
+    print(f"    - Partial Fine-Tuning: Input, Cross-Attention, Output layers", flush=True)
+    
+    # PyTorch Model Summary
+    print(f"\n  PyTorch Model Structure:", flush=True)
+    print(f"    Model Type: {type(model).__name__}", flush=True)
+    print(f"    UNet Type: {type(model.unet).__name__}", flush=True)
+    print(f"    Drug Projection: {type(model.drug_proj).__name__}", flush=True)
+    
+    # Try to use torchsummary if available
+    try:
+        from torchsummary import summary
+        print(f"\n  Note: torchsummary available (model too complex for detailed summary)", flush=True)
+    except ImportError:
+        print(f"\n  Note: Install torchsummary for detailed layer info: pip install torchsummary", flush=True)
+    
+    print(f"{'='*60}\n", flush=True)
+    
     # 3. Optimizer (Only Trainable Params)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()), 
