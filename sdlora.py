@@ -101,7 +101,7 @@ class Config:
     
     # Training
     epochs = 200
-    batch_size = 64  # Lower batch size due to 512x512 resolution
+    batch_size = 32  # Lower batch size due to 512x512 resolution
     lr = 1e-5       # 1e-5 is perfect for ControlNet + LoRA
     save_freq = 1
     eval_freq = 1
