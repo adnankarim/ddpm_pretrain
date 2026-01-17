@@ -111,7 +111,7 @@ class Config:
     
     output_dir = "controlnet_lora_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mixed_precision = "fp16"
+    mixed_precision = "fp32"  # Use FP32 for stability (GH200 has enough VRAM)
 
 # ============================================================================
 # LOGGING UTILS
