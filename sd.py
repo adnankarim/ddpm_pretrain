@@ -677,13 +677,14 @@ def generate_video(model, vae, noise_scheduler, control, fingerprint, save_path,
         
         # Reverse diffusion loop
         for i, t in enumerate(reversed(noise_scheduler.timesteps)):
+            # Create timestep tensor for model (batch_size=1,)
             timestep = torch.full((1,), t, device=latents.device, dtype=torch.long)
             
             # Predict noise
             noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
             
-            # DDPM step
-            latents = noise_scheduler.step(noise_pred, timestep, latents).prev_sample
+            # DDPM step - pass scalar timestep to avoid tensor boolean ambiguity
+            latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
             
             # Save frame if at capture point
             if t in save_steps or i == len(noise_scheduler.timesteps) - 1:
@@ -978,13 +979,14 @@ def main():
                 
                 # Use scheduler for proper sampling
                 for t in tqdm(noise_scheduler.timesteps, desc="  Sampling", leave=False):
+                    # Create timestep tensor for model (batch_size,)
                     timestep = torch.full((latents.shape[0],), t, device=config.device, dtype=torch.long)
                     
                     # Predict noise
                     noise_pred = model(latents.float(), timestep, ctrl_latents.float(), fp)
                     
-                    # Scheduler step
-                    latents = noise_scheduler.step(noise_pred, timestep, latents).prev_sample
+                    # Scheduler step - pass scalar timestep to avoid tensor boolean ambiguity
+                    latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
                 
                 # 3. Decode Generated Images
                 fake_imgs = vae.decode(latents / vae.config.scaling_factor).sample
