@@ -103,8 +103,8 @@ class Config:
     epochs = 200
     batch_size = 64  # Lower batch size due to 512x512 resolution
     lr = 1e-5       # 1e-5 is perfect for ControlNet + LoRA
-    save_freq = 51
-    eval_freq = 5
+    save_freq = 1
+    eval_freq = 1
     
     # Token Strategy (Fixes Flaw #1: Voice Imbalance)
     num_drug_tokens = 4  # Give drug 4 "words" of attention instead of 1
