@@ -740,7 +740,7 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
     
     # Get a sample batch
     sample_batch = next(iter(eval_loader))
-    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    weight_dtype = torch.float32  # Use FP32 for stability
     
     ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
     target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
@@ -755,7 +755,7 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
         tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
         text_emb = text_encoder(tokens)[0]  # [B, 77, 768]
         # Convert fingerprint to match drug_proj dtype
-        weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+        weight_dtype = torch.float32  # Use FP32 for stability
         # Convert text_emb to match weight_dtype (float16 if mixed precision)
         text_emb = text_emb.to(dtype=weight_dtype)
         drug_emb = drug_proj(fp.to(dtype=weight_dtype))  # [B, N, 768]
@@ -921,7 +921,8 @@ def main():
 
     # 1. Load Standard Components (All Frozen)
     print("Loading Components...")
-    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    # Use FP32 for stability (GH200 has enough VRAM, no need for FP16)
+    weight_dtype = torch.float32
     
     # VAE must always be float32 (it doesn't work well with float16)
     vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device, dtype=torch.float32)
