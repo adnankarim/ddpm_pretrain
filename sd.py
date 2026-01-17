@@ -63,6 +63,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+try:
+    import imageio
+    IMAGEIO_AVAILABLE = True
+except ImportError:
+    IMAGEIO_AVAILABLE = False
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
