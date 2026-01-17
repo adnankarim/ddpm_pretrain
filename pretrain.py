@@ -79,7 +79,7 @@ class Config:
     save_freq = 5
     eval_freq = 5
     
-    output_dir = "foundation_train_only_results"
+    output_dir = "foundation_train_only_results_anton"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============================================================================
@@ -653,7 +653,7 @@ def main():
     
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
-    print("Initializing Modern U-Net (From Scratch)...")
+    print("Initializing Pretrained U-Net (anton-l/ddpm-butterflies-128)...")
     model = UnconditionalDiffusion(config)
     optimizer = torch.optim.AdamW(model.model.parameters(), lr=config.lr, weight_decay=0.01)
     
