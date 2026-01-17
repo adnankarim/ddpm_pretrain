@@ -190,7 +190,7 @@ class TrainingLogger:
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
-    
+        
     def _plot_metrics(self):
         """Plot additional metrics (KL, PSNR, SSIM)"""
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -299,10 +299,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-            for cpd in df['CPD_NAME'].unique():
+        for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-                self.fingerprints[cpd] = self.encoder.encode(smiles)
+            self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -361,7 +361,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-            ctrls = self.batch_map[batch]['ctrl']
+        ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -787,6 +787,64 @@ def calculate_kl_divergence(noise_pred, noise_true):
     kl = 0.5 * mse
     return kl.item()
 
+def calculate_fid(real_images, fake_images, device):
+    """
+    Calculate Fréchet Inception Distance (FID) between real and generated images.
+    
+    Args:
+        real_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
+        fake_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
+        device: torch device
+    
+    Returns:
+        FID score (float) or None if calculation fails
+    """
+    try:
+        from torchvision.models import inception_v3
+        from scipy import linalg
+        
+        # Load Inception v3 model
+        inception = inception_v3(pretrained=True, transform_input=False).to(device)
+        inception.eval()
+        inception.fc = torch.nn.Identity()  # Remove final classification layer
+        
+        def get_features(images):
+            """Extract features from Inception v3"""
+            # Normalize to [0, 1] for Inception
+            img_norm = (images + 1.0) / 2.0
+            # Resize to 299x299 (Inception input size)
+            img_resized = torch.nn.functional.interpolate(
+                img_norm, size=(299, 299), mode='bilinear', align_corners=False
+            )
+            with torch.no_grad():
+                features = inception(img_resized)
+            return features.cpu().numpy()
+        
+        # Extract features
+        real_features = get_features(real_images)
+        fake_features = get_features(fake_images)
+        
+        # Calculate mean and covariance
+        mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
+        mu2, sigma2 = fake_features.mean(axis=0), np.cov(fake_features, rowvar=False)
+        
+        # Calculate FID
+        diff = mu1 - mu2
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        if not np.isfinite(covmean).all():
+            # Handle numerical issues
+            offset = np.eye(sigma1.shape[0]) * 1e-6
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        
+        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
+        return float(np.real(fid))
+        
+    except ImportError:
+        return None
+    except Exception as e:
+        print(f"  Warning: FID calculation failed: {e}", flush=True)
+        return None
+
 def calculate_metrics(model, val_loader, device, num_samples=8):
     """
     Calculate evaluation metrics on validation set.
@@ -1150,7 +1208,7 @@ def main():
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
-        
+
         # Step scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
