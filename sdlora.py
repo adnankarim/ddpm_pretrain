@@ -956,8 +956,9 @@ def main():
     print(f"Model Summary:", flush=True)
     print(f"{'='*60}", flush=True)
     
-    total_params = sum(p.numel() for p in [unet, controlnet, drug_proj])
-    trainable_params = sum(p.numel() for p in [unet, controlnet, drug_proj] if p.requires_grad)
+    # Count parameters correctly (iterate over parameters, not models)
+    total_params = sum(p.numel() for model in [unet, controlnet, drug_proj] for p in model.parameters())
+    trainable_params = sum(p.numel() for model in [unet, controlnet, drug_proj] for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     
     print(f"  Total Parameters:     {total_params:,}", flush=True)
