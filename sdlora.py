@@ -633,10 +633,10 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
         # 3. Setup Scheduler
         scheduler.set_timesteps(1000)
         frames = []
-        save_steps = np.linspace(0, 999, num_frames, dtype=int)
+        save_steps = np.linspace(0, len(scheduler.timesteps) - 1, num_frames, dtype=int)
         
         # 4. Loop (FIXED: No reversed timesteps)
-        for t in tqdm(scheduler.timesteps, desc="  Generating Video", leave=False):
+        for i, t in enumerate(tqdm(scheduler.timesteps, desc="  Generating Video", leave=False)):
             t_tensor = torch.full((1,), t, device=device, dtype=torch.long)
             
             # A. ControlNet Step (takes pixel image)
@@ -667,8 +667,9 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
                     mid_block_additional_residual=mid_block_res_sample,
                 ).sample
             
-            # C. Scheduler Step
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            # C. Scheduler Step (t must be a valid timestep value, not index)
+            # The scheduler expects the actual timestep value from scheduler.timesteps
+            latents = scheduler.step(noise_pred, t.item() if isinstance(t, torch.Tensor) else t, latents).prev_sample
             
             # D. Save Frame
             if t.item() in save_steps or t.item() == 0:
