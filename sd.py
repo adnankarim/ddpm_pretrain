@@ -244,9 +244,17 @@ class DrugConditionedStableDiffusion(nn.Module):
         # Statistics
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in trainable_params)
+        frozen = total - trainable
+        
         print(f"  Total Params: {total:,}")
-        print(f"  Trainable:    {trainable:,} ({(trainable/total)*100:.1f}%)")
+        print(f"  Trainable:    {trainable:,} ({(trainable/total)*100:.2f}%)")
+        print(f"  Frozen:       {frozen:,} ({(frozen/total)*100:.2f}%)")
         print(f"  Unfrozen Attention Blocks: {unfrozen_blocks}")
+        
+        # Store for later access
+        self.total_params = total
+        self.trainable_params = trainable
+        self.frozen_params = frozen
 
     def forward(self, noisy_latents, timesteps, control_latents, fingerprint):
         # 1. Project Drug Fingerprint
