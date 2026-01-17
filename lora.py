@@ -109,8 +109,12 @@ class BBBC021LoRADataset(Dataset):
             raise FileNotFoundError(f"Cannot find metadata CSV at {csv_full_path}")
             
         df = pd.read_csv(csv_full_path)
-        if 'SPLIT' in df.columns:
+        # If split is empty string, use all data (for 10% sampling from all weeks)
+        if split and 'SPLIT' in df.columns:
             df = df[df['SPLIT'].str.lower() == split.lower()]
+        elif split == '':
+            # Use all data regardless of split
+            print(f"  Loading ALL data (all splits) for 10% sampling...")
             
         self.metadata = df.to_dict('records')
         
