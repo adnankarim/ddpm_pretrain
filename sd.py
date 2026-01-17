@@ -93,16 +93,29 @@ class Config:
 # ============================================================================
 
 class TrainingLogger:
+    """
+    Logs training metrics to CSV and generates plots every epoch.
+    Now tracks KL, MSE, PSNR, SSIM.
+    """
     def __init__(self, save_dir):
         self.save_dir = save_dir
-        self.history = {'epoch': [], 'loss': [], 'learning_rate': []}
+        # Main training log
+        self.history = {'epoch': [], 'train_loss': [], 'learning_rate': []}
         self.csv_path = os.path.join(save_dir, "training_history.csv")
         self.plot_path = os.path.join(save_dir, "training_loss.png")
         
+        # Detailed metrics log
+        self.metrics_csv_path = os.path.join(save_dir, "evaluation_metrics.csv")
+        # Initialize metrics file with headers if it doesn't exist
+        if not os.path.exists(self.metrics_csv_path):
+            pd.DataFrame(columns=['epoch', 'kl_div', 'mse', 'psnr', 'ssim']).to_csv(self.metrics_csv_path, index=False)
+        
     def update(self, epoch, loss, lr=None):
         self.history['epoch'].append(epoch)
-        self.history['loss'].append(loss)
+        self.history['train_loss'].append(loss)
         self.history['learning_rate'].append(lr if lr is not None else 0)
+        
+        # Save Training History
         df = pd.DataFrame(self.history)
         df.to_csv(self.csv_path, index=False)
         
@@ -113,7 +126,7 @@ class TrainingLogger:
         color = '#1f77b4'
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('MSE Loss', color=color)
-        line1 = ax1.plot(self.history['epoch'], self.history['loss'], 
+        line1 = ax1.plot(self.history['epoch'], self.history['train_loss'], 
                         label='MSE Loss', color=color, linewidth=2)
         ax1.tick_params(axis='y', labelcolor=color)
         ax1.set_yscale('log')
@@ -133,6 +146,14 @@ class TrainingLogger:
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
+
+    def log_metrics(self, epoch, metrics_dict):
+        """Appends evaluation metrics to a separate CSV"""
+        new_row = {'epoch': epoch}
+        new_row.update(metrics_dict)
+        df = pd.DataFrame([new_row])
+        df.to_csv(self.metrics_csv_path, mode='a', header=False, index=False)
+        print(f"  📊 Metrics logged to {self.metrics_csv_path}")
 
 # ============================================================================
 # ARCHITECTURE: CONDITIONAL STABLE DIFFUSION
