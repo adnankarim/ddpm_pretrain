@@ -855,13 +855,30 @@ def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer,
             wandb.log(wandb_metrics)
 
 def main():
-    parser = argparse.ArgumentParser(description="ControlNet + LoRA for Drug-Conditioned Generation")
-    parser.add_argument("--output_dir", type=str, default=None)
+    parser = argparse.ArgumentParser(
+        description="ControlNet + LoRA for Drug-Conditioned Generation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train normally
+  python sdlora.py --output_dir ./results
+
+  # Evaluate latest checkpoint (from output_dir/checkpoints/latest.pt)
+  python sdlora.py --eval_only --output_dir ./results
+
+  # Evaluate specific checkpoint on test split
+  python sdlora.py --eval_only --checkpoint ./results/checkpoints/checkpoint_epoch_10.pt --eval_split test
+
+  # Resume training from latest checkpoint
+  python sdlora.py --resume --output_dir ./results
+        """
+    )
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for results (default: controlnet_lora_results)")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
-    parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file")
-    parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (generate video, grid, and metrics)")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation")
-    parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation")
+    parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file for robust file lookup")
+    parser.add_argument("--eval_only", action="store_true", help="Run evaluation only: generate samples, plot grid, video, and metrics (no training)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation (default: uses latest.pt from output_dir)")
+    parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation (default: train)")
     args = parser.parse_args()
     
     config = Config()
