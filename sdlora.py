@@ -581,22 +581,7 @@ def calculate_metrics(real_imgs, gen_imgs, noise_pred=None, noise_real=None):
 
 def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_encoder, control, fingerprint, prompt, save_path, device, num_frames=40):
     """
-    Generates video of denoising process using ControlNet + LoRA
-    
-    Args:
-        unet: U-Net with LoRA (frozen base, trainable LoRA)
-        controlnet: ControlNet model (trainable)
-        vae: VAE encoder/decoder
-        scheduler: DDPMScheduler
-        drug_proj: DrugProjector module
-        tokenizer: CLIPTokenizer
-        text_encoder: CLIPTextModel
-        control: Control image tensor [3, H, W] (pixel space)
-        fingerprint: Drug fingerprint tensor [1024]
-        prompt: Text prompt string
-        save_path: Path to save video
-        device: Device to run on
-        num_frames: Number of frames to capture
+    Generates video of denoising process (Fixed: robust to timestep index errors)
     """
     if not IMAGEIO_AVAILABLE: 
         print("  Warning: imageio not available. Skipping video generation.")
@@ -606,102 +591,68 @@ def generate_video(unet, controlnet, vae, scheduler, drug_proj, tokenizer, text_
     controlnet.eval()
     
     with torch.no_grad():
-        # 1. Prepare Inputs
-        # Control Image (keep in pixel space for ControlNet)
-        ctrl_pixel = control.unsqueeze(0).to(device)  # [1, 3, H, W]
+        # 1. Inputs
+        ctrl_pixel = control.unsqueeze(0).to(device)
+        dtype = next(unet.parameters()).dtype
+        latents = torch.randn((1, 4, 64, 64), device=device, dtype=dtype)
         
-        # Latents for U-Net
-        weight_dtype = next(unet.parameters()).dtype
-        latents = torch.randn((1, 4, 64, 64), device=device, dtype=weight_dtype)
+        # 2. Context
+        tokens = tokenizer([prompt], padding="max_length", truncation=True, return_tensors="pt").input_ids.to(device)
+        text_emb = text_encoder(tokens)[0].to(dtype=dtype)
+        drug_emb = drug_proj(fingerprint.unsqueeze(0).to(device, dtype=dtype))
+        context = torch.cat([text_emb, drug_emb], dim=1)
         
-        # 2. Prepare Context (Text + Drug)
-        tokens = tokenizer(
-            [prompt], 
-            padding="max_length", 
-            truncation=True, 
-            return_tensors="pt"
-        ).input_ids.to(device)
-        text_emb = text_encoder(tokens)[0]  # [1, 77, 768]
-        
-        # Convert fingerprint to match drug_proj dtype
-        weight_dtype = next(drug_proj.parameters()).dtype
-        # Convert text_emb to match weight_dtype (float16 if mixed precision)
-        text_emb = text_emb.to(dtype=weight_dtype)
-        drug_emb = drug_proj(fingerprint.unsqueeze(0).to(device, dtype=weight_dtype))  # [1, N, 768]
-        context = torch.cat([text_emb, drug_emb], dim=1)  # [1, 77+N, 768]
-        
-        # 3. Setup Scheduler
+        # 3. Scheduler Setup
         scheduler.set_timesteps(1000)
         frames = []
-        # Use iteration indices for frame saving (0 to len(timesteps)-1)
-        save_steps = np.linspace(0, len(scheduler.timesteps) - 1, num_frames, dtype=int)
+        save_steps = np.linspace(0, 999, num_frames, dtype=int)
         
-        # 4. Loop (FIXED: No reversed timesteps)
-        for i, t in enumerate(tqdm(scheduler.timesteps, desc="  Generating Video", leave=False)):
-            # Convert t to scalar if it's a tensor (scheduler expects scalar)
-            t_scalar = t.item() if isinstance(t, torch.Tensor) else int(t)
-            t_tensor = torch.full((1,), t_scalar, device=device, dtype=torch.long)
+        # 4. Denoising Loop
+        for t in tqdm(scheduler.timesteps, desc="  Generating Video", leave=False):
+            # FIX: Force t to be a valid index (0-999)
+            t_val = t.item() if isinstance(t, torch.Tensor) else t
+            t_val = min(t_val, scheduler.config.num_train_timesteps - 1) 
+            t_tensor = torch.full((1,), t_val, device=device, dtype=torch.long)
             
-            # A. ControlNet Step (takes pixel image)
-            down_block_res_samples, mid_block_res_sample = controlnet(
-                latents,
-                t_tensor,
-                encoder_hidden_states=context,
-                controlnet_cond=ctrl_pixel,  # Pass Pixel Image!
-                return_dict=False,
+            # A. ControlNet
+            down, mid = controlnet(
+                latents, t_tensor, encoder_hidden_states=context, 
+                controlnet_cond=ctrl_pixel, return_dict=False
             )
             
-            # B. U-Net Step (uses ControlNet residuals)
+            # B. U-Net
             if hasattr(unet, 'base_model'):
-                # PEFT wrapped model
                 noise_pred = unet.base_model.model(
-                    latents,
-                    t_tensor,
-                    encoder_hidden_states=context,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
+                    latents, t_tensor, encoder_hidden_states=context,
+                    down_block_additional_residuals=down, mid_block_additional_residual=mid
                 ).sample
             else:
                 noise_pred = unet(
-                    latents,
-                    t_tensor,
-                    encoder_hidden_states=context,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
+                    latents, t_tensor, encoder_hidden_states=context,
+                    down_block_additional_residuals=down, mid_block_additional_residual=mid
                 ).sample
             
-            # C. Scheduler Step (t_scalar must be a valid timestep value: 0-999)
-            latents = scheduler.step(noise_pred, t_scalar, latents).prev_sample
+            # C. Step (Use t_val to avoid index error)
+            latents = scheduler.step(noise_pred, t_val, latents).prev_sample
             
-            # D. Save Frame (use iteration index, not timestep value)
-            if i in save_steps or i == len(scheduler.timesteps) - 1:
-                # Decode to image (VAE requires float32)
+            # D. Save Frame
+            if t_val in save_steps or t_val == 0:
                 decoded = vae.decode((latents / vae.config.scaling_factor).float()).sample
                 decoded = (decoded / 2 + 0.5).clamp(0, 1)
                 img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 frames.append(img_np)
         
-        # Also decode control for side-by-side comparison
-        ctrl_decoded = vae.decode(vae.encode(ctrl_pixel.to(dtype=torch.float32)).latent_dist.mode() / vae.config.scaling_factor).sample
-        ctrl_decoded = (ctrl_decoded / 2 + 0.5).clamp(0, 1)
-        ctrl_np = (ctrl_decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        
-        # Create separator
-        separator = np.zeros((ctrl_np.shape[0], 2, 3), dtype=np.uint8)
-        
-        # Stitch frames: [Generated (changing)] | [Control (static)]
-        final_frames = []
-        for frame in frames:
-            combined = np.hstack([frame, separator, ctrl_np])
-            final_frames.append(combined)
-        
-        # 5. Save Video
-        if IMAGEIO_AVAILABLE and final_frames:
-            import imageio
+        # 5. Save
+        if frames:
+            # Helper to create side-by-side
+            ctrl_decoded = vae.decode(vae.encode(ctrl_pixel.float()).latent_dist.mode() / vae.config.scaling_factor).sample
+            ctrl_decoded = (ctrl_decoded / 2 + 0.5).clamp(0, 1)
+            ctrl_np = (ctrl_decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            separator = np.zeros((ctrl_np.shape[0], 2, 3), dtype=np.uint8)
+            
+            final_frames = [np.hstack([f, separator, ctrl_np]) for f in frames]
             imageio.mimsave(save_path, final_frames, fps=10)
             print(f"  ✓ Video saved to: {save_path}")
-        else:
-            print(f"  ⚠ Skipping video save (imageio not available or no frames)")
 
 def load_checkpoint(unet, controlnet, drug_proj, optimizer, path, scheduler=None):
     if not os.path.exists(path): 
