@@ -768,6 +768,17 @@ def main():
         split='train',
         paths_csv=args.paths_csv
     )
+    
+    # Dataset Summary
+    print(f"\n{'='*60}", flush=True)
+    print(f"Dataset Summary:", flush=True)
+    print(f"{'='*60}", flush=True)
+    print(f"  Total Treated Samples: {len(dataset.treated):,}", flush=True)
+    print(f"  Total Control Samples: {sum(len(v) for v in dataset.controls.values()):,}", flush=True)
+    print(f"  Unique Batches: {len(dataset.controls):,}", flush=True)
+    print(f"  Image Size: {config.image_size}x{config.image_size}", flush=True)
+    print(f"{'='*60}\n", flush=True)
+    
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
     
     # Load checkpoint
