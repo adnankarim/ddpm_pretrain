@@ -677,11 +677,19 @@ def main():
             # F. Loss & Backprop
             loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
             
+            # Check for NaN loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n⚠️  Warning: NaN/Inf loss detected at step {step}, skipping this batch", flush=True)
+                optimizer.zero_grad()
+                continue
+            
             loss.backward()
             epoch_losses.append(loss.item())
             
             # Gradient Accumulation
             if (step + 1) % config.gradient_accumulation_steps == 0:
+                # Gradient clipping to prevent explosion
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
