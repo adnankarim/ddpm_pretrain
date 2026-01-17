@@ -742,6 +742,7 @@ def run_validation(epoch, unet, vae, tokenizer, text_encoder, noise_scheduler, c
     print("Running validation sampling...")
     unet.eval()
     
+    # Use float32 for validation to avoid dtype mismatches with LoRA
     pipeline = StableDiffusionPipeline.from_pretrained(
         config.pretrained_model_name_or_path,
         vae=vae,
@@ -749,9 +750,12 @@ def run_validation(epoch, unet, vae, tokenizer, text_encoder, noise_scheduler, c
         tokenizer=tokenizer,
         unet=unet, # This UNet has the LoRA weights loaded
         safety_checker=None,
-        torch_dtype=dtype
+        torch_dtype=torch.float32  # Use float32 for stability during validation
     )
     pipeline.to(config.device)
+    
+    # Ensure UNet is in float32 to match pipeline expectations
+    pipeline.unet = pipeline.unet.float()
     
     with torch.no_grad():
         # Generate 4 images
