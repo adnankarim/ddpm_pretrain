@@ -60,7 +60,7 @@ class Config:
     image_size = 96
     
     # Architecture (Modified Diffusers)
-    base_model_id = "google/ddpm-cifar10-32" 
+    base_model_id = "anton-l/ddpm-butterflies-128"  # Pretrained on natural images (butterflies) 
     
     # Embeddings
     perturbation_emb_dim = 128 
@@ -74,7 +74,7 @@ class Config:
     # Training
     epochs = 500
     batch_size = 64
-    lr = 1e-4
+    lr = 3e-5  # Lower LR when using pretrained weights to prevent drift
     save_freq = 1
     eval_freq = 5
     
@@ -639,17 +639,35 @@ class PairedDataLoader:
 class ModifiedDiffusersUNet(nn.Module):
     def __init__(self, image_size=96, fingerprint_dim=1024):
         super().__init__()
-        print(f"Loading base architecture from {Config.base_model_id}...")
-        # Load pretrained model with its default architecture, then modify
-        self.unet = UNet2DModel.from_pretrained(
-            Config.base_model_id,
+        base_model_id = Config.base_model_id
+        print(f"Loading base architecture from {base_model_id}...")
+        
+        # Load pretrained UNet weights
+        unet_pre = UNet2DModel.from_pretrained(base_model_id)
+        
+        # Rebuild a UNet with YOUR desired sample_size and channels
+        # This ensures config matches your training setup (96x96, 6 channels)
+        self.unet = UNet2DModel(
             sample_size=image_size,
-            class_embed_type="identity"
+            in_channels=6,  # Your modified input (3 noise + 3 control)
+            out_channels=unet_pre.config.out_channels,  # usually 3
+            layers_per_block=unet_pre.config.layers_per_block,
+            block_out_channels=unet_pre.config.block_out_channels,
+            down_block_types=unet_pre.config.down_block_types,
+            up_block_types=unet_pre.config.up_block_types,
+            dropout=unet_pre.config.dropout,
+            attention_head_dim=getattr(unet_pre.config, "attention_head_dim", None),
+            norm_num_groups=unet_pre.config.norm_num_groups,
+            class_embed_type="identity"  # For fingerprint conditioning
         )
         
-        # 
-        # Surgery: 3 -> 6 channels
-        old_conv = self.unet.conv_in
+        # Copy weights where shapes match (except conv_in which we'll replace)
+        missing, unexpected = self.unet.load_state_dict(unet_pre.state_dict(), strict=False)
+        print(f"  Loaded weights with strict=False")
+        print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        
+        # --- conv_in surgery: 3 -> 6 ---
+        old_conv = unet_pre.conv_in
         new_conv = nn.Conv2d(
             in_channels=6,
             out_channels=old_conv.out_channels,
@@ -657,18 +675,15 @@ class ModifiedDiffusersUNet(nn.Module):
             stride=old_conv.stride,
             padding=old_conv.padding
         )
-        
         with torch.no_grad():
+            # Copy first 3 channels from pretrained, zero-init last 3 (control)
             new_conv.weight[:, :3, :, :] = old_conv.weight
-            new_conv.weight[:, 3:, :, :] = 0.0 
-            new_conv.bias = old_conv.bias
-            
+            new_conv.weight[:, 3:, :, :] = 0.0
+            new_conv.bias.copy_(old_conv.bias)
         self.unet.conv_in = new_conv
-        print("  ✓ Network Surgery: Input expanded 3 -> 6 channels")
+        print("  ✓ Network Surgery: Input expanded 3 -> 6 channels (pretrained weights preserved)")
 
-        # Surgery: Projection - get actual class embedding dimension from model
-        # The model uses class_labels, so we need to match its embedding dimension
-        # For identity class_embed_type, it uses time_embedding_dim
+        # Fingerprint projection - get actual class embedding dimension from model
         target_dim = self.unet.time_embedding.linear_1.out_features
         self.fingerprint_proj = nn.Sequential(
             nn.Linear(fingerprint_dim, 512),
