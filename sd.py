@@ -1,24 +1,28 @@
 """
 ================================================================================
-BBBC021 PARTIAL FINE-TUNING (CONDITIONAL U-NET)
+BBBC021 STABLE DIFFUSION: PARTIAL FINE-TUNING (Conditional)
 ================================================================================
-Strategy: Partial Fine-Tuning (Sparse Tuning)
+Strategy: Sparse Fine-Tuning
 --------------------------------------------------------------------------------
-Instead of training the entire U-Net (slow, overfitting risk) or just LoRA (low capacity),
-we fine-tune SPECIFIC layers crucial for the task:
-1. Input Layer (Adapter for 6-channel input)
-2. Cross-Attention Layers (The "Drug Listeners")
-3. Output Layer (Pixel refinement)
-Everything else (ResNet blocks, Self-Attention) is FROZEN.
+This script transforms Stable Diffusion into a Drug-Conditioned Generator.
+It freezes most of the pre-trained weights to preserve visual knowledge, 
+but unfreezes specific layers to learn biological drug effects.
 
-Input: Control Image + Drug Fingerprint + Noise
-Output: Perturbed Image
+Architecture:
+1. VAE: Frozen (Encodes pixels -> latents)
+2. U-Net: Partially Unfrozen
+   - conv_in: Trained (Adapts to 8-channel input)
+   - attn2 (Cross-Attn): Trained (Learns "Drug -> Visual" mapping)
+   - conv_out: Trained (Refines biological texture)
+   - ResNets/Self-Attn: FROZEN (Keeps pre-trained knowledge)
+   
+Input: [Noisy Latents (4ch) + Control Latents (4ch)] + Drug Fingerprint
+Output: Denoised Latents (Target Cell)
 ================================================================================
 """
 
 import os
 import sys
-import math
 import argparse
 import numpy as np
 import pandas as pd
@@ -26,8 +30,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision.utils import make_grid, save_image
+from torchvision import transforms
+from torchvision.utils import save_image
 from pathlib import Path
+from PIL import Image
+from tqdm.auto import tqdm
 
 # --- Plotting Backend ---
 import matplotlib
@@ -36,23 +43,12 @@ import matplotlib.pyplot as plt
 
 # --- Dependencies ---
 try:
-    from diffusers import UNet2DModel
+    from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+    from transformers import CLIPTokenizer
     DIFFUSERS_AVAILABLE = True
 except ImportError:
-    print("CRITICAL: 'diffusers' library not found. Install with: pip install diffusers")
+    print("CRITICAL: Install dependencies: pip install diffusers transformers accelerate")
     sys.exit(1)
-
-try:
-    import imageio
-    IMAGEIO_AVAILABLE = True
-except ImportError:
-    IMAGEIO_AVAILABLE = False
-
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
 
 try:
     from rdkit import Chem
@@ -60,6 +56,12 @@ try:
     RDKIT_AVAILABLE = True
 except ImportError:
     RDKIT_AVAILABLE = False
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURATION
@@ -69,28 +71,22 @@ class Config:
     # Data
     data_dir = "./data/bbbc021_all"
     metadata_file = "metadata/bbbc021_df_all.csv"
-    image_size = 96
+    image_size = 512  # SD Native Resolution
     
-    # Architecture
-    base_model_id = "google/ddpm-cifar10-32" 
-    
-    # Embeddings
+    # Model
+    model_id = "runwayml/stable-diffusion-v1-5"
     fingerprint_dim = 1024
     
-    # Diffusion
-    timesteps = 1000
-    beta_start = 0.0001
-    beta_end = 0.02
-    
     # Training
-    epochs = 300
-    batch_size = 64
-    lr = 1e-4
+    epochs = 200
+    batch_size = 4  # Lower batch size due to 512x512 resolution
+    lr = 5e-5       # Lower LR for fine-tuning pre-trained weights
     save_freq = 5
     eval_freq = 5
     
-    output_dir = "partial_finetune_results"
+    output_dir = "sd_partial_finetune_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    mixed_precision = "fp16"
 
 # ============================================================================
 # LOGGING UTILS
@@ -133,22 +129,129 @@ class TrainingLogger:
             ax2.tick_params(axis='y', labelcolor=color2)
             ax2.set_yscale('log')
         
-        plt.title(f'Partial Fine-Tuning Dynamics (Epoch {epoch})')
+        plt.title(f'Stable Diffusion Partial Fine-Tuning (Epoch {epoch})')
         plt.tight_layout()
         plt.savefig(self.plot_path, dpi=150)
         plt.close()
 
 # ============================================================================
+# ARCHITECTURE: CONDITIONAL STABLE DIFFUSION
+# ============================================================================
+
+class DrugConditionedStableDiffusion(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        print(f"Loading Stable Diffusion U-Net from {config.model_id}...")
+        
+        # 1. Load Pre-trained U-Net
+        self.unet = UNet2DConditionModel.from_pretrained(
+            config.model_id, subfolder="unet"
+        )
+        
+        # 2. INPUT SURGERY (4 channels -> 8 channels)
+        # We need to accept (Latent Noise + Latent Control)
+        old_conv = self.unet.conv_in
+        new_conv = nn.Conv2d(
+            8, old_conv.out_channels, 
+            kernel_size=old_conv.kernel_size, 
+            padding=old_conv.padding
+        )
+        
+        # Initialize weights: Copy old weights to first 4 channels, zero rest
+        with torch.no_grad():
+            new_conv.weight[:, :4, :, :] = old_conv.weight
+            new_conv.weight[:, 4:, :, :] = 0.0  # Zero-init control
+            new_conv.bias = old_conv.bias
+            
+        self.unet.conv_in = new_conv
+        print("  ✓ Input layer modified for 8 channels.")
+
+        # 3. DRUG PROJECTION (Fingerprint -> CLIP Embedding Dim)
+        # SD v1.5 uses 768-dim embeddings
+        self.drug_proj = nn.Sequential(
+            nn.Linear(config.fingerprint_dim, 768),
+            nn.SiLU(),
+            nn.Linear(768, 768),
+        )
+        print("  ✓ Drug Projection layer added.")
+
+        # 4. PARTIAL FREEZING STRATEGY
+        self._apply_partial_freezing()
+
+    def _apply_partial_freezing(self):
+        print("\nConfiguring Partial Fine-Tuning...")
+        
+        # A. Freeze EVERYTHING first
+        for param in self.unet.parameters():
+            param.requires_grad = False
+            
+        trainable_params = []
+        
+        # B. Unfreeze Input Layer (Must adapt to 8 channels)
+        for param in self.unet.conv_in.parameters():
+            param.requires_grad = True
+            trainable_params.append(param)
+            
+        # C. Unfreeze Output Layer (Refine pixel texture)
+        for param in self.unet.conv_out.parameters():
+            param.requires_grad = True
+            trainable_params.append(param)
+            
+        # D. Unfreeze Cross-Attention Layers ('attn2')
+        # These are the layers that "listen" to the drug embedding
+        unfrozen_blocks = 0
+        for name, module in self.unet.named_modules():
+            if name.endswith("attn2"):
+                for param in module.parameters():
+                    param.requires_grad = True
+                    trainable_params.append(param)
+                unfrozen_blocks += 1
+        
+        # E. Unfreeze Drug Projection (Must train from scratch)
+        for param in self.drug_proj.parameters():
+            param.requires_grad = True
+            trainable_params.append(param)
+
+        # Statistics
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in trainable_params)
+        print(f"  Total Params: {total:,}")
+        print(f"  Trainable:    {trainable:,} ({(trainable/total)*100:.1f}%)")
+        print(f"  Unfrozen Attention Blocks: {unfrozen_blocks}")
+
+    def forward(self, noisy_latents, timesteps, control_latents, fingerprint):
+        # 1. Project Drug Fingerprint
+        # Shape: [B, 1024] -> [B, 1, 768] (Mimics 1 text token)
+        drug_emb = self.drug_proj(fingerprint).unsqueeze(1)
+        
+        # 2. Concat Inputs (Noise + Control)
+        # Shape: [B, 8, 64, 64]
+        unet_input = torch.cat([noisy_latents, control_latents], dim=1)
+        
+        # 3. Forward Pass
+        # We pass drug_emb as 'encoder_hidden_states'
+        noise_pred = self.unet(
+            unet_input, 
+            timesteps, 
+            encoder_hidden_states=drug_emb
+        ).sample
+        
+        return noise_pred
+
+# ============================================================================
 # DATASET & ENCODER
 # ============================================================================
 
-class MorganFingerprintEncoder:
+class MorganEncoder:
     def __init__(self, n_bits=1024):
         self.n_bits = n_bits
         self.cache = {}
+        
     def encode(self, smiles):
-        if isinstance(smiles, list): return np.array([self.encode(s) for s in smiles])
-        if smiles in self.cache: return self.cache[smiles]
+        if isinstance(smiles, list): 
+            return np.array([self.encode(s) for s in smiles])
+        if smiles in self.cache: 
+            return self.cache[smiles]
         if RDKIT_AVAILABLE and smiles and smiles not in ['DMSO', '']:
             try:
                 mol = Chem.MolFromSmiles(smiles)
@@ -157,17 +260,18 @@ class MorganFingerprintEncoder:
                 AllChem.DataStructs.ConvertToNumpyArray(fp, arr)
                 self.cache[smiles] = arr
                 return arr
-            except: pass
+            except: 
+                pass
         np.random.seed(hash(str(smiles)) % 2**32)
         arr = (np.random.rand(self.n_bits) > 0.5).astype(np.float32)
         self.cache[smiles] = arr
         return arr
 
-class BBBC021Dataset(Dataset):
-    def __init__(self, data_dir, metadata_file, image_size=96, split='train', encoder=None, paths_csv=None):
+class PairedBBBC021Dataset(Dataset):
+    def __init__(self, data_dir, metadata_file, size=512, split='train', paths_csv=None):
         self.data_dir = Path(data_dir).resolve()
-        self.image_size = image_size
-        self.encoder = encoder
+        self.size = size
+        self.encoder = MorganEncoder()
         self._first_load_logged = False
         
         # Robust CSV Loading
@@ -180,17 +284,33 @@ class BBBC021Dataset(Dataset):
             df = df[df['SPLIT'].str.lower() == split.lower()]
         
         self.metadata = df.to_dict('records')
-        self.batch_map = self._group_by_batch()
         
-        # Pre-encode chemicals
+        # Group by Batch to find controls
+        self.controls = {}  # Batch -> [List of Control Indices]
+        self.treated = []   # List of Treated Indices
+        
+        for idx, row in enumerate(self.metadata):
+            batch = row.get('BATCH', 'unk')
+            cpd = str(row.get('CPD_NAME', '')).upper()
+            
+            if cpd == 'DMSO':
+                if batch not in self.controls: 
+                    self.controls[batch] = []
+                self.controls[batch].append(idx)
+            else:
+                self.treated.append(idx)
+        
+        # Pre-encode fingerprints
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
             for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
                 self.fingerprints[cpd] = self.encoder.encode(smiles)
-        
-        # Load paths.csv for robust file lookup (same as train.py)
+                
+        print(f"Dataset ({split}): {len(self.treated)} Treated, {sum(len(v) for v in self.controls.values())} Controls")
+
+        # Load paths.csv for robust file lookup
         self.paths_lookup = {}
         self.paths_by_rel = {}
         self.paths_by_basename = {}
@@ -225,29 +345,12 @@ class BBBC021Dataset(Dataset):
         else:
             print("  Note: paths.csv not found, will use fallback path resolution")
 
-    def _group_by_batch(self):
-        groups = {}
-        for idx, row in enumerate(self.metadata):
-            b = row.get('BATCH', 'unknown')
-            if b not in groups: groups[b] = {'ctrl': [], 'trt': []}
-            cpd = str(row.get('CPD_NAME', '')).upper()
-            if cpd == 'DMSO': 
-                groups[b]['ctrl'].append(idx)
-            else: 
-                groups[b]['trt'].append(idx)
-        return groups
-
-    def get_perturbed_indices(self):
-        return [i for i, m in enumerate(self.metadata) if str(m.get('CPD_NAME', '')).upper() != 'DMSO']
-
-    def get_paired_sample(self, trt_idx):
-        batch = self.metadata[trt_idx].get('BATCH', 'unknown')
-        if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-            ctrls = self.batch_map[batch]['ctrl']
-            return (np.random.choice(ctrls), trt_idx)
-        return (trt_idx, trt_idx)
-
-    def __len__(self): return len(self.metadata)
+        self.transform = transforms.Compose([
+            transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])  # SD expects [-1, 1]
+        ])
 
     def _find_file_path(self, path):
         """Robust file path finding using paths.csv lookup (same logic as train.py)."""
@@ -300,7 +403,7 @@ class BBBC021Dataset(Dataset):
                     if candidate.exists():
                         return candidate
         
-        # Strategy 2: Search paths.csv by SAMPLE_KEY in relative_path
+        # Strategy 2: Search paths.csv by SAMPLE_KEY
         if self.paths_lookup:
             for rel_path_key, rel_path_info in self.paths_by_rel.items():
                 if path_str in rel_path_key or path_str.replace('.0', '') in rel_path_key:
@@ -377,17 +480,12 @@ class BBBC021Dataset(Dataset):
         
         return None
 
-    def __getitem__(self, idx):
+    def _load_img(self, idx):
         meta = self.metadata[idx]
         path = meta.get('image_path') or meta.get('SAMPLE_KEY')
         
         if not path:
-            raise ValueError(
-                f"CRITICAL: No image path found in metadata!\n"
-                f"  Index: {idx}\n"
-                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
-                f"  Metadata keys: {list(meta.keys())}"
-            )
+            raise ValueError(f"CRITICAL: No image path found in metadata! Index: {idx}")
         
         full_path = self._find_file_path(path)
         
@@ -395,35 +493,36 @@ class BBBC021Dataset(Dataset):
             raise FileNotFoundError(
                 f"CRITICAL: Image file not found!\n"
                 f"  Index: {idx}\n"
-                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
                 f"  Path from metadata: {path}\n"
                 f"  Data directory: {self.data_dir}\n"
                 f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
             )
         
         try:
-            file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
             img = np.load(str(full_path))
             original_shape = img.shape
-            original_dtype = img.dtype
             
-            if img.ndim == 3 and img.shape[-1] == 3: 
-                img = img.transpose(2, 0, 1)
-            img = torch.from_numpy(img).float()
+            # Handle shapes
+            if img.ndim == 3 and img.shape[0] == 3: 
+                img = img.transpose(1, 2, 0)  # CHW -> HWC for PIL
             
-            if img.max() > 1.0: 
-                img = (img / 127.5) - 1.0
+            # Normalize to 0-255 uint8 for PIL
+            if img.max() > 1.0:
+                img = img.astype(np.uint8)
             else:
-                img = (img * 2.0) - 1.0
-            img = torch.clamp(img, -1, 1)
+                if img.min() < 0:
+                    img = (img + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                img = (img * 255).astype(np.uint8)
+            
+            # If grayscale, make RGB
+            if img.ndim == 2: 
+                img = np.stack([img]*3, axis=-1)
             
             if not self._first_load_logged or idx < 3:
                 print(f"\n{'='*60}", flush=True)
                 print(f"✓ Successfully loaded image #{idx}", flush=True)
-                print(f"  Compound: {meta.get('CPD_NAME', 'unknown')}", flush=True)
                 print(f"  File path: {full_path}", flush=True)
-                print(f"  File size: {file_size_bytes:,} bytes", flush=True)
-                print(f"  Original shape: {original_shape} (dtype: {original_dtype})", flush=True)
+                print(f"  Original shape: {original_shape}", flush=True)
                 print(f"  Processed shape: {img.shape}", flush=True)
                 print(f"{'='*60}\n", flush=True)
                 if idx >= 3:
@@ -437,218 +536,63 @@ class BBBC021Dataset(Dataset):
                 f"  Original error: {type(e).__name__}: {str(e)}"
             ) from e
 
-        cpd = meta.get('CPD_NAME', 'DMSO')
-        fp = self.fingerprints.get(cpd, np.zeros(1024))
-        return {
-            'image': img, 
-            'fingerprint': torch.from_numpy(fp).float(), 
-            'compound': cpd
-        }
+        # Convert to PIL for transforms
+        image_pil = Image.fromarray(img)
+        if image_pil.mode != "RGB":
+            image_pil = image_pil.convert("RGB")
+            
+        return self.transform(image_pil)
 
-class PairedDataLoader:
-    def __init__(self, dataset, batch_size, shuffle=True):
-        self.ds = dataset
-        self.bs = batch_size
-        self.indices = self.ds.get_perturbed_indices()
-        self.shuffle = shuffle
-        if len(self.indices) == 0:
-            print("Warning: No perturbed samples found. DataLoader will be empty.")
-    
-    def __iter__(self):
-        if self.shuffle: np.random.shuffle(self.indices)
-        for i in range(0, len(self.indices), self.bs):
-            batch_idx = self.indices[i:i+self.bs]
-            ctrls, trts, fps, names = [], [], [], []
-            for tidx in batch_idx:
-                cidx, tidx = self.ds.get_paired_sample(tidx)
-                ctrls.append(self.ds[cidx]['image'])
-                trts.append(self.ds[tidx]['image'])
-                fps.append(self.ds[tidx]['fingerprint'])
-                names.append(self.ds[tidx]['compound'])
-            
-            if not ctrls: continue
-            
-            yield {
-                'control': torch.stack(ctrls), 
-                'perturbed': torch.stack(trts), 
-                'fingerprint': torch.stack(fps), 
-                'compound': names
-            }
-            
     def __len__(self): 
-        if self.bs == 0: return 0
-        return (len(self.indices) + self.bs - 1) // self.bs
+        return len(self.treated)
 
-# ============================================================================
-# ARCHITECTURE (PARTIAL FINE-TUNING)
-# ============================================================================
-
-class ConditionalUNet(nn.Module):
-    def __init__(self, image_size=96, fingerprint_dim=1024):
-        super().__init__()
-        print(f"Loading base architecture from {Config.base_model_id}...")
+    def __getitem__(self, idx):
+        # 1. Get Treated Sample
+        trt_idx = self.treated[idx]
+        trt_meta = self.metadata[trt_idx]
+        batch = trt_meta.get('BATCH', 'unk')
         
-        # 1. Load Pre-trained U-Net
-        self.unet = UNet2DModel.from_pretrained(
-            Config.base_model_id,
-            sample_size=image_size,
-            class_embed_type="identity"
-        )
-        
-        # 2. Input Layer Surgery (3 -> 6 channels)
-        old_conv = self.unet.conv_in
-        new_conv = nn.Conv2d(
-            in_channels=6, # 3 Noise + 3 Control
-            out_channels=old_conv.out_channels,
-            kernel_size=old_conv.kernel_size,
-            stride=old_conv.stride,
-            padding=old_conv.padding
-        )
-        # Initialize: Copy old weights to first 3 channels, zero others
-        with torch.no_grad():
-            new_conv.weight[:, :3, :, :] = old_conv.weight
-            new_conv.weight[:, 3:, :, :] = 0.0 
-            new_conv.bias = old_conv.bias
-        self.unet.conv_in = new_conv
-        
-        # 3. Drug Projection (Fingerprint -> Time Embed Dim)
-        target_dim = self.unet.time_embedding.linear_1.out_features
-        self.fingerprint_proj = nn.Sequential(
-            nn.Linear(fingerprint_dim, 512),
-            nn.SiLU(),
-            nn.Linear(512, target_dim)
-        )
-
-        # 4. PARTIAL FREEZING (The Magic Step)
-        print("\nConfiguring Partial Fine-Tuning...")
-        
-        # A. Freeze EVERYTHING first
-        for param in self.unet.parameters():
-            param.requires_grad = False
+        # 2. Get Random Control from SAME Batch
+        if batch in self.controls and len(self.controls[batch]) > 0:
+            ctrl_idx = np.random.choice(self.controls[batch])
+        else:
+            ctrl_idx = trt_idx  # Fallback
             
-        # B. Unfreeze Input Layer (Must train to adapt to 6 channels)
-        for param in self.unet.conv_in.parameters():
-            param.requires_grad = True
-            
-        # C. Unfreeze Output Layer (Refine pixel texture)
-        for param in self.unet.conv_out.parameters():
-            param.requires_grad = True
-            
-        # D. Unfreeze Attention Layers (The "Drug Listeners")
-        unfrozen_attn_count = 0
-        for name, module in self.unet.named_modules():
-            if "attn" in name.lower() or "attention" in name.lower():
-                for param in module.parameters():
-                    param.requires_grad = True
-                unfrozen_attn_count += 1
+        # 3. Load Images
+        trt_img = self._load_img(trt_idx)
+        ctrl_img = self._load_img(ctrl_idx)
         
-        # E. Drug Projection (Must be trainable)
-        for param in self.fingerprint_proj.parameters():
-            param.requires_grad = True
-
-        # Stats
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"  Total Params: {total_params:,}")
-        print(f"  Trainable:    {trainable_params:,} ({(trainable_params/total_params)*100:.1f}%)")
-        print(f"  Unfrozen Attention Blocks: {unfrozen_attn_count}")
-
-    def forward(self, x, t, control, fingerprint):
-        x_in = torch.cat([x, control], dim=1)
-        emb = self.fingerprint_proj(fingerprint)
-        return self.unet(x_in, t, class_labels=emb).sample
-
-class DiffusionModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.cfg = config
-        self.model = ConditionalUNet(
-            image_size=config.image_size, 
-            fingerprint_dim=config.fingerprint_dim
-        ).to(config.device)
+        # 4. Get Drug Fingerprint
+        cpd = trt_meta.get('CPD_NAME', 'DMSO')
+        fp = self.fingerprints.get(cpd, np.zeros(1024))
         
-        self.timesteps = config.timesteps
-        beta = torch.linspace(config.beta_start, config.beta_end, config.timesteps).to(config.device)
-        alpha = 1. - beta
-        self.alpha_bar = torch.cumprod(alpha, dim=0)
-        self.sqrt_alpha_bar = torch.sqrt(self.alpha_bar)
-        self.sqrt_one_minus_alpha_bar = torch.sqrt(1. - self.alpha_bar)
-
-    def forward(self, x0, control, fingerprint):
-        b = x0.shape[0]
-        t = torch.randint(0, self.timesteps, (b,), device=self.cfg.device)
-        noise = torch.randn_like(x0)
-        xt = self.sqrt_alpha_bar[t].view(-1,1,1,1) * x0 + \
-             self.sqrt_one_minus_alpha_bar[t].view(-1,1,1,1) * noise
-        noise_pred = self.model(xt, t, control, fingerprint)
-        return F.mse_loss(noise_pred, noise)
-
-    @torch.no_grad()
-    def sample(self, control, fingerprint):
-        self.model.eval()
-        b = control.shape[0]
-        xt = torch.randn_like(control)
-        for i in reversed(range(self.timesteps)):
-            t = torch.full((b,), i, device=self.cfg.device, dtype=torch.long)
-            noise_pred = self.model(xt, t, control, fingerprint)
-            
-            alpha = 1 - torch.linspace(self.cfg.beta_start, self.cfg.beta_end, self.timesteps).to(self.cfg.device)[i]
-            alpha_bar = self.alpha_bar[i]
-            beta = 1 - alpha
-            z = torch.randn_like(xt) if i > 0 else 0
-            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
-            xt = torch.clamp(xt, -1, 1)
-        return xt
+        return {
+            'control': ctrl_img,
+            'target': trt_img,
+            'fingerprint': torch.from_numpy(fp).float()
+        }
 
 # ============================================================================
 # UTILITIES
 # ============================================================================
 
-def generate_video(model, control, fingerprint, save_path):
-    """Generate a video showing the reverse diffusion process"""
-    if not IMAGEIO_AVAILABLE: return
-    model.model.eval()
-    xt = torch.randn_like(control)
-    frames = []
-    
-    save_steps = np.linspace(0, model.timesteps-1, 40, dtype=int)
-    
-    with torch.no_grad():
-        for i in reversed(range(model.timesteps)):
-            t = torch.full((1,), i, device=model.cfg.device, dtype=torch.long)
-            noise_pred = model.model(xt, t, control, fingerprint)
-            
-            alpha = 1 - torch.linspace(model.cfg.beta_start, model.cfg.beta_end, model.timesteps).to(model.cfg.device)[i]
-            alpha_bar = model.alpha_bar[i]
-            beta = 1 - alpha
-            z = torch.randn_like(xt) if i > 0 else 0
-            xt = (1 / torch.sqrt(alpha)) * (xt - ((1 - alpha) / torch.sqrt(1 - alpha_bar)) * noise_pred) + torch.sqrt(beta) * z
-            xt = torch.clamp(xt, -1, 1)
-            
-            if i in save_steps or i==0:
-                img_np = ((xt[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                frames.append(img_np)
-    
-    ctrl_np = ((control[0].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-    final_frames = [np.concatenate([f, ctrl_np], axis=1) for f in frames]
-    imageio.mimsave(save_path, final_frames, fps=10)
-
 def load_checkpoint(model, optimizer, path, scheduler=None):
-    if not os.path.exists(path): return 0
+    if not os.path.exists(path): 
+        return 0
     print(f"Loading checkpoint: {path}")
-    ckpt = torch.load(path, map_location=model.cfg.device)
+    ckpt = torch.load(path, map_location=model.cfg.device if hasattr(model, 'cfg') else 'cpu')
     model.load_state_dict(ckpt['model'])
     optimizer.load_state_dict(ckpt['optimizer'])
     if scheduler is not None and 'scheduler' in ckpt:
         scheduler.load_state_dict(ckpt['scheduler'])
-    return ckpt['epoch']
+    return ckpt.get('epoch', 0)
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Partial Fine-Tuning of Conditional U-Net")
+    parser = argparse.ArgumentParser(description="Partial Fine-Tuning of Stable Diffusion for Drug-Conditioned Generation")
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file")
@@ -658,35 +602,56 @@ def main():
     if args.output_dir:
         config.output_dir = args.output_dir
     
-    os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
     os.makedirs(f"{config.output_dir}/checkpoints", exist_ok=True)
+    os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
+    
     logger = TrainingLogger(config.output_dir)
     
-    if WANDB_AVAILABLE: wandb.init(project="bbbc021-partial-finetune", config=config.__dict__)
+    if WANDB_AVAILABLE: 
+        wandb.init(project="bbbc021-sd-partial", config=config.__dict__)
 
-    print("Loading Dataset...")
-    encoder = MorganFingerprintEncoder()
-    train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder, paths_csv=args.paths_csv)
-    val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder, paths_csv=args.paths_csv)
-    if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
+    # 1. Load VAE (Frozen)
+    print("Loading VAE...")
+    vae = AutoencoderKL.from_pretrained(config.model_id, subfolder="vae").to(config.device)
+    vae.requires_grad_(False)
     
-    train_loader = PairedDataLoader(train_ds, config.batch_size, shuffle=True)
-    val_loader = PairedDataLoader(val_ds, batch_size=8, shuffle=True)
-
-    print("Initializing Model...")
-    model = DiffusionModel(config)
-    # Important: Optimize ONLY trainable parameters
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.model.parameters()), lr=config.lr, weight_decay=0.01)
+    # 2. Load Model (Partial Tuning)
+    model = DrugConditionedStableDiffusion(config).to(config.device)
     
-    # Learning Rate Scheduler
+    # Store config in model for checkpoint loading
+    model.cfg = config
+    
+    # 3. Optimizer (Only Trainable Params)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()), 
+        lr=config.lr,
+        weight_decay=0.01
+    )
+    
+    # 4. Learning Rate Scheduler
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, 
         T_max=config.epochs,
         eta_min=1e-6
     )
-
+    
+    # 5. Scheduler (Noise)
+    noise_scheduler = DDPMScheduler.from_pretrained(config.model_id, subfolder="scheduler")
+    
+    # 6. Data
+    print("\nLoading Dataset...")
+    dataset = PairedBBBC021Dataset(
+        config.data_dir, 
+        config.metadata_file, 
+        size=config.image_size,
+        split='train',
+        paths_csv=args.paths_csv
+    )
+    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=4)
+    
     # Load checkpoint
     checkpoint_path = f"{config.output_dir}/checkpoints/latest.pt"
+    start_epoch = 0
     if args.resume:
         start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
@@ -701,58 +666,133 @@ def main():
             print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
             print(f"Starting training from epoch 1...")
-
-    print("Starting Partial Fine-Tuning...")
+    
+    print("Starting Training...")
+    
+    weight_dtype = torch.float16 if config.mixed_precision == "fp16" else torch.float32
+    
     for epoch in range(start_epoch, config.epochs):
-        model.model.train()
-        losses = []
-        for batch in train_loader:
-            optimizer.zero_grad()
-            ctrl = batch['control'].to(config.device)
-            target = batch['perturbed'].to(config.device)
+        model.train()
+        epoch_losses = []
+        progress = tqdm(loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in progress:
+            ctrl_img = batch['control'].to(config.device, dtype=weight_dtype)
+            target_img = batch['target'].to(config.device, dtype=weight_dtype)
             fp = batch['fingerprint'].to(config.device)
             
-            loss = model(target, ctrl, fp)
+            optimizer.zero_grad()
+            
+            # A. Encode Images to Latents (VAE)
+            with torch.no_grad():
+                # Control: Use Mode (Deterministic)
+                ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
+                # Target: Use Sample (Stochastic)
+                target_latents = vae.encode(target_img).latent_dist.sample() * vae.config.scaling_factor
+            
+            # B. Add Noise
+            noise = torch.randn_like(target_latents)
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, 
+                (target_latents.shape[0],), device=config.device
+            ).long()
+            noisy_target = noise_scheduler.add_noise(target_latents, noise, timesteps)
+            
+            # C. Forward Pass
+            if config.mixed_precision == "fp16":
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    noise_pred = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
+                    loss = F.mse_loss(noise_pred.float(), noise.float())
+            else:
+                noise_pred = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
+                loss = F.mse_loss(noise_pred, noise)
+            
+            # Check for NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n⚠️  Warning: NaN/Inf loss detected, skipping this batch", flush=True)
+                optimizer.zero_grad()
+                continue
+            
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
-            losses.append(loss.item())
+            
+            epoch_losses.append(loss.item())
+            progress.set_postfix({"loss": loss.item()})
+            
+            if WANDB_AVAILABLE: 
+                wandb.log({"loss": loss.item(), "step": epoch * len(loader) + len(epoch_losses)})
         
         # Step scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         
-        avg_loss = np.mean(losses)
-        print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f} | LR: {current_lr:.2e}", flush=True)
+        # Filter out NaN/Inf losses
+        valid_losses = [l for l in epoch_losses if not (np.isnan(l) or np.isinf(l))]
+        if valid_losses:
+            avg_loss = np.mean(valid_losses)
+        else:
+            avg_loss = float('nan')
+            print(f"\n⚠️  WARNING: All losses in epoch {epoch+1} were NaN/Inf!", flush=True)
+        
+        print(f"\nEpoch {epoch+1}/{config.epochs} | Avg Loss: {avg_loss:.5f} | LR: {current_lr:.2e}", flush=True)
+        
+        # Stop training if loss is NaN
+        if np.isnan(avg_loss) or np.isinf(avg_loss):
+            print(f"\n❌ Training stopped due to NaN/Inf loss.", flush=True)
+            break
+        
         logger.update(epoch+1, avg_loss, current_lr)
         if WANDB_AVAILABLE: 
             wandb.log({
-                "loss": avg_loss,
                 "epoch": epoch+1,
+                "epoch_loss": avg_loss,
                 "learning_rate": current_lr
             })
-
-        if (epoch + 1) % config.eval_freq == 0:
-            # Visualization
-            model.model.eval()
-            val_iter = iter(val_loader)
-            batch = next(val_iter)
-            ctrl = batch['control'].to(config.device)
-            real_t = batch['perturbed'].to(config.device)
-            fp = batch['fingerprint'].to(config.device)
-            
-            fakes = model.sample(ctrl[:8], fp[:8])
-            grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
-            save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
-            generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
-
+        
+        # Checkpointing
         if (epoch + 1) % config.save_freq == 0:
             torch.save({
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
-                'epoch': epoch+1
+                'epoch': epoch+1,
+                'config': config.__dict__
             }, f"{config.output_dir}/checkpoints/latest.pt")
             print(f"Checkpoint Saved. (LR: {current_lr:.2e})", flush=True)
+            
+            # Simple validation visualization
+            if (epoch + 1) % config.eval_freq == 0:
+                model.eval()
+                with torch.no_grad():
+                    # Get a sample batch
+                    sample_batch = next(iter(loader))
+                    ctrl_img = sample_batch['control'][:4].to(config.device, dtype=weight_dtype)
+                    target_img = sample_batch['target'][:4].to(config.device, dtype=weight_dtype)
+                    fp = sample_batch['fingerprint'][:4].to(config.device)
+                    
+                    # Encode to latents
+                    ctrl_latents = vae.encode(ctrl_img).latent_dist.mode() * vae.config.scaling_factor
+                    target_latents = vae.encode(target_img).latent_dist.mode() * vae.config.scaling_factor
+                    
+                    # Simple forward pass visualization (not full sampling)
+                    timesteps = torch.zeros((4,), device=config.device, dtype=torch.long)
+                    noise_pred = model(target_latents.float(), timesteps, ctrl_latents.float(), fp)
+                    
+                    # Decode and save
+                    with torch.no_grad():
+                        pred_img = vae.decode((noise_pred / vae.config.scaling_factor).float()).sample
+                        pred_img = (pred_img / 2 + 0.5).clamp(0, 1)
+                        
+                        grid = torch.cat([
+                            (ctrl_img / 2 + 0.5).clamp(0, 1),
+                            pred_img,
+                            (target_img / 2 + 0.5).clamp(0, 1)
+                        ], dim=0)
+                        save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=4, normalize=False)
 
 if __name__ == "__main__":
     main()
