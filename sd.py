@@ -79,8 +79,8 @@ class Config:
     
     # Training
     epochs = 200
-    batch_size = 128  # Lower batch size due to 512x512 resolution
-    lr = 2e-4       # Lower LR for fine-tuning pre-trained weights
+    batch_size = 64  # Lower batch size due to 512x512 resolution
+    lr = 1e-4       # Lower LR for fine-tuning pre-trained weights
     save_freq = 5
     eval_freq = 5
     
