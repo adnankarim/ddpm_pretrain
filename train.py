@@ -670,12 +670,7 @@ class ModifiedDiffusersUNet(nn.Module):
             class_embed_type="identity"  # For fingerprint conditioning
         )
         
-        # Copy weights where shapes match (except conv_in which we'll replace)
-        missing, unexpected = self.unet.load_state_dict(unet_pre.state_dict(), strict=False)
-        print(f"  Loaded weights with strict=False")
-        print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
-        
-        # --- conv_in surgery: 3 -> 6 ---
+        # --- conv_in surgery: 3 -> 6 (do this BEFORE loading state dict) ---
         old_conv = unet_pre.conv_in
         new_conv = nn.Conv2d(
             in_channels=6,
@@ -687,10 +682,21 @@ class ModifiedDiffusersUNet(nn.Module):
         with torch.no_grad():
             # Copy first 3 channels from pretrained, zero-init last 3 (control)
             new_conv.weight[:, :3, :, :] = old_conv.weight
-            new_conv.weight[:, 3:, :, :] = 0.0
+            new_conv.weight[:, 3:, :, :] = 0.0 
             new_conv.bias.copy_(old_conv.bias)
         self.unet.conv_in = new_conv
         print("  ✓ Network Surgery: Input expanded 3 -> 6 channels (pretrained weights preserved)")
+        
+        # Copy weights where shapes match (excluding conv_in which we already handled)
+        # Filter out conv_in from the state dict to avoid size mismatch
+        pretrained_state = unet_pre.state_dict()
+        # Create a new dict without conv_in keys to avoid size mismatch
+        filtered_state = {k: v for k, v in pretrained_state.items() 
+                         if not k.startswith('conv_in.')}
+        
+        missing, unexpected = self.unet.load_state_dict(filtered_state, strict=False)
+        print(f"  Loaded weights with strict=False (conv_in excluded)")
+        print(f"  Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
         # Fingerprint projection - get actual class embedding dimension from model
         target_dim = self.unet.time_embedding.linear_1.out_features
