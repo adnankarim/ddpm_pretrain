@@ -1203,8 +1203,54 @@ def main():
     if args.resume or args.checkpoint:
         start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
         if start_epoch > 0:
-            print(f"Resuming training from epoch {start_epoch+1}...")
-            print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"\n{'='*60}", flush=True)
+            print(f"RESUMING TRAINING FROM EPOCH {start_epoch}", flush=True)
+            print(f"{'='*60}", flush=True)
+            print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
+            print(f"  Checkpoint: {checkpoint_path}", flush=True)
+            
+            # Run evaluation first when resuming
+            print(f"\n🔍 Running evaluation on loaded checkpoint before continuing training...", flush=True)
+            print(f"{'='*60}", flush=True)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000)
+            
+            # Print metrics prominently
+            print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
+            print(f"  {'-'*58}", flush=True)
+            if metrics['kl_divergence'] is not None:
+                print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
+            if metrics['mse'] is not None:
+                print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+            if metrics['psnr'] is not None:
+                print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+            if metrics['ssim'] is not None:
+                print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+            if metrics['fid'] is not None:
+                print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+            if metrics['cfid'] is not None:
+                print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+            print(f"  {'-'*58}", flush=True)
+            
+            # Generate visualization for resume checkpoint
+            val_iter = iter(val_loader)
+            batch = next(val_iter)
+            ctrl = batch['control'].to(config.device)
+            real_t = batch['perturbed'].to(config.device)
+            fp = batch['fingerprint'].to(config.device)
+            
+            fakes = model.sample(ctrl, fp, num_inference_steps=200)
+            grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
+            resume_grid_path = f"{config.output_dir}/plots/resume_epoch_{start_epoch}.png"
+            save_image(grid, resume_grid_path, nrow=8, normalize=True, value_range=(-1,1))
+            print(f"  ✓ Resume checkpoint grid saved to: {resume_grid_path}", flush=True)
+            
+            generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_resume_epoch_{start_epoch}.mp4")
+            print(f"  ✓ Resume checkpoint video saved", flush=True)
+            
+            # Log metrics for resume checkpoint
+            logger.update(start_epoch, 0.0, metrics, scheduler.get_last_lr()[0])
+            print(f"{'='*60}\n", flush=True)
+            print(f"✅ Evaluation complete. Continuing training from epoch {start_epoch+1}...\n", flush=True)
         else:
             print(f"Starting training from epoch 1 (checkpoint not found or empty)...")
     else:
