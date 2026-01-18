@@ -305,10 +305,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-            for cpd in df['CPD_NAME'].unique():
+        for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-                self.fingerprints[cpd] = self.encoder.encode(smiles)
+            self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -367,7 +367,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-            ctrls = self.batch_map[batch]['ctrl']
+        ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -1434,17 +1434,15 @@ Examples:
             else:
                 print("  Skipping metric calculations (only generating samples/video)...", flush=True)
             
-            print("="*60 + "\n", flush=True)
-            
-            # Visualization (always generate samples and video)
-            print("  Generating sample grid and video...", flush=True)
+            # Visualization (always generate samples and video - quick generation, no full evaluation)
+            print("  Generating sample grid and video (quick generation, no evaluation)...", flush=True)
             val_iter = iter(val_loader)
             batch = next(val_iter)
             ctrl = batch['control'].to(config.device)
             real_t = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
             
-            # Use fewer inference steps for faster evaluation (can increase later)
+            # Use fewer inference steps for faster generation (200 steps is enough for visualization)
             fakes = model.sample(ctrl, fp, num_inference_steps=200)
             
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
@@ -1452,6 +1450,7 @@ Examples:
             print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
             print(f"  ✓ Video saved to: {config.output_dir}/plots/video_{epoch+1}.mp4", flush=True)
+            print("="*60 + "\n", flush=True)
 
         # Step scheduler
         scheduler.step()
