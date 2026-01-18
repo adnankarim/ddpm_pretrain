@@ -599,6 +599,15 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
     if not accelerator.is_main_process:
         return
     
+    # Check if eval dataset is empty
+    if len(eval_dataset) == 0:
+        print(f"\n{'='*60}")
+        print(f"EVALUATION (Step {step}) - SKIPPED")
+        print(f"{'='*60}")
+        print(f"  Warning: Evaluation dataset ({args.eval_split}) is empty. Skipping evaluation.")
+        print(f"{'='*60}\n")
+        return
+    
     print(f"\n{'='*60}")
     print(f"EVALUATION (Step {step})")
     print(f"{'='*60}")
@@ -608,18 +617,24 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
     os.makedirs(plots_dir, exist_ok=True)
     
     # Get a sample batch
-    eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=2)
-    sample_batch = next(iter(eval_loader))
+    batch_size = min(4, len(eval_dataset))
+    eval_loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    try:
+        sample_batch = next(iter(eval_loader))
+    except StopIteration:
+        print(f"  Warning: Could not get sample batch from evaluation dataset. Skipping evaluation.")
+        return
     
-    ctrl_imgs = sample_batch["control"][:4].to(device, dtype=weight_dtype)
-    target_imgs = sample_batch["target"][:4].to(device, dtype=weight_dtype)
-    fps = sample_batch["fingerprint"][:4].to(device)
-    prompts = sample_batch["prompt"][:4] if isinstance(sample_batch["prompt"], list) else [sample_batch["prompt"]] * 4
+    num_samples = min(4, len(sample_batch["control"]))
+    ctrl_imgs = sample_batch["control"][:num_samples].to(device, dtype=weight_dtype)
+    target_imgs = sample_batch["target"][:num_samples].to(device, dtype=weight_dtype)
+    fps = sample_batch["fingerprint"][:num_samples].to(device)
+    prompts = sample_batch["prompt"][:num_samples] if isinstance(sample_batch["prompt"], list) else [sample_batch["prompt"]] * num_samples
     
     # Generate samples
     print("  Generating samples...")
     generated_imgs = []
-    for i in range(4):
+    for i in range(num_samples):
         gen = generate_samples_flux(pipe, controlnet, drug_proj, ctrl_imgs[i], fps[i], prompts[i], 
                                    device, weight_dtype, num_inference_steps=50)
         generated_imgs.append(gen)
@@ -628,13 +643,13 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
     
     # Create grid: control | generated | target
     grid = torch.cat([
-        (ctrl_imgs[:4] / 2 + 0.5).clamp(0, 1),
+        (ctrl_imgs / 2 + 0.5).clamp(0, 1),
         generated_stack,
-        (target_imgs[:4] / 2 + 0.5).clamp(0, 1)
+        (target_imgs / 2 + 0.5).clamp(0, 1)
     ], dim=0)
     
     grid_path = os.path.join(plots_dir, f"step_{step}.png")
-    save_image(grid, grid_path, nrow=4, normalize=False)
+    save_image(grid, grid_path, nrow=num_samples, normalize=False)
     print(f"  ✓ Sample grid saved to: {grid_path}")
     
     # Generate video
@@ -865,20 +880,34 @@ def main():
             paths_csv=args.paths_csv,
         )
         
-        # Run evaluation at start of training (step 0 sanity check)
-        print("\n" + "="*60)
-        print("🔎 Running Step 0 Sanity Check (Untrained Model)...")
-        print("="*60)
-        pipe.controlnet = accelerator.unwrap_model(controlnet)
-        pipe.transformer = accelerator.unwrap_model(transformer)
+        # If eval split is empty, fallback to training split
+        if len(eval_dataset) == 0:
+            print(f"  Warning: Evaluation split '{args.eval_split}' is empty. Using 'train' split for evaluation.")
+            eval_dataset = PairedBBBC021Dataset(
+                data_dir=args.data_dir,
+                metadata_file=args.metadata_file,
+                size=args.resolution,
+                split="train",
+                paths_csv=args.paths_csv,
+            )
         
-        run_evaluation(
-            pipe, accelerator.unwrap_model(controlnet), accelerator.unwrap_model(transformer),
-            accelerator.unwrap_model(drug_proj), eval_dataset, args, accelerator.device, 
-            weight_dtype, 0, args.output_dir, accelerator
-        )
-        print("✅ Step 0 Check Complete. Check ./{}/plots/".format(args.output_dir))
-        print("="*60 + "\n")
+        # Run evaluation at start of training (step 0 sanity check)
+        if len(eval_dataset) > 0:
+            print("\n" + "="*60)
+            print("🔎 Running Step 0 Sanity Check (Untrained Model)...")
+            print("="*60)
+            pipe.controlnet = accelerator.unwrap_model(controlnet)
+            pipe.transformer = accelerator.unwrap_model(transformer)
+            
+            run_evaluation(
+                pipe, accelerator.unwrap_model(controlnet), accelerator.unwrap_model(transformer),
+                accelerator.unwrap_model(drug_proj), eval_dataset, args, accelerator.device, 
+                weight_dtype, 0, args.output_dir, accelerator
+            )
+            print("✅ Step 0 Check Complete. Check ./{}/plots/".format(args.output_dir))
+            print("="*60 + "\n")
+        else:
+            print("  Warning: No evaluation data available. Skipping Step 0 check.")
 
     global_step = 0
 
