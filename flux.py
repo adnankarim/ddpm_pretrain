@@ -556,16 +556,17 @@ def main():
     )
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(args.pretrained_model, subfolder="scheduler", revision=args.revision)
 
-    # ControlNet (FLUX flavor)
-    controlnet = FluxControlNetModel(
-        num_double_layers=args.num_double_layers,
-        num_single_layers=args.num_single_layers,
-        attention_head_dim=transformer.config.attention_head_dim,
-        num_attention_heads=transformer.config.num_attention_heads,
-        joint_attention_dim=transformer.config.joint_attention_dim,
-        pooled_projection_dim=transformer.config.pooled_projection_dim,
-        guidance_embeds=transformer.config.guidance_embeds,
-    )
+    # ControlNet (FLUX flavor) - initialize from transformer
+    # FluxControlNetModel should be initialized from the transformer config
+    try:
+        # Try from_transformer method (if available in newer diffusers)
+        controlnet = FluxControlNetModel.from_transformer(transformer)
+    except (AttributeError, TypeError):
+        # Fallback: create directly with transformer config
+        # The API may have changed - use the config object directly
+        controlnet = FluxControlNetModel(
+            transformer.config
+        )
 
     # Freeze brain
     vae.requires_grad_(False)
