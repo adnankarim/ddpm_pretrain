@@ -850,7 +850,7 @@ def calculate_fid(real_images, fake_images, device):
         print(f"  Warning: FID calculation failed: {e}", flush=True)
         return None
 
-def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid=False):
+def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid=False, num_inference_steps=200, skip_other_metrics=False):
     """
     Calculate evaluation metrics on validation set.
     
@@ -860,6 +860,8 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
         device: torch device
         num_samples: Number of samples to use for evaluation
         calculate_fid: If True, calculate FID and cFID (slower). If False, skip FID calculation.
+        num_inference_steps: Number of inference steps for generation (default: 200)
+        skip_other_metrics: If True, skip KL, MSE, PSNR, SSIM and only calculate FID (faster)
     
     Returns:
         dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim', 'fid', 'cfid'
@@ -928,23 +930,25 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             real_t = sample['perturbed'].to(device)
             fp = sample['fingerprint'].to(device)
             
-            # Generate samples (use fewer steps for faster evaluation)
-            generated = model.sample(ctrl, fp, num_inference_steps=200)
+            # Generate samples with specified inference steps
+            generated = model.sample(ctrl, fp, num_inference_steps=num_inference_steps)
             
-            # Calculate KL divergence (using forward pass on a sample)
-            # Sample a random timestep and compute KL
-            b = ctrl.shape[0]
-            t = torch.randint(0, model.timesteps, (b,), device=device).long()
-            noise = torch.randn_like(real_t)
-            # Use scheduler's add_noise for consistency
-            xt = model.noise_scheduler.add_noise(real_t, noise, t)
-            noise_pred = model.model(xt, t, ctrl, fp)
-            kl = calculate_kl_divergence(noise_pred, noise)
-            metrics['kl_divergence'].append(kl)
-            
-            # Calculate MSE between generated and real
-            mse = F.mse_loss(generated, real_t).item()
-            metrics['mse'].append(mse)
+            # Calculate other metrics only if not skipping
+            if not skip_other_metrics:
+                # Calculate KL divergence (using forward pass on a sample)
+                # Sample a random timestep and compute KL
+                b = ctrl.shape[0]
+                t = torch.randint(0, model.timesteps, (b,), device=device).long()
+                noise = torch.randn_like(real_t)
+                # Use scheduler's add_noise for consistency
+                xt = model.noise_scheduler.add_noise(real_t, noise, t)
+                noise_pred = model.model(xt, t, ctrl, fp)
+                kl = calculate_kl_divergence(noise_pred, noise)
+                metrics['kl_divergence'].append(kl)
+                
+                # Calculate MSE between generated and real
+                mse = F.mse_loss(generated, real_t).item()
+                metrics['mse'].append(mse)
             
             # Collect images for FID only if enabled (saves memory and time)
             if calculate_fid:
@@ -966,8 +970,8 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
                     condition_groups[cond_key]['real'].append(real_t[i:i+1])
                     condition_groups[cond_key]['gen'].append(generated[i:i+1])
             
-            # Calculate PSNR and SSIM if available
-            if SKIMAGE_AVAILABLE:
+            # Calculate PSNR and SSIM if available (only if not skipping)
+            if not skip_other_metrics and SKIMAGE_AVAILABLE:
                 for i in range(generated.shape[0]):
                     # Convert to numpy [0, 255] range
                     gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
@@ -1089,6 +1093,9 @@ Examples:
 
   # Resume from specific checkpoint
   python train.py --checkpoint ./results/checkpoints/checkpoint_epoch_10.pt
+
+  # Evaluate only FID on latest checkpoint with 1000 timesteps
+  python train.py --eval_only --output_dir ./results --calculate_fid --fid_only --inference_steps 1000
         """
     )
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file to resume from (default: auto-loads latest.pt)")
@@ -1096,6 +1103,9 @@ Examples:
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint (runs evaluation first before continuing)")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     parser.add_argument("--calculate_fid", action="store_true", help="Enable FID and cFID calculation during evaluation (slower but more comprehensive metrics)")
+    parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (no training). Loads latest checkpoint from output_dir.")
+    parser.add_argument("--inference_steps", type=int, default=200, help="Number of inference steps for generation (default: 200, use 1000 for full quality)")
+    parser.add_argument("--fid_only", action="store_true", help="Only calculate FID metrics (skip KL, MSE, PSNR, SSIM for faster evaluation)")
     args = parser.parse_args()
     
     config = Config()
@@ -1103,6 +1113,12 @@ Examples:
     # Override calculate_fid from command line
     if args.calculate_fid:
         config.calculate_fid = True
+    
+    # Check if eval_only mode
+    if args.eval_only:
+        if not args.calculate_fid:
+            print("WARNING: --eval_only specified but --calculate_fid not enabled. FID will not be calculated.")
+            print("  Use --calculate_fid to enable FID calculation.")
     
     # Override output directory if specified
     if args.output_dir:
@@ -1234,6 +1250,61 @@ Examples:
         eta_min=1e-6  # Minimum learning rate
     )
 
+    # Handle eval_only mode
+    if args.eval_only:
+        checkpoint_path = args.checkpoint if args.checkpoint else f"{config.output_dir}/checkpoints/latest.pt"
+        if not os.path.exists(checkpoint_path):
+            print(f"ERROR: Checkpoint not found at {checkpoint_path}")
+            print(f"  Please specify --checkpoint or ensure latest.pt exists in {config.output_dir}/checkpoints/")
+            return
+        
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATION ONLY MODE", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  Loading checkpoint: {checkpoint_path}", flush=True)
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, scheduler)
+        
+        if start_epoch == 0:
+            print("ERROR: Failed to load checkpoint or checkpoint is empty")
+            return
+        
+        print(f"  Loaded checkpoint from epoch {start_epoch}", flush=True)
+        print(f"  Inference steps: {args.inference_steps}", flush=True)
+        print(f"  FID calculation: {'Enabled' if args.calculate_fid else 'Disabled'}", flush=True)
+        print(f"  FID only mode: {'Yes' if args.fid_only else 'No'}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        # Run evaluation
+        print("Running evaluation...", flush=True)
+        metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000,
+                                  calculate_fid=config.calculate_fid,
+                                  num_inference_steps=args.inference_steps,
+                                  skip_other_metrics=args.fid_only)
+        
+        # Print metrics
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATION RESULTS", flush=True)
+        print(f"{'='*60}", flush=True)
+        if not args.fid_only:
+            if metrics['kl_divergence'] is not None:
+                print(f"  KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
+            if metrics['mse'] is not None:
+                print(f"  MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+            if metrics['psnr'] is not None:
+                print(f"  PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+            if metrics['ssim'] is not None:
+                print(f"  SSIM:              {metrics['ssim']:.4f}", flush=True)
+        if metrics['fid'] is not None:
+            print(f"  FID (Overall):     {metrics['fid']:.2f}", flush=True)
+        if metrics['cfid'] is not None:
+            print(f"  cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+        print(f"{'='*60}", flush=True)
+        
+        # Log metrics
+        logger.update(start_epoch, 0.0, metrics, scheduler.get_last_lr()[0] if start_epoch > 0 else 0)
+        print(f"\n✅ Evaluation complete! Results saved to {logger.metrics_csv_path}", flush=True)
+        return
+    
     # Load checkpoint
     checkpoint_path = args.checkpoint if args.checkpoint else f"{config.output_dir}/checkpoints/latest.pt"
     if args.resume or args.checkpoint:
@@ -1248,7 +1319,10 @@ Examples:
             # Run evaluation first when resuming
             print(f"\n🔍 Running evaluation on loaded checkpoint before continuing training...", flush=True)
             print(f"{'='*60}", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, calculate_fid=config.calculate_fid)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                                      calculate_fid=config.calculate_fid, 
+                                      num_inference_steps=args.inference_steps,
+                                      skip_other_metrics=args.fid_only)
             
             # Print metrics prominently
             print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
@@ -1322,7 +1396,10 @@ Examples:
             print(f"EVALUATION (Epoch {epoch+1})", flush=True)
             print("="*60, flush=True)
             print("  Calculating metrics on validation set...", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, calculate_fid=config.calculate_fid)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                                      calculate_fid=config.calculate_fid,
+                                      num_inference_steps=args.inference_steps,
+                                      skip_other_metrics=args.fid_only)
             
             # Print metrics prominently
             print(f"\n  📊 EVALUATION METRICS:", flush=True)
