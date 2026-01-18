@@ -470,7 +470,6 @@ def save_drug_proj(drug_proj: nn.Module, out_dir: str):
 # =============================================================================
 def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, device, weight_dtype, num_inference_steps=50):
     """Generate samples using FLUX ControlNet pipeline"""
-    pipe.eval()
     controlnet.eval()
     drug_proj.eval()
     
@@ -526,7 +525,6 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
         print("  Warning: imageio not available. Skipping video generation.")
         return
     
-    pipe.eval()
     controlnet.eval()
     drug_proj.eval()
     
@@ -683,8 +681,8 @@ def parse_args():
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--save_every", type=int, default=1000)
     p.add_argument("--eval_every", type=int, default=1000, help="Run evaluation (generate samples/video) every N steps")
-    p.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], 
-                   help="Data split to use for evaluation (default: val)")
+    p.add_argument("--eval_split", type=str, default="test", choices=["train", "val", "test"], 
+                   help="Data split to use for evaluation (default: test)")
 
     # Drug tokens
     p.add_argument("--fingerprint_dim", type=int, default=1024)
@@ -880,14 +878,17 @@ def main():
             paths_csv=args.paths_csv,
         )
         
-        # If eval split is empty, fallback to training split
+        # If eval split is empty, try fallback splits
         if len(eval_dataset) == 0:
-            print(f"  Warning: Evaluation split '{args.eval_split}' is empty. Using 'train' split for evaluation.")
+            print(f"  Warning: Evaluation split '{args.eval_split}' is empty.")
+            # Try test if val was requested, or train as last resort
+            fallback_split = "test" if args.eval_split == "val" else "train"
+            print(f"  Trying fallback split '{fallback_split}' for evaluation.")
             eval_dataset = PairedBBBC021Dataset(
                 data_dir=args.data_dir,
                 metadata_file=args.metadata_file,
                 size=args.resolution,
-                split="train",
+                split=fallback_split,
                 paths_csv=args.paths_csv,
             )
         
