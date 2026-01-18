@@ -515,7 +515,7 @@ def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint,
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
         ])
-        img_tensor = transform(images[0]).unsqueeze(0)
+        img_tensor = transform(images[0]).unsqueeze(0).to(device=device)
         return img_tensor
 
 
@@ -636,10 +636,15 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
     generated_stack = torch.cat(generated_imgs, dim=0)
     
     # Create grid: control | generated | target
+    # Ensure all tensors are on the same device
+    ctrl_norm = (ctrl_imgs / 2 + 0.5).clamp(0, 1)
+    target_norm = (target_imgs / 2 + 0.5).clamp(0, 1)
+    generated_stack = generated_stack.to(device=device)
+    
     grid = torch.cat([
-        (ctrl_imgs / 2 + 0.5).clamp(0, 1),
+        ctrl_norm,
         generated_stack,
-        (target_imgs / 2 + 0.5).clamp(0, 1)
+        target_norm
     ], dim=0)
     
     grid_path = os.path.join(plots_dir, f"step_{step}.png")
