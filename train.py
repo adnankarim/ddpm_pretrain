@@ -78,6 +78,7 @@ class Config:
     lr = 3e-5  # Lower LR when using pretrained weights to prevent drift
     save_freq = 1
     eval_freq = 5
+    calculate_fid = False  # Set to True to enable FID calculation (slower evaluation)
     
     output_dir = "ddpm_diffusers_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -303,10 +304,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-            for cpd in df['CPD_NAME'].unique():
+        for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-                self.fingerprints[cpd] = self.encoder.encode(smiles)
+            self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -365,7 +366,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-            ctrls = self.batch_map[batch]['ctrl']
+        ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -849,9 +850,16 @@ def calculate_fid(real_images, fake_images, device):
         print(f"  Warning: FID calculation failed: {e}", flush=True)
         return None
 
-def calculate_metrics(model, val_loader, device, num_samples=1000):
+def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid=False):
     """
     Calculate evaluation metrics on validation set.
+    
+    Args:
+        model: The diffusion model
+        val_loader: Validation data loader
+        device: torch device
+        num_samples: Number of samples to use for evaluation
+        calculate_fid: If True, calculate FID and cFID (slower). If False, skip FID calculation.
     
     Returns:
         dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim', 'fid', 'cfid'
@@ -936,23 +944,25 @@ def calculate_metrics(model, val_loader, device, num_samples=1000):
             mse = F.mse_loss(generated, real_t).item()
             metrics['mse'].append(mse)
             
-            # Collect images for overall FID (keep on device for efficiency)
-            all_real_images.append(real_t)
-            all_generated_images.append(generated)
-            
-            # Group by condition for conditional FID
-            # Create a hash of control and fingerprint to group similar conditions
-            for i in range(b):
-                # Use a simple hash: mean of control and fingerprint
-                ctrl_hash = tuple(ctrl[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2))
-                fp_hash = tuple(fp[i].cpu().numpy()[:10].round(decimals=2))  # Use first 10 dims for hash
-                cond_key = (ctrl_hash, fp_hash)
+            # Collect images for FID only if enabled (saves memory and time)
+            if calculate_fid:
+                # Collect images for overall FID (keep on device for efficiency)
+                all_real_images.append(real_t)
+                all_generated_images.append(generated)
                 
-                if cond_key not in condition_groups:
-                    condition_groups[cond_key] = {'real': [], 'gen': []}
-                
-                condition_groups[cond_key]['real'].append(real_t[i:i+1])
-                condition_groups[cond_key]['gen'].append(generated[i:i+1])
+                # Group by condition for conditional FID
+                # Create a hash of control and fingerprint to group similar conditions
+                for i in range(b):
+                    # Use a simple hash: mean of control and fingerprint
+                    ctrl_hash = tuple(ctrl[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2))
+                    fp_hash = tuple(fp[i].cpu().numpy()[:10].round(decimals=2))  # Use first 10 dims for hash
+                    cond_key = (ctrl_hash, fp_hash)
+                    
+                    if cond_key not in condition_groups:
+                        condition_groups[cond_key] = {'real': [], 'gen': []}
+                    
+                    condition_groups[cond_key]['real'].append(real_t[i:i+1])
+                    condition_groups[cond_key]['gen'].append(generated[i:i+1])
             
             # Calculate PSNR and SSIM if available
             if SKIMAGE_AVAILABLE:
@@ -975,32 +985,37 @@ def calculate_metrics(model, val_loader, device, num_samples=1000):
             
             sample_count += generated.shape[0]
     
-    # Calculate Overall FID (all images regardless of condition)
+    # Calculate FID only if enabled (can be slow)
     fid_score = None
-    if len(all_real_images) > 0 and len(all_generated_images) > 0:
-        real_stack = torch.cat(all_real_images, dim=0).to(device)
-        fake_stack = torch.cat(all_generated_images, dim=0).to(device)
-        # Need at least 2 samples for FID
-        if real_stack.shape[0] >= 2 and fake_stack.shape[0] >= 2:
-            print("  Calculating Overall FID...", flush=True)
-            fid_score = calculate_fid(real_stack, fake_stack, device)
-            if fid_score is not None:
-                metrics['fid'].append(fid_score)
-    
-    # Calculate Conditional FID (per-condition comparison)
-    cfid_scores = []
-    if len(condition_groups) > 0:
-        print(f"  Calculating Conditional FID across {len(condition_groups)} conditions...", flush=True)
-        for cond_key, group in condition_groups.items():
-            if len(group['real']) >= 2 and len(group['gen']) >= 2:
-                real_cond = torch.cat(group['real'], dim=0).to(device)
-                gen_cond = torch.cat(group['gen'], dim=0).to(device)
-                cfid = calculate_fid(real_cond, gen_cond, device)
-                if cfid is not None:
-                    cfid_scores.append(cfid)
-    
-    # Average conditional FID across all conditions
-    cfid_score = np.mean(cfid_scores) if len(cfid_scores) > 0 else None
+    cfid_score = None
+    if calculate_fid:
+        # Calculate Overall FID (all images regardless of condition)
+        if len(all_real_images) > 0 and len(all_generated_images) > 0:
+            real_stack = torch.cat(all_real_images, dim=0).to(device)
+            fake_stack = torch.cat(all_generated_images, dim=0).to(device)
+            # Need at least 2 samples for FID
+            if real_stack.shape[0] >= 2 and fake_stack.shape[0] >= 2:
+                print("  Calculating Overall FID...", flush=True)
+                fid_score = calculate_fid(real_stack, fake_stack, device)
+                if fid_score is not None:
+                    metrics['fid'].append(fid_score)
+        
+        # Calculate Conditional FID (per-condition comparison)
+        cfid_scores = []
+        if len(condition_groups) > 0:
+            print(f"  Calculating Conditional FID across {len(condition_groups)} conditions...", flush=True)
+            for cond_key, group in condition_groups.items():
+                if len(group['real']) >= 2 and len(group['gen']) >= 2:
+                    real_cond = torch.cat(group['real'], dim=0).to(device)
+                    gen_cond = torch.cat(group['gen'], dim=0).to(device)
+                    cfid = calculate_fid(real_cond, gen_cond, device)
+                    if cfid is not None:
+                        cfid_scores.append(cfid)
+        
+        # Average conditional FID across all conditions
+        cfid_score = np.mean(cfid_scores) if len(cfid_scores) > 0 else None
+    else:
+        print("  Skipping FID calculation (use --calculate_fid to enable)", flush=True)
     
     # Average metrics
     result = {
@@ -1078,9 +1093,14 @@ Examples:
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for results (default: ddpm_diffusers_results)")
     parser.add_argument("--resume", action="store_true", help="Resume training from latest checkpoint (runs evaluation first before continuing)")
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
+    parser.add_argument("--calculate_fid", action="store_true", help="Enable FID and cFID calculation during evaluation (slower but more comprehensive metrics)")
     args = parser.parse_args()
     
     config = Config()
+    
+    # Override calculate_fid from command line
+    if args.calculate_fid:
+        config.calculate_fid = True
     
     # Override output directory if specified
     if args.output_dir:
@@ -1226,7 +1246,7 @@ Examples:
             # Run evaluation first when resuming
             print(f"\n🔍 Running evaluation on loaded checkpoint before continuing training...", flush=True)
             print(f"{'='*60}", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, calculate_fid=config.calculate_fid)
             
             # Print metrics prominently
             print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
@@ -1300,7 +1320,7 @@ Examples:
             print(f"EVALUATION (Epoch {epoch+1})", flush=True)
             print("="*60, flush=True)
             print("  Calculating metrics on validation set...", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000)
+            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, calculate_fid=config.calculate_fid)
             
             # Print metrics prominently
             print(f"\n  📊 EVALUATION METRICS:", flush=True)
