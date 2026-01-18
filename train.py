@@ -1106,6 +1106,7 @@ Examples:
     parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (no training). Loads latest checkpoint from output_dir.")
     parser.add_argument("--inference_steps", type=int, default=200, help="Number of inference steps for generation (default: 200, use 1000 for full quality)")
     parser.add_argument("--fid_only", action="store_true", help="Only calculate FID metrics (skip KL, MSE, PSNR, SSIM for faster evaluation)")
+    parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], help="Data split to use for evaluation (default: val, falls back to test if val is empty)")
     args = parser.parse_args()
     
     config = Config()
@@ -1269,6 +1270,7 @@ Examples:
             return
         
         print(f"  Loaded checkpoint from epoch {start_epoch}", flush=True)
+        print(f"  Evaluation split: {eval_split}", flush=True)
         print(f"  Inference steps: {args.inference_steps}", flush=True)
         print(f"  FID calculation: {'Enabled' if args.calculate_fid else 'Disabled'}", flush=True)
         print(f"  FID only mode: {'Yes' if args.fid_only else 'No'}", flush=True)
