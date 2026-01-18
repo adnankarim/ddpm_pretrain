@@ -492,7 +492,8 @@ def parse_args():
     p.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # Precision
-    p.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
+    p.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"], 
+                   help="Mixed precision mode. Use 'no' (fp32) for stability on GH200, 'bf16' or 'fp16' for speed if supported.")
     p.add_argument("--seed", type=int, default=42)
 
     # ControlNet size knobs
