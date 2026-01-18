@@ -79,6 +79,7 @@ class Config:
     save_freq = 1
     eval_freq = 5
     calculate_fid = False  # Set to True to enable FID calculation (slower evaluation)
+    skip_metrics_during_training = True  # If True, skip metric calculations during training (only generate samples/video)
     
     output_dir = "ddpm_diffusers_results"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1318,30 +1319,35 @@ Examples:
             print(f"  Current LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
             print(f"  Checkpoint: {checkpoint_path}", flush=True)
             
-            # Run evaluation first when resuming
+            # Run evaluation first when resuming (only generate samples/video, skip metrics by default)
             print(f"\n🔍 Running evaluation on loaded checkpoint before continuing training...", flush=True)
             print(f"{'='*60}", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
-                                      calculate_fid=config.calculate_fid, 
-                                      num_inference_steps=args.inference_steps,
-                                      skip_other_metrics=args.fid_only)
             
-            # Print metrics prominently
-            print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
-            print(f"  {'-'*58}", flush=True)
-            if metrics['kl_divergence'] is not None:
-                print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
-            if metrics['mse'] is not None:
-                print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
-            if metrics['psnr'] is not None:
-                print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
-            if metrics['ssim'] is not None:
-                print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
-            if metrics['fid'] is not None:
-                print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
-            if metrics['cfid'] is not None:
-                print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
-            print(f"  {'-'*58}", flush=True)
+            metrics = None
+            if not config.skip_metrics_during_training:
+                metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                                          calculate_fid=config.calculate_fid, 
+                                          num_inference_steps=args.inference_steps,
+                                          skip_other_metrics=args.fid_only)
+                
+                # Print metrics prominently
+                print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
+                print(f"  {'-'*58}", flush=True)
+                if metrics['kl_divergence'] is not None:
+                    print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
+                if metrics['mse'] is not None:
+                    print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+                if metrics['psnr'] is not None:
+                    print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+                if metrics['ssim'] is not None:
+                    print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+                if metrics['fid'] is not None:
+                    print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+                if metrics['cfid'] is not None:
+                    print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+                print(f"  {'-'*58}", flush=True)
+            else:
+                print("  Skipping metric calculations (only generating samples/video)...", flush=True)
             
             # Generate visualization for resume checkpoint
             val_iter = iter(val_loader)
@@ -1391,40 +1397,47 @@ Examples:
             
         avg_loss = np.mean(losses)
         
-        # Calculate metrics during evaluation
+        # Generate samples and video during evaluation (metrics optional)
         metrics = None
         if (epoch + 1) % config.eval_freq == 0:
             print("\n" + "="*60, flush=True)
             print(f"EVALUATION (Epoch {epoch+1})", flush=True)
             print("="*60, flush=True)
-            print("  Calculating metrics on validation set...", flush=True)
-            metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
-                                      calculate_fid=config.calculate_fid,
-                                      num_inference_steps=args.inference_steps,
-                                      skip_other_metrics=args.fid_only)
             
-            # Print metrics prominently
-            print(f"\n  📊 EVALUATION METRICS:", flush=True)
-            print(f"  {'-'*58}", flush=True)
-            if metrics['kl_divergence'] is not None:
-                print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
-            if metrics['mse'] is not None:
-                print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
-            if metrics['psnr'] is not None:
-                print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
-            if metrics['ssim'] is not None:
-                print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
-            if metrics['fid'] is not None:
-                print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
-            if metrics['cfid'] is not None:
-                print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
-            print(f"  {'-'*58}", flush=True)
-            print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
-            print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
-            print(f"  ✓ Metrics plot: {logger.metrics_plot_path}", flush=True)
+            # Calculate metrics only if not skipped
+            if not config.skip_metrics_during_training:
+                print("  Calculating metrics on validation set...", flush=True)
+                metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                                          calculate_fid=config.calculate_fid,
+                                          num_inference_steps=args.inference_steps,
+                                          skip_other_metrics=args.fid_only)
+                
+                # Print metrics prominently
+                print(f"\n  📊 EVALUATION METRICS:", flush=True)
+                print(f"  {'-'*58}", flush=True)
+                if metrics['kl_divergence'] is not None:
+                    print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
+                if metrics['mse'] is not None:
+                    print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+                if metrics['psnr'] is not None:
+                    print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+                if metrics['ssim'] is not None:
+                    print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+                if metrics['fid'] is not None:
+                    print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+                if metrics['cfid'] is not None:
+                    print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+                print(f"  {'-'*58}", flush=True)
+                print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
+                print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
+                print(f"  ✓ Metrics plot: {logger.metrics_plot_path}", flush=True)
+            else:
+                print("  Skipping metric calculations (only generating samples/video)...", flush=True)
+            
             print("="*60 + "\n", flush=True)
             
-            # Visualization
+            # Visualization (always generate samples and video)
+            print("  Generating sample grid and video...", flush=True)
             val_iter = iter(val_loader)
             batch = next(val_iter)
             ctrl = batch['control'].to(config.device)
@@ -1436,7 +1449,9 @@ Examples:
             
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
             save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
+            print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
+            print(f"  ✓ Video saved to: {config.output_dir}/plots/video_{epoch+1}.mp4", flush=True)
 
         # Step scheduler
         scheduler.step()
