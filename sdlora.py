@@ -1178,32 +1178,31 @@ Examples:
                 "learning_rate": current_lr
             })
         
-        # Checkpointing
-        if (epoch + 1) % config.save_freq == 0:
-            # Save separate components
-            epoch_path = f"{config.output_dir}/checkpoints/checkpoint_epoch_{epoch+1}.pt"
-            torch.save({
-                'unet': unet.state_dict(),
-                'controlnet': controlnet.state_dict(),
-                'drug_proj': drug_proj.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'epoch': epoch+1,
-                'config': config.__dict__
-            }, epoch_path)
-            
-            # Update 'latest' for resuming
-            torch.save({
-                'unet': unet.state_dict(),
-                'controlnet': controlnet.state_dict(),
-                'drug_proj': drug_proj.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'epoch': epoch+1,
-                'config': config.__dict__
-            }, f"{config.output_dir}/checkpoints/latest.pt")
-            
-            print(f"  ✓ Saved checkpoint: {epoch_path} (LR: {current_lr:.2e})", flush=True)
+        # CHECKPOINTING (Save every epoch)
+        # Save epoch-specific checkpoint
+        epoch_path = f"{config.output_dir}/checkpoints/checkpoint_epoch_{epoch+1}.pt"
+        torch.save({
+            'unet': unet.state_dict(),
+            'controlnet': controlnet.state_dict(),
+            'drug_proj': drug_proj.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'epoch': epoch+1,
+            'config': config.__dict__
+        }, epoch_path)
+        
+        # Also update latest.pt for easy resuming
+        torch.save({
+            'unet': unet.state_dict(),
+            'controlnet': controlnet.state_dict(),
+            'drug_proj': drug_proj.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'epoch': epoch+1,
+            'config': config.__dict__
+        }, f"{config.output_dir}/checkpoints/latest.pt")
+        
+        print(f"  ✓ Checkpoint saved: {epoch_path} (LR: {current_lr:.2e})", flush=True)
             
         # --- EVALUATION ---
         if (epoch + 1) % config.eval_freq == 0:
