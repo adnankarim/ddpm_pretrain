@@ -304,10 +304,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-        for cpd in df['CPD_NAME'].unique():
+            for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-            self.fingerprints[cpd] = self.encoder.encode(smiles)
+                self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -366,7 +366,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-        ctrls = self.batch_map[batch]['ctrl']
+            ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
