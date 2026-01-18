@@ -918,7 +918,9 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
     
     sample_count = 0
     with torch.no_grad():
-        for sample in all_samples:
+        # Add progress bar for evaluation
+        from tqdm.auto import tqdm
+        for sample in tqdm(all_samples, desc="  Evaluating", leave=False):
             if sample_count >= num_samples:
                 break
             
