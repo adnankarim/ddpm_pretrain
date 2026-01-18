@@ -50,6 +50,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.utils import save_image
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -77,6 +78,13 @@ try:
     SAFETENSORS_OK = True
 except Exception:
     SAFETENSORS_OK = False
+
+# Optional imageio for video generation
+try:
+    import imageio
+    IMAGEIO_AVAILABLE = True
+except ImportError:
+    IMAGEIO_AVAILABLE = False
 
 # Optional RDKit
 try:
@@ -458,6 +466,187 @@ def save_drug_proj(drug_proj: nn.Module, out_dir: str):
 
 
 # =============================================================================
+# EVALUATION FUNCTIONS (Generate samples and videos)
+# =============================================================================
+def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, device, weight_dtype, num_inference_steps=50):
+    """Generate samples using FLUX ControlNet pipeline"""
+    pipe.eval()
+    controlnet.eval()
+    drug_proj.eval()
+    
+    with torch.no_grad():
+        # Prepare inputs
+        ctrl_px = control_img.unsqueeze(0).to(device, dtype=weight_dtype)
+        fp = fingerprint.unsqueeze(0).to(device, dtype=torch.float32)
+        
+        # Encode prompt
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt([prompt], prompt_2=[prompt])
+        prompt_embeds = prompt_embeds.to(dtype=weight_dtype, device=device)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=weight_dtype, device=device)
+        text_ids = text_ids.to(dtype=weight_dtype, device=device)
+        
+        # Add drug tokens
+        drug_tokens = drug_proj(fp).to(dtype=weight_dtype)
+        prompt_embeds = torch.cat([prompt_embeds, drug_tokens], dim=1)
+        
+        drug_txt_ids = torch.zeros((1, drug_proj.num_drug_tokens, text_ids.shape[-1]), 
+                                   device=device, dtype=weight_dtype)
+        text_ids_b = torch.cat([text_ids.unsqueeze(0), drug_txt_ids], dim=1)
+        
+        # Encode control image
+        ctrl_lat = pipe.vae.encode(ctrl_px).latent_dist.sample()
+        ctrl_lat = (ctrl_lat - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        control_latents = FluxControlNetPipeline._pack_latents(
+            ctrl_lat, 1, ctrl_lat.shape[1], ctrl_lat.shape[2], ctrl_lat.shape[3]
+        )
+        
+        # Generate using pipeline
+        images = pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            control_image=control_latents,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=3.5,
+            generator=torch.Generator(device=device).manual_seed(42),
+        ).images
+        
+        # Convert PIL to tensor [-1, 1]
+        from torchvision.transforms import ToTensor, Normalize
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+        img_tensor = transform(images[0]).unsqueeze(0)
+        return img_tensor
+
+
+def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, save_path, device, weight_dtype, num_frames=40):
+    """Generate video of FLUX generation process"""
+    if not IMAGEIO_AVAILABLE:
+        print("  Warning: imageio not available. Skipping video generation.")
+        return
+    
+    pipe.eval()
+    controlnet.eval()
+    drug_proj.eval()
+    
+    with torch.no_grad():
+        # Prepare inputs
+        ctrl_px = control_img.unsqueeze(0).to(device, dtype=weight_dtype)
+        fp = fingerprint.unsqueeze(0).to(device, dtype=torch.float32)
+        
+        # Encode prompt
+        prompt_embeds, pooled_prompt_embeds, text_ids = pipe.encode_prompt([prompt], prompt_2=[prompt])
+        prompt_embeds = prompt_embeds.to(dtype=weight_dtype, device=device)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(dtype=weight_dtype, device=device)
+        text_ids = text_ids.to(dtype=weight_dtype, device=device)
+        
+        # Add drug tokens
+        drug_tokens = drug_proj(fp).to(dtype=weight_dtype)
+        prompt_embeds = torch.cat([prompt_embeds, drug_tokens], dim=1)
+        
+        drug_txt_ids = torch.zeros((1, drug_proj.num_drug_tokens, text_ids.shape[-1]), 
+                                   device=device, dtype=weight_dtype)
+        text_ids_b = torch.cat([text_ids.unsqueeze(0), drug_txt_ids], dim=1)
+        
+        # Encode control
+        ctrl_lat = pipe.vae.encode(ctrl_px).latent_dist.sample()
+        ctrl_lat = (ctrl_lat - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        control_latents = FluxControlNetPipeline._pack_latents(
+            ctrl_lat, 1, ctrl_lat.shape[1], ctrl_lat.shape[2], ctrl_lat.shape[3]
+        )
+        
+        # Generate with callback to save frames
+        frames = []
+        def callback_fn(pipe, step_index, timestep, callback_kwargs):
+            if step_index % (pipe.scheduler.config.num_train_timesteps // num_frames) == 0:
+                latents = callback_kwargs["latents"]
+                # Decode frame
+                decoded = pipe.vae.decode((latents / pipe.vae.config.scaling_factor).float()).sample
+                decoded = (decoded / 2 + 0.5).clamp(0, 1)
+                img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                frames.append(img_np)
+            return callback_kwargs
+        
+        # Generate
+        images = pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            control_image=control_latents,
+            num_inference_steps=50,
+            guidance_scale=3.5,
+            callback_on_step_end=callback_fn,
+            generator=torch.Generator(device=device).manual_seed(42),
+        ).images
+        
+        # Add final frame
+        from torchvision.transforms import ToTensor
+        final_img = np.array(images[0])
+        frames.append(final_img)
+        
+        # Create side-by-side with control
+        ctrl_np = np.array(pipe.vae.decode((ctrl_lat / pipe.vae.config.scaling_factor).float()).sample[0].cpu().permute(1,2,0).numpy())
+        ctrl_np = ((ctrl_np + 1) / 2 * 255).astype(np.uint8)
+        separator = np.zeros((ctrl_np.shape[0], 2, 3), dtype=np.uint8)
+        final_frames = [np.hstack([f, separator, ctrl_np]) for f in frames]
+        
+        imageio.mimsave(save_path, final_frames, fps=10)
+        print(f"  ✓ Video saved to: {save_path}")
+
+
+def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args, device, weight_dtype, step, output_dir, accelerator):
+    """Run evaluation: generate sample grid and video"""
+    if not accelerator.is_main_process:
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"EVALUATION (Step {step})")
+    print(f"{'='*60}")
+    
+    # Create plots directory
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Get a sample batch
+    eval_loader = DataLoader(eval_dataset, batch_size=4, shuffle=False, num_workers=2)
+    sample_batch = next(iter(eval_loader))
+    
+    ctrl_imgs = sample_batch["control"][:4].to(device, dtype=weight_dtype)
+    target_imgs = sample_batch["target"][:4].to(device, dtype=weight_dtype)
+    fps = sample_batch["fingerprint"][:4].to(device)
+    prompts = sample_batch["prompt"][:4] if isinstance(sample_batch["prompt"], list) else [sample_batch["prompt"]] * 4
+    
+    # Generate samples
+    print("  Generating samples...")
+    generated_imgs = []
+    for i in range(4):
+        gen = generate_samples_flux(pipe, controlnet, drug_proj, ctrl_imgs[i], fps[i], prompts[i], 
+                                   device, weight_dtype, num_inference_steps=50)
+        generated_imgs.append(gen)
+    
+    generated_stack = torch.cat(generated_imgs, dim=0)
+    
+    # Create grid: control | generated | target
+    grid = torch.cat([
+        (ctrl_imgs[:4] / 2 + 0.5).clamp(0, 1),
+        generated_stack,
+        (target_imgs[:4] / 2 + 0.5).clamp(0, 1)
+    ], dim=0)
+    
+    grid_path = os.path.join(plots_dir, f"step_{step}.png")
+    save_image(grid, grid_path, nrow=4, normalize=False)
+    print(f"  ✓ Sample grid saved to: {grid_path}")
+    
+    # Generate video
+    print("  Generating video...")
+    video_path = os.path.join(plots_dir, f"video_step_{step}.mp4")
+    generate_video_flux(pipe, controlnet, drug_proj, ctrl_imgs[0], fps[0], prompts[0], 
+                       video_path, device, weight_dtype, num_frames=40)
+    
+    print(f"{'='*60}\n")
+
+
+# =============================================================================
 # MAIN TRAINING
 # =============================================================================
 def parse_args():
@@ -478,6 +667,9 @@ def parse_args():
     # Output
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--save_every", type=int, default=1000)
+    p.add_argument("--eval_every", type=int, default=1000, help="Run evaluation (generate samples/video) every N steps")
+    p.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], 
+                   help="Data split to use for evaluation (default: val)")
 
     # Drug tokens
     p.add_argument("--fingerprint_dim", type=int, default=1024)
@@ -662,6 +854,32 @@ def main():
     transformer.train()
     drug_proj.train()
 
+    # Load eval dataset once (for evaluation)
+    eval_dataset = None
+    if accelerator.is_main_process:
+        eval_dataset = PairedBBBC021Dataset(
+            data_dir=args.data_dir,
+            metadata_file=args.metadata_file,
+            size=args.resolution,
+            split=args.eval_split,
+            paths_csv=args.paths_csv,
+        )
+        
+        # Run evaluation at start of training (step 0 sanity check)
+        print("\n" + "="*60)
+        print("🔎 Running Step 0 Sanity Check (Untrained Model)...")
+        print("="*60)
+        pipe.controlnet = accelerator.unwrap_model(controlnet)
+        pipe.transformer = accelerator.unwrap_model(transformer)
+        
+        run_evaluation(
+            pipe, accelerator.unwrap_model(controlnet), accelerator.unwrap_model(transformer),
+            accelerator.unwrap_model(drug_proj), eval_dataset, args, accelerator.device, 
+            weight_dtype, 0, args.output_dir, accelerator
+        )
+        print("✅ Step 0 Check Complete. Check ./{}/plots/".format(args.output_dir))
+        print("="*60 + "\n")
+
     global_step = 0
 
     while global_step < args.max_train_steps:
@@ -780,6 +998,18 @@ def main():
 
             if accelerator.is_main_process and global_step % 50 == 0:
                 print(f"step={global_step} loss={loss.item():.6f}")
+
+            # evaluation (generate samples/video)
+            if accelerator.is_main_process and global_step > 0 and (global_step % args.eval_every == 0) and eval_dataset is not None:
+                # Update pipe with unwrapped models
+                pipe.controlnet = accelerator.unwrap_model(controlnet)
+                pipe.transformer = accelerator.unwrap_model(transformer)
+                
+                run_evaluation(
+                    pipe, accelerator.unwrap_model(controlnet), accelerator.unwrap_model(transformer),
+                    accelerator.unwrap_model(drug_proj), eval_dataset, args, accelerator.device, 
+                    weight_dtype, global_step, args.output_dir, accelerator
+                )
 
             # checkpoint
             if accelerator.is_main_process and global_step > 0 and (global_step % args.save_every == 0):

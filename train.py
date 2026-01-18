@@ -1434,15 +1434,17 @@ Examples:
             else:
                 print("  Skipping metric calculations (only generating samples/video)...", flush=True)
             
-            # Visualization (always generate samples and video - quick generation, no full evaluation)
-            print("  Generating sample grid and video (quick generation, no evaluation)...", flush=True)
+            print("="*60 + "\n", flush=True)
+            
+            # Visualization (always generate samples and video)
+            print("  Generating sample grid and video...", flush=True)
             val_iter = iter(val_loader)
             batch = next(val_iter)
             ctrl = batch['control'].to(config.device)
             real_t = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
             
-            # Use fewer inference steps for faster generation (200 steps is enough for visualization)
+            # Use fewer inference steps for faster evaluation (can increase later)
             fakes = model.sample(ctrl, fp, num_inference_steps=200)
             
             grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
@@ -1450,7 +1452,6 @@ Examples:
             print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
             generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
             print(f"  ✓ Video saved to: {config.output_dir}/plots/video_{epoch+1}.mp4", flush=True)
-            print("="*60 + "\n", flush=True)
 
         # Step scheduler
         scheduler.step()
