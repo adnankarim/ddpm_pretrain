@@ -492,18 +492,18 @@ def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint,
                                    device=device, dtype=weight_dtype)
         text_ids_b = torch.cat([text_ids.unsqueeze(0), drug_txt_ids], dim=1)
         
-        # Encode control image
-        ctrl_lat = pipe.vae.encode(ctrl_px).latent_dist.sample()
-        ctrl_lat = (ctrl_lat - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-        control_latents = FluxControlNetPipeline._pack_latents(
-            ctrl_lat, 1, ctrl_lat.shape[1], ctrl_lat.shape[2], ctrl_lat.shape[3]
-        )
+        # Convert control image from [-1, 1] to [0, 1] for pipeline
+        # Pipeline expects pixel images, not latents
+        control_image = (ctrl_px / 2 + 0.5).clamp(0, 1)
         
         # Generate using pipeline
+        # Note: We need to pass custom prompt_embeds with drug tokens
+        # But the pipeline API might not support this directly, so we'll need to use a workaround
+        # For now, let's try passing the control image as pixel space
         images = pipe(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
-            control_image=control_latents,
+            control_image=control_image,
             num_inference_steps=num_inference_steps,
             guidance_scale=3.5,
             generator=torch.Generator(device=device).manual_seed(42),
@@ -547,12 +547,9 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
                                    device=device, dtype=weight_dtype)
         text_ids_b = torch.cat([text_ids.unsqueeze(0), drug_txt_ids], dim=1)
         
-        # Encode control
-        ctrl_lat = pipe.vae.encode(ctrl_px).latent_dist.sample()
-        ctrl_lat = (ctrl_lat - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-        control_latents = FluxControlNetPipeline._pack_latents(
-            ctrl_lat, 1, ctrl_lat.shape[1], ctrl_lat.shape[2], ctrl_lat.shape[3]
-        )
+        # Convert control image from [-1, 1] to [0, 1] for pipeline
+        # Pipeline expects pixel images, not latents
+        control_image = (ctrl_px / 2 + 0.5).clamp(0, 1)
         
         # Generate with callback to save frames
         frames = []
@@ -570,7 +567,7 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
         images = pipe(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
-            control_image=control_latents,
+            control_image=control_image,
             num_inference_steps=50,
             guidance_scale=3.5,
             callback_on_step_end=callback_fn,
@@ -582,9 +579,8 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
         final_img = np.array(images[0])
         frames.append(final_img)
         
-        # Create side-by-side with control
-        ctrl_np = np.array(pipe.vae.decode((ctrl_lat / pipe.vae.config.scaling_factor).float()).sample[0].cpu().permute(1,2,0).numpy())
-        ctrl_np = ((ctrl_np + 1) / 2 * 255).astype(np.uint8)
+        # Create side-by-side with control (convert from tensor to numpy)
+        ctrl_np = (control_image[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         separator = np.zeros((ctrl_np.shape[0], 2, 3), dtype=np.uint8)
         final_frames = [np.hstack([f, separator, ctrl_np]) for f in frames]
         
