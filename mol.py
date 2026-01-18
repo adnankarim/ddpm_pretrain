@@ -88,7 +88,7 @@ class Config:
     calculate_fid = False  # Set to True to enable FID calculation (slower evaluation)
     skip_metrics_during_training = True  # If True, skip metric calculations during training (only generate samples/video)
     
-    output_dir = "ddpm_diffusers_results"
+    output_dir = "ddpm_diffusers_results_mol"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============================================================================

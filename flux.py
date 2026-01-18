@@ -468,7 +468,7 @@ def save_drug_proj(drug_proj: nn.Module, out_dir: str):
 # =============================================================================
 # EVALUATION FUNCTIONS (Generate samples and videos)
 # =============================================================================
-def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, device, weight_dtype, num_inference_steps=50):
+def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, device, weight_dtype, num_inference_steps=50, seed=None):
     """Generate samples using FLUX ControlNet pipeline"""
     controlnet.eval()
     drug_proj.eval()
@@ -496,6 +496,11 @@ def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint,
         # Pipeline expects pixel images, not latents
         control_image = (ctrl_px / 2 + 0.5).clamp(0, 1)
         
+        # Use different seed for each sample (or random if not provided)
+        if seed is None:
+            seed = torch.randint(0, 2**32, (1,)).item()
+        generator = torch.Generator(device=device).manual_seed(seed)
+        
         # Generate using pipeline
         # Note: We need to pass custom prompt_embeds with drug tokens
         # But the pipeline API might not support this directly, so we'll need to use a workaround
@@ -506,7 +511,7 @@ def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint,
             control_image=control_image,
             num_inference_steps=num_inference_steps,
             guidance_scale=3.5,
-            generator=torch.Generator(device=device).manual_seed(42),
+            generator=generator,
         ).images
         
         # Convert PIL to tensor [-1, 1]
@@ -519,7 +524,7 @@ def generate_samples_flux(pipe, controlnet, drug_proj, control_img, fingerprint,
         return img_tensor
 
 
-def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, save_path, device, weight_dtype, num_frames=40):
+def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, prompt, save_path, device, weight_dtype, num_frames=40, seed=42):
     """Generate video of FLUX generation process"""
     if not IMAGEIO_AVAILABLE:
         print("  Warning: imageio not available. Skipping video generation.")
@@ -553,13 +558,14 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
         
         # Generate (FLUX uses packed latents which are complex to decode mid-generation)
         # For now, we'll just save the final frame
+        generator = torch.Generator(device=device).manual_seed(seed)
         images = pipe(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             control_image=control_image,
             num_inference_steps=50,
             guidance_scale=3.5,
-            generator=torch.Generator(device=device).manual_seed(42),
+            generator=generator,
         ).images
         
         # Save final frame only (FLUX intermediate latents are packed and require complex unpacking)
@@ -613,12 +619,14 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
     fps = sample_batch["fingerprint"][:num_samples].to(device)
     prompts = sample_batch["prompt"][:num_samples] if isinstance(sample_batch["prompt"], list) else [sample_batch["prompt"]] * num_samples
     
-    # Generate samples
+    # Generate samples with different seeds for each sample
     print("  Generating samples...")
     generated_imgs = []
     for i in range(num_samples):
+        # Use different seed for each sample to get diverse outputs
+        seed = 42 + i  # Different seed per sample
         gen = generate_samples_flux(pipe, controlnet, drug_proj, ctrl_imgs[i], fps[i], prompts[i], 
-                                   device, weight_dtype, num_inference_steps=50)
+                                   device, weight_dtype, num_inference_steps=50, seed=seed)
         generated_imgs.append(gen)
     
     generated_stack = torch.cat(generated_imgs, dim=0)
