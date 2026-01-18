@@ -551,31 +551,19 @@ def generate_video_flux(pipe, controlnet, drug_proj, control_img, fingerprint, p
         # Pipeline expects pixel images, not latents
         control_image = (ctrl_px / 2 + 0.5).clamp(0, 1)
         
-        # Generate with callback to save frames
-        frames = []
-        def callback_fn(pipe, step_index, timestep, callback_kwargs):
-            if step_index % (pipe.scheduler.config.num_train_timesteps // num_frames) == 0:
-                latents = callback_kwargs["latents"]
-                # Decode frame
-                decoded = pipe.vae.decode((latents / pipe.vae.config.scaling_factor).float()).sample
-                decoded = (decoded / 2 + 0.5).clamp(0, 1)
-                img_np = (decoded[0].cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                frames.append(img_np)
-            return callback_kwargs
-        
-        # Generate
+        # Generate (FLUX uses packed latents which are complex to decode mid-generation)
+        # For now, we'll just save the final frame
         images = pipe(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             control_image=control_image,
             num_inference_steps=50,
             guidance_scale=3.5,
-            callback_on_step_end=callback_fn,
             generator=torch.Generator(device=device).manual_seed(42),
         ).images
         
-        # Add final frame
-        from torchvision.transforms import ToTensor
+        # Save final frame only (FLUX intermediate latents are packed and require complex unpacking)
+        frames = []
         final_img = np.array(images[0])
         frames.append(final_img)
         
