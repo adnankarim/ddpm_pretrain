@@ -1270,7 +1270,7 @@ Examples:
             return
         
         print(f"  Loaded checkpoint from epoch {start_epoch}", flush=True)
-        print(f"  Evaluation split: {eval_split}", flush=True)
+        print(f"  Evaluation split: {args.eval_split}", flush=True)
         print(f"  Inference steps: {args.inference_steps}", flush=True)
         print(f"  FID calculation: {'Enabled' if args.calculate_fid else 'Disabled'}", flush=True)
         print(f"  FID only mode: {'Yes' if args.fid_only else 'No'}", flush=True)
