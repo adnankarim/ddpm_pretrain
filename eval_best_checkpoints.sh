@@ -3,8 +3,8 @@ set -e
 
 OUTPUT_DIR="./ddpm_diffusers_results"
 CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
-INFERENCE_STEPS=1000  # Use 200 for faster eval, 1000 for higher quality
-NUM_SAMPLES=50
+INFERENCE_STEPS=50  # Use 200 for faster eval, 1000 for higher quality
+NUM_SAMPLES=1000
 EVAL_SPLIT="test"
 
 # Create log file with timestamp
