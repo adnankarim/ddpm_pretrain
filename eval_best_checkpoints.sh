@@ -3,9 +3,21 @@ set -e
 
 OUTPUT_DIR="./ddpm_diffusers_results"
 CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
-INFERENCE_STEPS=50  # Use 200 for faster eval, 1000 for higher quality
-NUM_SAMPLES=1000
-EVAL_SPLIT="val"
+INFERENCE_STEPS=1000  # Use 200 for faster eval, 1000 for higher quality
+NUM_SAMPLES=50
+EVAL_SPLIT="test"
+
+# Create log file with timestamp
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_FILE="${OUTPUT_DIR}/eval_log_${TIMESTAMP}.txt"
+
+# Ensure output directory exists
+mkdir -p "${OUTPUT_DIR}"
+
+# Function to log messages to both stdout and log file
+log() {
+    echo "$@" | tee -a "${LOG_FILE}"
+}
 
 CHECKPOINTS=(
   # Early–mid (diversity / structure)
@@ -39,26 +51,28 @@ CHECKPOINTS=(
   "checkpoint_epoch_132.pt"
 )
 
-echo "=============================================="
-echo "Evaluating DDPM checkpoints (Top + Best Overall)"
-echo "Inference steps: ${INFERENCE_STEPS}"
-echo "Samples: ${NUM_SAMPLES}"
-echo "Split: ${EVAL_SPLIT}"
-echo "=============================================="
+log "=============================================="
+log "Evaluating DDPM checkpoints (Top + Best Overall)"
+log "Inference steps: ${INFERENCE_STEPS}"
+log "Samples: ${NUM_SAMPLES}"
+log "Split: ${EVAL_SPLIT}"
+log "Log file: ${LOG_FILE}"
+log "=============================================="
 
 for CKPT in "${CHECKPOINTS[@]}"; do
   CKPT_PATH="${CHECKPOINT_DIR}/${CKPT}"
 
   if [[ ! -f "${CKPT_PATH}" ]]; then
-    echo "❌ Checkpoint not found: ${CKPT_PATH}"
+    log "❌ Checkpoint not found: ${CKPT_PATH}"
     continue
   fi
 
-  echo ""
-  echo "----------------------------------------------"
-  echo "▶ Evaluating ${CKPT}"
-  echo "----------------------------------------------"
+  log ""
+  log "----------------------------------------------"
+  log "▶ Evaluating ${CKPT}"
+  log "----------------------------------------------"
 
+  # Run evaluation and log both stdout and stderr
   python3 train.py \
     --eval_only \
     --calculate_fid \
@@ -66,9 +80,11 @@ for CKPT in "${CHECKPOINTS[@]}"; do
     --output_dir "${OUTPUT_DIR}" \
     --eval_split "${EVAL_SPLIT}" \
     --num_eval_samples "${NUM_SAMPLES}" \
-    --inference_steps "${INFERENCE_STEPS}"
+    --inference_steps "${INFERENCE_STEPS}" \
+    2>&1 | tee -a "${LOG_FILE}"
 
 done
 
-echo ""
-echo "✅ Evaluation completed for all checkpoints"
+log ""
+log "✅ Evaluation completed for all checkpoints"
+log "📄 Full log saved to: ${LOG_FILE}"
