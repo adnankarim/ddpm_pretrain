@@ -851,7 +851,7 @@ def calculate_fid(real_images, fake_images, device):
         print(f"  Warning: FID calculation failed: {e}", flush=True)
         return None
 
-def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid=False, num_inference_steps=200, skip_other_metrics=False):
+def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid_flag=False, num_inference_steps=200, skip_other_metrics=False):
     """
     Calculate evaluation metrics on validation set.
     
@@ -1000,7 +1000,7 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
     # Calculate FID only if enabled (can be slow)
     fid_score = None
     cfid_score = None
-    if calculate_fid:
+    if calculate_fid_flag:
         # Calculate Overall FID (all images regardless of condition)
         if len(all_real_images) > 0 and len(all_generated_images) > 0:
             real_stack = torch.cat(all_real_images, dim=0).to(device)
@@ -1286,7 +1286,7 @@ Examples:
         # Run evaluation
         print("Running evaluation...", flush=True)
         metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples,
-                                  calculate_fid=config.calculate_fid,
+                                  calculate_fid_flag=config.calculate_fid,
                                   num_inference_steps=args.inference_steps,
                                   skip_other_metrics=args.fid_only)
         
@@ -1332,7 +1332,7 @@ Examples:
             metrics = None
             if not config.skip_metrics_during_training:
                 metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
-                                          calculate_fid=config.calculate_fid, 
+                                          calculate_fid_flag=config.calculate_fid, 
                                           num_inference_steps=args.inference_steps,
                                           skip_other_metrics=args.fid_only)
                 
@@ -1414,7 +1414,7 @@ Examples:
             if not config.skip_metrics_during_training:
                 print("  Calculating metrics on validation set...", flush=True)
                 metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
-                                          calculate_fid=config.calculate_fid,
+                                          calculate_fid_flag=config.calculate_fid,
                                           num_inference_steps=args.inference_steps,
                                           skip_other_metrics=args.fid_only)
                 
