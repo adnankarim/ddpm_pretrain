@@ -305,10 +305,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-        for cpd in df['CPD_NAME'].unique():
+            for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-            self.fingerprints[cpd] = self.encoder.encode(smiles)
+                self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -367,7 +367,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-        ctrls = self.batch_map[batch]['ctrl']
+            ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -919,6 +919,11 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
     
     print(f"  Using {len(all_samples)} samples for evaluation (requested: {num_samples})", flush=True)
     
+    # Warn if fewer samples available than requested
+    if len(all_samples) < num_samples:
+        print(f"  ⚠ WARNING: Only {len(all_samples)} samples available in evaluation split, less than requested {num_samples}", flush=True)
+        print(f"  ⚠ Metrics may be less reliable with fewer samples. Consider using a different split or reducing --num_eval_samples", flush=True)
+    
     sample_count = 0
     with torch.no_grad():
         # Add progress bar for evaluation
@@ -1108,6 +1113,7 @@ Examples:
     parser.add_argument("--inference_steps", type=int, default=200, help="Number of inference steps for generation (default: 200, use 1000 for full quality)")
     parser.add_argument("--fid_only", action="store_true", help="Only calculate FID metrics (skip KL, MSE, PSNR, SSIM for faster evaluation)")
     parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], help="Data split to use for evaluation (default: val, falls back to test if val is empty)")
+    parser.add_argument("--num_eval_samples", type=int, default=1000, help="Max number of samples to use for evaluation metrics (default: 1000)")
     args = parser.parse_args()
     
     config = Config()
@@ -1279,7 +1285,7 @@ Examples:
         
         # Run evaluation
         print("Running evaluation...", flush=True)
-        metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000,
+        metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples,
                                   calculate_fid=config.calculate_fid,
                                   num_inference_steps=args.inference_steps,
                                   skip_other_metrics=args.fid_only)
@@ -1325,7 +1331,7 @@ Examples:
             
             metrics = None
             if not config.skip_metrics_during_training:
-                metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
                                           calculate_fid=config.calculate_fid, 
                                           num_inference_steps=args.inference_steps,
                                           skip_other_metrics=args.fid_only)
@@ -1407,7 +1413,7 @@ Examples:
             # Calculate metrics only if not skipped
             if not config.skip_metrics_during_training:
                 print("  Calculating metrics on validation set...", flush=True)
-                metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000, 
+                metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
                                           calculate_fid=config.calculate_fid,
                                           num_inference_steps=args.inference_steps,
                                           skip_other_metrics=args.fid_only)
