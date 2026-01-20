@@ -305,10 +305,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-        for cpd in df['CPD_NAME'].unique():
+            for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-            self.fingerprints[cpd] = self.encoder.encode(smiles)
+                self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -367,7 +367,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-        ctrls = self.batch_map[batch]['ctrl']
+            ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -851,7 +851,7 @@ def calculate_fid(real_images, fake_images, device):
         print(f"  Warning: FID calculation failed: {e}", flush=True)
         return None
 
-def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid_flag=False, num_inference_steps=200, skip_other_metrics=False):
+def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid_flag=False, num_inference_steps=200, skip_other_metrics=False, direction="theta"):
     """
     Calculate evaluation metrics on validation set.
     
@@ -935,9 +935,19 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             ctrl = sample['control'].to(device)
             real_t = sample['perturbed'].to(device)
             fp = sample['fingerprint'].to(device)
+
+            # Choose conditioning image and target image based on direction
+            if direction == "theta":
+                # p_theta(X | Y, c): condition=control (Y), target=treated (X)
+                cond_img = ctrl
+                target_img = real_t
+            else:
+                # p_phi(Y | X, c): condition=treated (X), target=control (Y)
+                cond_img = real_t
+                target_img = ctrl
             
             # Generate samples with specified inference steps
-            generated = model.sample(ctrl, fp, num_inference_steps=num_inference_steps)
+            generated = model.sample(cond_img, fp, num_inference_steps=num_inference_steps)
             
             # Calculate other metrics only if not skipping
             if not skip_other_metrics:
@@ -945,35 +955,37 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
                 # Sample a random timestep and compute KL
                 b = ctrl.shape[0]
                 t = torch.randint(0, model.timesteps, (b,), device=device).long()
-                noise = torch.randn_like(real_t)
+                noise = torch.randn_like(target_img)
                 # Use scheduler's add_noise for consistency
-                xt = model.noise_scheduler.add_noise(real_t, noise, t)
-                noise_pred = model.model(xt, t, ctrl, fp)
+                xt = model.noise_scheduler.add_noise(target_img, noise, t)
+
+                # Match model call to training direction
+                noise_pred = model.model(xt, t, cond_img, fp)
+
                 kl = calculate_kl_divergence(noise_pred, noise)
                 metrics['kl_divergence'].append(kl)
                 
-                # Calculate MSE between generated and real
-                mse = F.mse_loss(generated, real_t).item()
+                # Calculate MSE between generated and true target
+                mse = F.mse_loss(generated, target_img).item()
                 metrics['mse'].append(mse)
             
             # Collect images for FID only if enabled (saves memory and time)
-            if calculate_fid:
+            if calculate_fid_flag:
                 # Collect images for overall FID (keep on device for efficiency)
-                all_real_images.append(real_t)
+                all_real_images.append(target_img)
                 all_generated_images.append(generated)
                 
                 # Group by condition for conditional FID
-                # Create a hash of control and fingerprint to group similar conditions
+                # Create a hash of (conditioning image, fingerprint) to group similar conditions
                 for i in range(b):
-                    # Use a simple hash: mean of control and fingerprint
-                    ctrl_hash = tuple(ctrl[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2))
-                    fp_hash = tuple(fp[i].cpu().numpy()[:10].round(decimals=2))  # Use first 10 dims for hash
-                    cond_key = (ctrl_hash, fp_hash)
+                    cond_mean = cond_img[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2)
+                    fp_head = fp[i].cpu().numpy()[:10].round(decimals=2)  # Use first 10 dims for hash
+                    cond_key = (tuple(cond_mean), tuple(fp_head))
                     
                     if cond_key not in condition_groups:
                         condition_groups[cond_key] = {'real': [], 'gen': []}
                     
-                    condition_groups[cond_key]['real'].append(real_t[i:i+1])
+                    condition_groups[cond_key]['real'].append(target_img[i:i+1])
                     condition_groups[cond_key]['gen'].append(generated[i:i+1])
             
             # Calculate PSNR and SSIM if available (only if not skipping)
@@ -981,7 +993,7 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
                 for i in range(generated.shape[0]):
                     # Convert to numpy [0, 255] range
                     gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                    real_np = ((real_t[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                    real_np = ((target_img[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
                     
                     # Convert to grayscale for SSIM
                     gen_gray = np.mean(gen_np, axis=2)
@@ -1114,6 +1126,13 @@ Examples:
     parser.add_argument("--fid_only", action="store_true", help="Only calculate FID metrics (skip KL, MSE, PSNR, SSIM for faster evaluation)")
     parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], help="Data split to use for evaluation (default: val, falls back to test if val is empty)")
     parser.add_argument("--num_eval_samples", type=int, default=1000, help="Max number of samples to use for evaluation metrics (default: 1000)")
+    parser.add_argument(
+        "--direction",
+        type=str,
+        default="theta",
+        choices=["theta", "phi"],
+        help="theta: train p(X|Y,c) (treated|control). phi: train p(Y|X,c) (control|treated, specular)."
+    )
     args = parser.parse_args()
     
     config = Config()
@@ -1132,6 +1151,11 @@ Examples:
     if args.output_dir:
         config.output_dir = args.output_dir
         print(f"Using output directory: {config.output_dir}")
+
+    # Use separate output directory for specular (phi) model so checkpoints don't collide
+    if args.direction == "phi":
+        config.output_dir = config.output_dir + "_phi"
+        print(f"[Specular training] Saving to: {config.output_dir}")
     
     os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
     os.makedirs(f"{config.output_dir}/checkpoints", exist_ok=True)
@@ -1148,8 +1172,8 @@ Examples:
     encoder = MorganFingerprintEncoder()
     train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder, paths_csv=args.paths_csv)
     if len(train_ds) == 0: train_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='', encoder=encoder, paths_csv=args.paths_csv)
-    val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='val', encoder=encoder, paths_csv=args.paths_csv)
-    if len(val_ds) == 0: val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
+    val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split=args.eval_split, encoder=encoder, paths_csv=args.paths_csv)
+    if len(val_ds) == 0 and args.eval_split == "val": val_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     
     # Log paths.csv status
     print(f"\n{'='*60}", flush=True)
@@ -1285,10 +1309,16 @@ Examples:
         
         # Run evaluation
         print("Running evaluation...", flush=True)
-        metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples,
-                                  calculate_fid_flag=config.calculate_fid,
-                                  num_inference_steps=args.inference_steps,
-                                  skip_other_metrics=args.fid_only)
+        metrics = calculate_metrics(
+            model,
+            val_loader,
+            config.device,
+            num_samples=args.num_eval_samples,
+            calculate_fid_flag=config.calculate_fid,
+            num_inference_steps=args.inference_steps,
+            skip_other_metrics=args.fid_only,
+            direction=args.direction,
+        )
         
         # Print metrics
         print(f"\n{'='*60}", flush=True)
@@ -1331,10 +1361,16 @@ Examples:
             
             metrics = None
             if not config.skip_metrics_during_training:
-                metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
-                                          calculate_fid_flag=config.calculate_fid, 
-                                          num_inference_steps=args.inference_steps,
-                                          skip_other_metrics=args.fid_only)
+                metrics = calculate_metrics(
+                    model,
+                    val_loader,
+                    config.device,
+                    num_samples=args.num_eval_samples,
+                    calculate_fid_flag=config.calculate_fid,
+                    num_inference_steps=args.inference_steps,
+                    skip_other_metrics=args.fid_only,
+                    direction=args.direction,
+                )
                 
                 # Print metrics prominently
                 print(f"\n  📊 EVALUATION METRICS (Resume Checkpoint):", flush=True)
@@ -1361,14 +1397,22 @@ Examples:
             ctrl = batch['control'].to(config.device)
             real_t = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
-            
-            fakes = model.sample(ctrl, fp, num_inference_steps=200)
-            grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
-            resume_grid_path = f"{config.output_dir}/plots/resume_epoch_{start_epoch}.png"
+
+            if args.direction == "theta":
+                # generate treated from control
+                fakes = model.sample(ctrl, fp, num_inference_steps=200)
+                grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)  # cond | gen | real
+                video_cond = ctrl[0:1]
+            else:
+                # generate control from treated (specular)
+                fakes = model.sample(real_t, fp, num_inference_steps=200)
+                grid = torch.cat([real_t[:8], fakes[:8], ctrl[:8]], dim=0)  # cond | gen | real
+                video_cond = real_t[0:1]
+            resume_grid_path = f"{config.output_dir}/plots/{args.direction}_resume_epoch_{start_epoch}.png"
             save_image(grid, resume_grid_path, nrow=8, normalize=True, value_range=(-1,1))
             print(f"  ✓ Resume checkpoint grid saved to: {resume_grid_path}", flush=True)
             
-            generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_resume_epoch_{start_epoch}.mp4")
+            generate_video(model, video_cond, fp[0:1], f"{config.output_dir}/plots/{args.direction}_video_resume_epoch_{start_epoch}.mp4")
             print(f"  ✓ Resume checkpoint video saved", flush=True)
             
             # Log metrics for resume checkpoint
@@ -1393,10 +1437,15 @@ Examples:
         for batch in train_loader:
             optimizer.zero_grad()
             ctrl = batch['control'].to(config.device)
-            target = batch['perturbed'].to(config.device)
+            trt = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
-            
-            loss = model(target, ctrl, fp)
+
+            if args.direction == "theta":
+                # p_theta(X | Y, c): target = treated, condition = control
+                loss = model(trt, ctrl, fp)
+            else:
+                # p_phi(Y | X, c): target = control, condition = treated
+                loss = model(ctrl, trt, fp)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
@@ -1413,10 +1462,16 @@ Examples:
             # Calculate metrics only if not skipped
             if not config.skip_metrics_during_training:
                 print("  Calculating metrics on validation set...", flush=True)
-                metrics = calculate_metrics(model, val_loader, config.device, num_samples=args.num_eval_samples, 
-                                          calculate_fid_flag=config.calculate_fid,
-                                          num_inference_steps=args.inference_steps,
-                                          skip_other_metrics=args.fid_only)
+                metrics = calculate_metrics(
+                    model,
+                    val_loader,
+                    config.device,
+                    num_samples=args.num_eval_samples,
+                    calculate_fid_flag=config.calculate_fid,
+                    num_inference_steps=args.inference_steps,
+                    skip_other_metrics=args.fid_only,
+                    direction=args.direction,
+                )
                 
                 # Print metrics prominently
                 print(f"\n  📊 EVALUATION METRICS:", flush=True)
@@ -1449,15 +1504,23 @@ Examples:
             ctrl = batch['control'].to(config.device)
             real_t = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
-            
+
             # Use fewer inference steps for faster evaluation (can increase later)
-            fakes = model.sample(ctrl, fp, num_inference_steps=200)
-            
-            grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)
-            save_image(grid, f"{config.output_dir}/plots/epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
-            print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/epoch_{epoch+1}.png", flush=True)
-            generate_video(model, ctrl[0:1], fp[0:1], f"{config.output_dir}/plots/video_{epoch+1}.mp4")
-            print(f"  ✓ Video saved to: {config.output_dir}/plots/video_{epoch+1}.mp4", flush=True)
+            if args.direction == "theta":
+                # generate treated from control
+                fakes = model.sample(ctrl, fp, num_inference_steps=200)
+                grid = torch.cat([ctrl[:8], fakes[:8], real_t[:8]], dim=0)  # cond | gen | real
+                video_cond = ctrl[0:1]
+            else:
+                # generate control from treated
+                fakes = model.sample(real_t, fp, num_inference_steps=200)
+                grid = torch.cat([real_t[:8], fakes[:8], ctrl[:8]], dim=0)  # cond | gen | real
+                video_cond = real_t[0:1]
+            tag = args.direction
+            save_image(grid, f"{config.output_dir}/plots/{tag}_epoch_{epoch+1}.png", nrow=8, normalize=True, value_range=(-1,1))
+            print(f"  ✓ Sample grid saved to: {config.output_dir}/plots/{tag}_epoch_{epoch+1}.png", flush=True)
+            generate_video(model, video_cond, fp[0:1], f"{config.output_dir}/plots/{tag}_video_{epoch+1}.mp4")
+            print(f"  ✓ Video saved to: {config.output_dir}/plots/{tag}_video_{epoch+1}.mp4", flush=True)
 
         # Step scheduler
         scheduler.step()
