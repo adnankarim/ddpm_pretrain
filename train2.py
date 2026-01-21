@@ -16,6 +16,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
 from pathlib import Path
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+from tqdm import tqdm
 
 # --- Plotting Backend (Prevents crashes on headless servers) ---
 import matplotlib
@@ -103,7 +106,14 @@ class TrainingLogger:
             'psnr': [],
             'ssim': [],
             'fid': [],
+            'ssim': [],
+            'fid': [],
             'cfid': [],
+            'kid_mean': [],
+            'kid_std': [],
+            'avg_fid': [],
+            'avg_kid_mean': [],
+            'avg_kid_std': [],
             'learning_rate': []
         }
         self.csv_path = os.path.join(save_dir, "training_history.csv")
@@ -134,12 +144,22 @@ class TrainingLogger:
             self.history['ssim'].append(metrics.get('ssim', None))
             self.history['fid'].append(metrics.get('fid', None))
             self.history['cfid'].append(metrics.get('cfid', None))
+            self.history['kid_mean'].append(metrics.get('kid_mean', None))
+            self.history['kid_std'].append(metrics.get('kid_std', None))
+            self.history['avg_fid'].append(metrics.get('avg_fid', None))
+            self.history['avg_kid_mean'].append(metrics.get('avg_kid_mean', None))
+            self.history['avg_kid_std'].append(metrics.get('avg_kid_std', None))
         else:
             self.history['kl_divergence'].append(None)
             self.history['psnr'].append(None)
             self.history['ssim'].append(None)
             self.history['fid'].append(None)
             self.history['cfid'].append(None)
+            self.history['kid_mean'].append(None)
+            self.history['kid_std'].append(None)
+            self.history['avg_fid'].append(None)
+            self.history['avg_kid_mean'].append(None)
+            self.history['avg_kid_std'].append(None)
         
         # Save to CSV immediately
         df = pd.DataFrame(self.history)
@@ -154,7 +174,12 @@ class TrainingLogger:
                 'psnr': metrics.get('psnr'),
                 'ssim': metrics.get('ssim'),
                 'fid': metrics.get('fid'),
-                'cfid': metrics.get('cfid')
+                'kid_mean': metrics.get('kid_mean'),
+                'kid_std': metrics.get('kid_std'),
+                'cfid': metrics.get('cfid'), # This will now be average per-class FID
+                'avg_fid': metrics.get('avg_fid'), # Same as cfid basically, but explicit
+                'avg_kid_mean': metrics.get('avg_kid_mean'),
+                'avg_kid_std': metrics.get('avg_kid_std')
             }])
             metrics_csv = os.path.join(self.save_dir, "evaluation_metrics.csv")
             # Append to file if it exists, otherwise create new
@@ -793,63 +818,6 @@ def calculate_kl_divergence(noise_pred, noise_true):
     kl = 0.5 * mse
     return kl.item()
 
-def calculate_fid(real_images, fake_images, device):
-    """
-    Calculate Fréchet Inception Distance (FID) between real and generated images.
-    
-    Args:
-        real_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
-        fake_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
-        device: torch device
-    
-    Returns:
-        FID score (float) or None if calculation fails
-    """
-    try:
-        from torchvision.models import inception_v3
-        from scipy import linalg
-        
-        # Load Inception v3 model
-        inception = inception_v3(pretrained=True, transform_input=False).to(device)
-        inception.eval()
-        inception.fc = torch.nn.Identity()  # Remove final classification layer
-        
-        def get_features(images):
-            """Extract features from Inception v3"""
-            # Normalize to [0, 1] for Inception
-            img_norm = (images + 1.0) / 2.0
-            # Resize to 299x299 (Inception input size)
-            img_resized = torch.nn.functional.interpolate(
-                img_norm, size=(299, 299), mode='bilinear', align_corners=False
-            )
-            with torch.no_grad():
-                features = inception(img_resized)
-            return features.cpu().numpy()
-        
-        # Extract features
-        real_features = get_features(real_images)
-        fake_features = get_features(fake_images)
-        
-        # Calculate mean and covariance
-        mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = fake_features.mean(axis=0), np.cov(fake_features, rowvar=False)
-        
-        # Calculate FID
-        diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-        if not np.isfinite(covmean).all():
-            # Handle numerical issues
-            offset = np.eye(sigma1.shape[0]) * 1e-6
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return float(np.real(fid))
-        
-    except ImportError:
-        return None
-    except Exception as e:
-        print(f"  Warning: FID calculation failed: {e}", flush=True)
-        return None
 
 def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid_flag=False, num_inference_steps=200, skip_other_metrics=False, direction="theta"):
     """
@@ -860,12 +828,12 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
         val_loader: Validation data loader
         device: torch device
         num_samples: Number of samples to use for evaluation
-        calculate_fid: If True, calculate FID and cFID (slower). If False, skip FID calculation.
-        num_inference_steps: Number of inference steps for generation (default: 200)
-        skip_other_metrics: If True, skip KL, MSE, PSNR, SSIM and only calculate FID (faster)
+        calculate_fid_flag: If True, calculate FID and KID (slower).
+        num_inference_steps: Number of inference steps for generation
+        skip_other_metrics: If True, skip KL, MSE, PSNR, SSIM and only calculate FID/KID
     
     Returns:
-        dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim', 'fid', 'cfid'
+        dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim', 'fid', 'kid', 'cfid', 'avg_fid', ...
     """
     model.model.eval()
     metrics = {
@@ -873,8 +841,13 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
         'mse': [],
         'psnr': [],
         'ssim': [],
-        'fid': [],
-        'cfid': []
+        'fid': None,
+        'kid_mean': None,
+        'kid_std': None,
+        'cfid': None,
+        'avg_fid': None,
+        'avg_kid_mean': None,
+        'avg_kid_std': None
     }
     
     # Try to import scikit-image for SSIM/PSNR
@@ -885,21 +858,18 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
     except ImportError:
         SKIMAGE_AVAILABLE = False
     
-    # Collect all real and generated images for overall FID
-    all_real_images = []
-    all_generated_images = []
+    # Initialize FID and KID metrics if enabled
+    if calculate_fid_flag:
+        fid_metric = FrechetInceptionDistance(normalize=True).to(device)
+        kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(device)
     
-    # Collect per-condition images for conditional FID
-    # Group by condition (control + fingerprint combination)
-    condition_groups = {}  # (ctrl_hash, fp_hash) -> {'real': [...], 'gen': [...]}
-    
-    # Collect all batches first, then randomly sample
+    # Collect all batches first, then randomly sample to respect num_samples
     all_batches = []
     with torch.no_grad():
         for batch in val_loader:
             all_batches.append(batch)
     
-    # Flatten all samples and randomly sample
+    # Flatten all samples
     all_samples = []
     for batch in all_batches:
         b_size = batch['control'].shape[0]
@@ -907,27 +877,25 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             all_samples.append({
                 'control': batch['control'][i:i+1],
                 'perturbed': batch['perturbed'][i:i+1],
-                'fingerprint': batch['fingerprint'][i:i+1]
+                'fingerprint': batch['fingerprint'][i:i+1],
+                'compound': batch['compound'][i]
             })
     
     # Randomly sample up to num_samples
     if len(all_samples) > num_samples:
         import random
-        random.seed(42)  # For reproducibility
+        random.seed(42)
         sampled_indices = random.sample(range(len(all_samples)), num_samples)
         all_samples = [all_samples[i] for i in sampled_indices]
     
     print(f"  Using {len(all_samples)} samples for evaluation (requested: {num_samples})", flush=True)
     
-    # Warn if fewer samples available than requested
-    if len(all_samples) < num_samples:
-        print(f"  ⚠ WARNING: Only {len(all_samples)} samples available in evaluation split, less than requested {num_samples}", flush=True)
-        print(f"  ⚠ Metrics may be less reliable with fewer samples. Consider using a different split or reducing --num_eval_samples", flush=True)
+    # Data structures for per-class FID/KID
+    # compound -> {'gen': [], 'real': []}
+    class_samples = {}
     
     sample_count = 0
     with torch.no_grad():
-        # Add progress bar for evaluation
-        from tqdm.auto import tqdm
         for sample in tqdm(all_samples, desc="  Evaluating", leave=False):
             if sample_count >= num_samples:
                 break
@@ -935,123 +903,162 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             ctrl = sample['control'].to(device)
             real_t = sample['perturbed'].to(device)
             fp = sample['fingerprint'].to(device)
+            化合物 = sample['compound'] # compound name
 
             # Choose conditioning image and target image based on direction
             if direction == "theta":
-                # p_theta(X | Y, c): condition=control (Y), target=treated (X)
                 cond_img = ctrl
                 target_img = real_t
             else:
-                # p_phi(Y | X, c): condition=treated (X), target=control (Y)
                 cond_img = real_t
                 target_img = ctrl
             
-            # Generate samples with specified inference steps
+            # Generate samples
             generated = model.sample(cond_img, fp, num_inference_steps=num_inference_steps)
             
-            # Calculate other metrics only if not skipping
+            # ----------------------------------------------------------------
+            # 1. Standard Metrics (KL, MSE, PSNR, SSIM)
+            # ----------------------------------------------------------------
             if not skip_other_metrics:
-                # Calculate KL divergence (using forward pass on a sample)
-                # Sample a random timestep and compute KL
+                # KL Divergence (approx)
                 b = ctrl.shape[0]
                 t = torch.randint(0, model.timesteps, (b,), device=device).long()
                 noise = torch.randn_like(target_img)
-                # Use scheduler's add_noise for consistency
                 xt = model.noise_scheduler.add_noise(target_img, noise, t)
-
-                # Match model call to training direction
                 noise_pred = model.model(xt, t, cond_img, fp)
-
                 kl = calculate_kl_divergence(noise_pred, noise)
                 metrics['kl_divergence'].append(kl)
                 
-                # Calculate MSE between generated and true target
+                # MSE
                 mse = F.mse_loss(generated, target_img).item()
                 metrics['mse'].append(mse)
-            
-            # Collect images for FID only if enabled (saves memory and time)
+
+                # PSNR / SSIM
+                if SKIMAGE_AVAILABLE:
+                    for i in range(generated.shape[0]):
+                        gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                        real_np = ((target_img[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                        gen_gray = np.mean(gen_np, axis=2)
+                        real_gray = np.mean(real_np, axis=2)
+                        
+                        metrics['ssim'].append(ssim(real_gray, gen_gray, data_range=255))
+                        metrics['psnr'].append(psnr(real_np, gen_np, data_range=255))
+
+            # ----------------------------------------------------------------
+            # 2. FID / KID Preparation
+            # ----------------------------------------------------------------
             if calculate_fid_flag:
-                # Collect images for overall FID (keep on device for efficiency)
-                all_real_images.append(target_img)
-                all_generated_images.append(generated)
+                # Preprocess as per paper implementation: [-1, 1] -> [0, 1] quantized
+                # Real
+                real_norm = torch.clamp(target_img * 0.5 + 0.5, min=0.0, max=1.0)
+                real_norm = torch.floor(real_norm * 255).to(torch.float32) / 255.0
                 
-                # Group by condition for conditional FID
-                # Create a hash of (conditioning image, fingerprint) to group similar conditions
-                for i in range(b):
-                    cond_mean = cond_img[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2)
-                    fp_head = fp[i].cpu().numpy()[:10].round(decimals=2)  # Use first 10 dims for hash
-                    cond_key = (tuple(cond_mean), tuple(fp_head))
-                    
-                    if cond_key not in condition_groups:
-                        condition_groups[cond_key] = {'real': [], 'gen': []}
-                    
-                    condition_groups[cond_key]['real'].append(target_img[i:i+1])
-                    condition_groups[cond_key]['gen'].append(generated[i:i+1])
-            
-            # Calculate PSNR and SSIM if available (only if not skipping)
-            if not skip_other_metrics and SKIMAGE_AVAILABLE:
-                for i in range(generated.shape[0]):
-                    # Convert to numpy [0, 255] range
-                    gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                    real_np = ((target_img[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                    
-                    # Convert to grayscale for SSIM
-                    gen_gray = np.mean(gen_np, axis=2)
-                    real_gray = np.mean(real_np, axis=2)
-                    
-                    # Calculate SSIM
-                    ssim_val = ssim(real_gray, gen_gray, data_range=255)
-                    metrics['ssim'].append(ssim_val)
-                    
-                    # Calculate PSNR
-                    psnr_val = psnr(real_np, gen_np, data_range=255)
-                    metrics['psnr'].append(psnr_val)
+                # Generated
+                gen_norm = torch.clamp(generated * 0.5 + 0.5, min=0.0, max=1.0)
+                gen_norm = torch.floor(gen_norm * 255).to(torch.float32) / 255.0
+                
+                # Update Overall Metrics
+                fid_metric.update(real_norm, real=True)
+                fid_metric.update(gen_norm, real=False)
+                kid_metric.update(real_norm, real=True)
+                kid_metric.update(gen_norm, real=False)
+                
+                # Store for Per-Class
+                if 化合物 not in class_samples:
+                    class_samples[化合物] = {'gen': [], 'real': []}
+                
+                # Move to CPU to save memory during loop
+                class_samples[化合物]['real'].append(real_norm.cpu())
+                class_samples[化合物]['gen'].append(gen_norm.cpu())
             
             sample_count += generated.shape[0]
+
+    # ----------------------------------------------------------------
+    # 3. Compute Final Metrics
+    # ----------------------------------------------------------------
     
-    # Calculate FID only if enabled (can be slow)
-    fid_score = None
-    cfid_score = None
+    # Average standard metrics
+    metrics['kl_divergence'] = np.mean(metrics['kl_divergence']) if metrics['kl_divergence'] else None
+    metrics['mse'] = np.mean(metrics['mse']) if metrics['mse'] else None
+    metrics['psnr'] = np.mean(metrics['psnr']) if metrics['psnr'] else None
+    metrics['ssim'] = np.mean(metrics['ssim']) if metrics['ssim'] else None
+    
     if calculate_fid_flag:
-        # Calculate Overall FID (all images regardless of condition)
-        if len(all_real_images) > 0 and len(all_generated_images) > 0:
-            real_stack = torch.cat(all_real_images, dim=0).to(device)
-            fake_stack = torch.cat(all_generated_images, dim=0).to(device)
-            # Need at least 2 samples for FID
-            if real_stack.shape[0] >= 2 and fake_stack.shape[0] >= 2:
-                print("  Calculating Overall FID...", flush=True)
-                fid_score = calculate_fid(real_stack, fake_stack, device)
-                if fid_score is not None:
-                    metrics['fid'].append(fid_score)
+        print("  Calculating Overall FID/KID...", flush=True)
+        # Compute Overall
+        try:
+            metrics['fid'] = fid_metric.compute().item()
+            kid_mean, kid_std = kid_metric.compute()
+            metrics['kid_mean'] = kid_mean.item()
+            metrics['kid_std'] = kid_std.item()
+            print(f"    Overall FID: {metrics['fid']:.4f}", flush=True)
+            print(f"    Overall KID: {metrics['kid_mean']:.5f} (±{metrics['kid_std']:.5f})", flush=True)
+        except Exception as e:
+            print(f"    Warning: Overall FID/KID calculation failed: {e}", flush=True)
+
+        # Compute Per-Class (FID c)
+        print("  Calculating Per-Class FID/KID...", flush=True)
+        fid_per_class = {}
+        kid_per_class = {}
         
-        # Calculate Conditional FID (per-condition comparison)
-        cfid_scores = []
-        if len(condition_groups) > 0:
-            print(f"  Calculating Conditional FID across {len(condition_groups)} conditions...", flush=True)
-            for cond_key, group in condition_groups.items():
-                if len(group['real']) >= 2 and len(group['gen']) >= 2:
-                    real_cond = torch.cat(group['real'], dim=0).to(device)
-                    gen_cond = torch.cat(group['gen'], dim=0).to(device)
-                    cfid = calculate_fid(real_cond, gen_cond, device)
-                    if cfid is not None:
-                        cfid_scores.append(cfid)
+        # We need a new instance or reset? 
+        # torchmetrics reset() clears state.
         
-        # Average conditional FID across all conditions
-        cfid_score = np.mean(cfid_scores) if len(cfid_scores) > 0 else None
-    else:
-        print("  Skipping FID calculation (use --calculate_fid to enable)", flush=True)
+        for cls, samples in tqdm(class_samples.items(), desc="    Classes", leave=False):
+            # Skip classes with too few samples
+            if len(samples['real']) < 2 or len(samples['gen']) < 2:
+                continue
+                
+            # Stack and move to device
+            real_stack = torch.cat(samples['real'], dim=0).to(device)
+            gen_stack = torch.cat(samples['gen'], dim=0).to(device)
+            
+            # Reset metrics
+            fid_metric.reset()
+            kid_metric.reset() # KID might need reset too
+            
+            # Update with class samples
+            fid_metric.update(real_stack, real=True)
+            fid_metric.update(gen_stack, real=False)
+            
+            # KID subset size adjustment
+            current_subset_size = min(len(samples['gen']), 100)
+            # We can't easily change subset_size of existing metric without re-init?
+            # Creating new instance per class is safer for KID subset_size
+            kid_metric_class = KernelInceptionDistance(subset_size=current_subset_size, normalize=True).to(device)
+            kid_metric_class.update(real_stack, real=True)
+            kid_metric_class.update(gen_stack, real=False)
+            
+            try:
+                # FID
+                val_fid = fid_metric.compute().item()
+                fid_per_class[cls] = val_fid
+                
+                # KID
+                val_kid_mu, val_kid_sigma = kid_metric_class.compute()
+                kid_per_class[cls] = {'mean': val_kid_mu.item(), 'std': val_kid_sigma.item()}
+            except Exception as e:
+                # print(f"Warning: Failed for class {cls}: {e}")
+                continue
+        
+        # Calculate Averages (FID c / Average KID)
+        if fid_per_class:
+            avg_fid = np.mean(list(fid_per_class.values()))
+            metrics['cfid'] = avg_fid # Storing as cfid to match existing logging key expectation if any
+            metrics['avg_fid'] = avg_fid
+            print(f"    Average FID (FID c): {avg_fid:.4f}", flush=True)
+        
+        if kid_per_class:
+            avg_kid_mean = np.mean([v['mean'] for v in kid_per_class.values()])
+            avg_kid_std = np.mean([v['std'] for v in kid_per_class.values()])
+            metrics['avg_kid_mean'] = avg_kid_mean
+            metrics['avg_kid_std'] = avg_kid_std
+            print(f"    Average KID: {avg_kid_mean:.5f} (±{avg_kid_std:.5f})", flush=True)
+            
+        # Log to file detailed breakdown if needed? 
+        # (Maybe to a separate JSON like snippet? For now staying compatible with current return)
     
-    # Average metrics
-    result = {
-        'kl_divergence': np.mean(metrics['kl_divergence']) if metrics['kl_divergence'] else None,
-        'mse': np.mean(metrics['mse']) if metrics['mse'] else None,
-        'psnr': np.mean(metrics['psnr']) if metrics['psnr'] else None,
-        'ssim': np.mean(metrics['ssim']) if metrics['ssim'] else None,
-        'fid': fid_score if fid_score is not None else None,
-        'cfid': cfid_score if cfid_score is not None else None
-    }
-    
-    return result
+    return metrics
 
 # ============================================================================
 # UTILITIES
@@ -1335,8 +1342,12 @@ Examples:
                 print(f"  SSIM:              {metrics['ssim']:.4f}", flush=True)
         if metrics['fid'] is not None:
             print(f"  FID (Overall):     {metrics['fid']:.2f}", flush=True)
+        if metrics['kid_mean'] is not None:
+            print(f"  KID (Overall):     {metrics['kid_mean']:.5f} (±{metrics['kid_std']:.5f})", flush=True)
         if metrics['cfid'] is not None:
             print(f"  cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+        if metrics['avg_kid_mean'] is not None:
+            print(f"  Avg KID (Per-Class): {metrics['avg_kid_mean']:.5f} (±{metrics['avg_kid_std']:.5f})", flush=True)
         print(f"{'='*60}", flush=True)
         
         # Log metrics
@@ -1385,8 +1396,12 @@ Examples:
                     print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
                 if metrics['fid'] is not None:
                     print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+                if metrics['kid_mean'] is not None:
+                    print(f"    KID (Overall):     {metrics['kid_mean']:.5f} (±{metrics['kid_std']:.5f})", flush=True)
                 if metrics['cfid'] is not None:
                     print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+                if metrics['avg_kid_mean'] is not None:
+                    print(f"    Avg KID (Per-Class): {metrics['avg_kid_mean']:.5f} (±{metrics['avg_kid_std']:.5f})", flush=True)
                 print(f"  {'-'*58}", flush=True)
             else:
                 print("  Skipping metric calculations (only generating samples/video)...", flush=True)
@@ -1486,8 +1501,12 @@ Examples:
                     print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
                 if metrics['fid'] is not None:
                     print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+                if metrics['kid_mean'] is not None:
+                    print(f"    KID (Overall):     {metrics['kid_mean']:.5f} (±{metrics['kid_std']:.5f})", flush=True)
                 if metrics['cfid'] is not None:
                     print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+                if metrics['avg_kid_mean'] is not None:
+                    print(f"    Avg KID (Per-Class): {metrics['avg_kid_mean']:.5f} (±{metrics['avg_kid_std']:.5f})", flush=True)
                 print(f"  {'-'*58}", flush=True)
                 print(f"  ✓ Metrics saved to: {logger.csv_path}", flush=True)
                 print(f"  ✓ Metrics also saved to: {logger.metrics_csv_path}", flush=True)
@@ -1549,6 +1568,8 @@ Examples:
                     log_dict['ssim'] = metrics['ssim']
                 if metrics['fid'] is not None:
                     log_dict['fid'] = metrics['fid']
+                if metrics['kid_mean'] is not None:
+                    log_dict['kid_mean'] = metrics['kid_mean']
                 if metrics['cfid'] is not None:
                     log_dict['cfid'] = metrics['cfid']
             wandb.log(log_dict)

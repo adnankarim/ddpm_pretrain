@@ -21,6 +21,9 @@ from pathlib import Path
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for headless servers
 import matplotlib.pyplot as plt
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.kid import KernelInceptionDistance
+from tqdm import tqdm
 
 # --- NEW IMPORTS ---
 try:
@@ -305,10 +308,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-        for cpd in df['CPD_NAME'].unique():
+            for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-            self.fingerprints[cpd] = self.encoder.encode(smiles)
+                self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths
@@ -793,79 +796,10 @@ def calculate_kl_divergence(noise_pred, noise_true):
     kl = 0.5 * mse
     return kl.item()
 
-def calculate_fid(real_images, fake_images, device):
-    """
-    Calculate Fréchet Inception Distance (FID) between real and generated images.
-    
-    Args:
-        real_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
-        fake_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
-        device: torch device
-    
-    Returns:
-        FID score (float) or None if calculation fails
-    """
-    try:
-        from torchvision.models import inception_v3
-        from scipy import linalg
-        
-        # Load Inception v3 model
-        inception = inception_v3(pretrained=True, transform_input=False).to(device)
-        inception.eval()
-        inception.fc = torch.nn.Identity()  # Remove final classification layer
-        
-        def get_features(images):
-            """Extract features from Inception v3"""
-            # Normalize to [0, 1] for Inception
-            img_norm = (images + 1.0) / 2.0
-            # Resize to 299x299 (Inception input size)
-            img_resized = torch.nn.functional.interpolate(
-                img_norm, size=(299, 299), mode='bilinear', align_corners=False
-            )
-            with torch.no_grad():
-                features = inception(img_resized)
-            return features.cpu().numpy()
-        
-        # Extract features
-        real_features = get_features(real_images)
-        fake_features = get_features(fake_images)
-        
-        # Calculate mean and covariance
-        mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = fake_features.mean(axis=0), np.cov(fake_features, rowvar=False)
-        
-        # Calculate FID
-        diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-        if not np.isfinite(covmean).all():
-            # Handle numerical issues
-            offset = np.eye(sigma1.shape[0]) * 1e-6
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return float(np.real(fid))
-        
-    except ImportError:
-        return None
-    except Exception as e:
-        print(f"  Warning: FID calculation failed: {e}", flush=True)
-        return None
-
 def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid_flag=False, num_inference_steps=200, skip_other_metrics=False):
     """
-    Calculate evaluation metrics on validation set.
-    
-    Args:
-        model: The diffusion model
-        val_loader: Validation data loader
-        device: torch device
-        num_samples: Number of samples to use for evaluation
-        calculate_fid: If True, calculate FID and cFID (slower). If False, skip FID calculation.
-        num_inference_steps: Number of inference steps for generation (default: 200)
-        skip_other_metrics: If True, skip KL, MSE, PSNR, SSIM and only calculate FID (faster)
-    
-    Returns:
-        dict with keys: 'kl_divergence', 'mse', 'psnr', 'ssim', 'fid', 'cfid'
+    Calculate evaluation metrics on validation set using torchmetrics.
+    Correctly aligns with train2.py logic for FID and FIDc (Per-Class).
     """
     model.model.eval()
     metrics = {
@@ -873,8 +807,11 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
         'mse': [],
         'psnr': [],
         'ssim': [],
-        'fid': [],
-        'cfid': []
+        'fid': None,
+        'kid_mean': None,
+        'kid_std': None,
+        'cfid': None,
+        'avg_fid': None, # Explicit alias for cfid
     }
     
     # Try to import scikit-image for SSIM/PSNR
@@ -884,22 +821,18 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
         SKIMAGE_AVAILABLE = True
     except ImportError:
         SKIMAGE_AVAILABLE = False
+
+    # Initialize Metrics
+    if calculate_fid_flag:
+        fid_metric = FrechetInceptionDistance(normalize=True).to(device)
+        kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(device)
     
-    # Collect all real and generated images for overall FID
-    all_real_images = []
-    all_generated_images = []
-    
-    # Collect per-condition images for conditional FID
-    # Group by condition (control + fingerprint combination)
-    condition_groups = {}  # (ctrl_hash, fp_hash) -> {'real': [...], 'gen': [...]}
-    
-    # Collect all batches first, then randomly sample
+    # Collect all samples
     all_batches = []
     with torch.no_grad():
         for batch in val_loader:
             all_batches.append(batch)
     
-    # Flatten all samples and randomly sample
     all_samples = []
     for batch in all_batches:
         b_size = batch['control'].shape[0]
@@ -907,27 +840,25 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             all_samples.append({
                 'control': batch['control'][i:i+1],
                 'perturbed': batch['perturbed'][i:i+1],
-                'fingerprint': batch['fingerprint'][i:i+1]
+                'fingerprint': batch['fingerprint'][i:i+1],
+                'compound': batch['compound'][i]
             })
     
-    # Randomly sample up to num_samples
+    # Random subsample
     if len(all_samples) > num_samples:
         import random
-        random.seed(42)  # For reproducibility
+        random.seed(42)
         sampled_indices = random.sample(range(len(all_samples)), num_samples)
         all_samples = [all_samples[i] for i in sampled_indices]
     
-    print(f"  Using {len(all_samples)} samples for evaluation (requested: {num_samples})", flush=True)
-    
-    # Warn if fewer samples available than requested
-    if len(all_samples) < num_samples:
-        print(f"  ⚠ WARNING: Only {len(all_samples)} samples available in evaluation split, less than requested {num_samples}", flush=True)
-        print(f"  ⚠ Metrics may be less reliable with fewer samples. Consider using a different split or reducing --num_eval_samples", flush=True)
-    
+    print(f"  Using {len(all_samples)} samples for evaluation (request: {num_samples})", flush=True)
+
+    # Data structures for Per-Class FID (FIDc)
+    # Group by COMPOUND NAME (Correct standard), not instance hash
+    class_samples = {} 
+
     sample_count = 0
     with torch.no_grad():
-        # Add progress bar for evaluation
-        from tqdm.auto import tqdm
         for sample in tqdm(all_samples, desc="  Evaluating", leave=False):
             if sample_count >= num_samples:
                 break
@@ -935,111 +866,104 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
             ctrl = sample['control'].to(device)
             real_t = sample['perturbed'].to(device)
             fp = sample['fingerprint'].to(device)
+            cpd_name = sample['compound']
             
-            # Generate samples with specified inference steps
+            # Generate
             generated = model.sample(ctrl, fp, num_inference_steps=num_inference_steps)
             
-            # Calculate other metrics only if not skipping
+            # --- Standard Metrics ---
             if not skip_other_metrics:
-                # Calculate KL divergence (using forward pass on a sample)
-                # Sample a random timestep and compute KL
+                # KL (Approx)
                 b = ctrl.shape[0]
                 t = torch.randint(0, model.timesteps, (b,), device=device).long()
                 noise = torch.randn_like(real_t)
-                # Use scheduler's add_noise for consistency
                 xt = model.noise_scheduler.add_noise(real_t, noise, t)
                 noise_pred = model.model(xt, t, ctrl, fp)
                 kl = calculate_kl_divergence(noise_pred, noise)
                 metrics['kl_divergence'].append(kl)
                 
-                # Calculate MSE between generated and real
-                mse = F.mse_loss(generated, real_t).item()
-                metrics['mse'].append(mse)
-            
-            # Collect images for FID only if enabled (saves memory and time)
-            if calculate_fid:
-                # Collect images for overall FID (keep on device for efficiency)
-                all_real_images.append(real_t)
-                all_generated_images.append(generated)
+                # MSE
+                metrics['mse'].append(F.mse_loss(generated, real_t).item())
                 
-                # Group by condition for conditional FID
-                # Create a hash of control and fingerprint to group similar conditions
-                for i in range(b):
-                    # Use a simple hash: mean of control and fingerprint
-                    ctrl_hash = tuple(ctrl[i].mean(dim=(1, 2)).cpu().numpy().round(decimals=2))
-                    fp_hash = tuple(fp[i].cpu().numpy()[:10].round(decimals=2))  # Use first 10 dims for hash
-                    cond_key = (ctrl_hash, fp_hash)
-                    
-                    if cond_key not in condition_groups:
-                        condition_groups[cond_key] = {'real': [], 'gen': []}
-                    
-                    condition_groups[cond_key]['real'].append(real_t[i:i+1])
-                    condition_groups[cond_key]['gen'].append(generated[i:i+1])
-            
-            # Calculate PSNR and SSIM if available (only if not skipping)
-            if not skip_other_metrics and SKIMAGE_AVAILABLE:
-                for i in range(generated.shape[0]):
-                    # Convert to numpy [0, 255] range
-                    gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                    real_np = ((real_t[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
-                    
-                    # Convert to grayscale for SSIM
-                    gen_gray = np.mean(gen_np, axis=2)
-                    real_gray = np.mean(real_np, axis=2)
-                    
-                    # Calculate SSIM
-                    ssim_val = ssim(real_gray, gen_gray, data_range=255)
-                    metrics['ssim'].append(ssim_val)
-                    
-                    # Calculate PSNR
-                    psnr_val = psnr(real_np, gen_np, data_range=255)
-                    metrics['psnr'].append(psnr_val)
-            
+                # PSNR/SSIM
+                if SKIMAGE_AVAILABLE:
+                    for i in range(generated.shape[0]):
+                        gen_np = ((generated[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                        real_np = ((real_t[i].cpu().permute(1,2,0) + 1) * 127.5).numpy().astype(np.uint8)
+                        
+                        metrics['psnr'].append(psnr(real_np, gen_np, data_range=255))
+                        
+                        gen_gray = np.mean(gen_np, axis=2)
+                        real_gray = np.mean(real_np, axis=2)
+                        metrics['ssim'].append(ssim(real_gray, gen_gray, data_range=255))
+
+            # --- FID/KID Collection ---
+            if calculate_fid_flag:
+                # Preprocess [-1, 1] -> [0, 1]
+                real_norm = torch.clamp(real_t * 0.5 + 0.5, 0, 1)
+                gen_norm = torch.clamp(generated * 0.5 + 0.5, 0, 1)
+                
+                # Update Overall
+                fid_metric.update(real_norm, real=True)
+                fid_metric.update(gen_norm, real=False)
+                kid_metric.update(real_norm, real=True)
+                kid_metric.update(gen_norm, real=False)
+                
+                # Store for Per-Class
+                if cpd_name not in class_samples:
+                    class_samples[cpd_name] = {'real': [], 'gen': []}
+                class_samples[cpd_name]['real'].append(real_norm.cpu())
+                class_samples[cpd_name]['gen'].append(gen_norm.cpu())
+
             sample_count += generated.shape[0]
-    
-    # Calculate FID only if enabled (can be slow)
-    fid_score = None
-    cfid_score = None
+
+    # --- Compute Final Metrics ---
+    # Avg scalars
+    for k in ['kl_divergence', 'mse', 'psnr', 'ssim']:
+        metrics[k] = np.mean(metrics[k]) if metrics[k] else None
+
     if calculate_fid_flag:
-        # Calculate Overall FID (all images regardless of condition)
-        if len(all_real_images) > 0 and len(all_generated_images) > 0:
-            real_stack = torch.cat(all_real_images, dim=0).to(device)
-            fake_stack = torch.cat(all_generated_images, dim=0).to(device)
-            # Need at least 2 samples for FID
-            if real_stack.shape[0] >= 2 and fake_stack.shape[0] >= 2:
-                print("  Calculating Overall FID...", flush=True)
-                fid_score = calculate_fid(real_stack, fake_stack, device)
-                if fid_score is not None:
-                    metrics['fid'].append(fid_score)
+        print("  Calculating Overall FID/KID...", flush=True)
+        try:
+            metrics['fid'] = fid_metric.compute().item()
+            kid_mu, kid_sigma = kid_metric.compute()
+            metrics['kid_mean'] = kid_mu.item()
+            metrics['kid_std'] = kid_sigma.item()
+            print(f"    Overall FID: {metrics['fid']:.4f}", flush=True)
+        except Exception as e:
+            print(f"    Error calculating overall FID: {e}")
+
+        # Compute Per-Class (FIDc)
+        print("  Calculating Per-Class FID (FIDc)...", flush=True)
+        fid_per_class = []
         
-        # Calculate Conditional FID (per-condition comparison)
-        cfid_scores = []
-        if len(condition_groups) > 0:
-            print(f"  Calculating Conditional FID across {len(condition_groups)} conditions...", flush=True)
-            for cond_key, group in condition_groups.items():
-                if len(group['real']) >= 2 and len(group['gen']) >= 2:
-                    real_cond = torch.cat(group['real'], dim=0).to(device)
-                    gen_cond = torch.cat(group['gen'], dim=0).to(device)
-                    cfid = calculate_fid(real_cond, gen_cond, device)
-                    if cfid is not None:
-                        cfid_scores.append(cfid)
-        
-        # Average conditional FID across all conditions
-        cfid_score = np.mean(cfid_scores) if len(cfid_scores) > 0 else None
-    else:
-        print("  Skipping FID calculation (use --calculate_fid to enable)", flush=True)
-    
-    # Average metrics
-    result = {
-        'kl_divergence': np.mean(metrics['kl_divergence']) if metrics['kl_divergence'] else None,
-        'mse': np.mean(metrics['mse']) if metrics['mse'] else None,
-        'psnr': np.mean(metrics['psnr']) if metrics['psnr'] else None,
-        'ssim': np.mean(metrics['ssim']) if metrics['ssim'] else None,
-        'fid': fid_score if fid_score is not None else None,
-        'cfid': cfid_score if cfid_score is not None else None
-    }
-    
-    return result
+        for cpd, data in tqdm(class_samples.items(), desc="    Classes", leave=False):
+            # Need at least 2 samples
+            if len(data['real']) < 2 or len(data['gen']) < 2:
+                continue
+                
+            r_stack = torch.cat(data['real'], dim=0).to(device)
+            g_stack = torch.cat(data['gen'], dim=0).to(device)
+            
+            # Reset and compute just for this class
+            fid_metric.reset()
+            fid_metric.update(r_stack, real=True)
+            fid_metric.update(g_stack, real=False)
+            
+            try:
+                val = fid_metric.compute().item()
+                fid_per_class.append(val)
+            except: pass
+            
+        if fid_per_class:
+            avg_fid = np.mean(fid_per_class)
+            metrics['cfid'] = avg_fid
+            metrics['avg_fid'] = avg_fid
+            print(f"    Average FID (FIDc): {avg_fid:.4f}", flush=True)
+        else:
+            print("    Warning: No classes had enough samples for FIDc.")
+
+    return metrics
 
 # ============================================================================
 # UTILITIES
