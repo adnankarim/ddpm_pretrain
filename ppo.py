@@ -74,8 +74,8 @@ class Config:
     reward_mc = 3        # Monte Carlo repetitions
     
     # Paths
-    theta_checkpoint = "ddpm_diffusers_results/checkpoints/latest.pt"     # Pretrained Theta
-    phi_checkpoint = "./results_phi_phi/checkpoints/latest.pt"   # Pretrained Phi
+    theta_checkpoint = "./ddpm_diffusers_results/checkpoints/checkpoint_epoch_60.pt"     # Pretrained Theta
+    phi_checkpoint = "./results_phi_phi/checkpoints/checkpoint_epoch_100.pt"   # Pretrained Phi
     output_dir = "ddpm_ddmec_results"
     
     # Evaluation
