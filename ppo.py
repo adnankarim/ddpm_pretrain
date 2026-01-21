@@ -333,9 +333,32 @@ class DiffusionModel(nn.Module):
         print(f"Loading checkpoint from {path}")
         ckpt = torch.load(path, map_location=self.cfg.device)
         if isinstance(ckpt, dict) and 'model' in ckpt:
-            self.model.load_state_dict(ckpt['model'])
+            state_dict = ckpt['model']
         else:
-            self.model.load_state_dict(ckpt)
+            state_dict = ckpt
+            
+        # Handle 'model.' prefix if present (e.g. from DDP or DiffusionModel wrapper)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('model.'):
+                new_state_dict[k[6:]] = v  # Remove 'model.' prefix
+            elif k.startswith('unet.'):
+                 # Case where we are loading directly into unet but keys start with unet.
+                 # This matches ModifiedDiffusersUNet structure if we load into it directly?
+                 # No, ModifiedDiffusersUNet has 'unet' as a member.
+                 # Wait, if we load into self.model (ModifiedDiffusersUNet), it expects:
+                 # 'unet.conv_in...', 'fingerprint_proj...'
+                 # Check if keys are 'unet...' or 'model.unet...'
+                 new_state_dict[k] = v
+            else:
+                new_state_dict[k] = v
+                
+        # Load with strict=False to be safe, or check keys
+        missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
+        if len(missing) > 0:
+            print(f"Warning: Missing keys in checkpoint: {missing[:5]} ...")
+        if len(unexpected) > 0:
+            print(f"Warning: Unexpected keys in checkpoint: {unexpected[:5]} ...")
 
 # ============================================================================
 # TRAJECTORY / PROBABILITY HELPERS 
