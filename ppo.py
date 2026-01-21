@@ -388,7 +388,10 @@ def get_posterior_mean_variance(scheduler, x_t, eps_pred, t, t_prev, clip_sample
     beta_prod_t_prev = 1 - alpha_prod_t_prev
     
     # 2. Compute predicted x_0
-    pred_original_sample = (x_t - beta_prod_t ** 0.5 * eps_pred) / alpha_prod_t ** 0.5
+    # Reshape for broadcasting: [B] -> [B, 1, 1, 1]
+    alpha_prod_t_reshaped = alpha_prod_t[:, None, None, None]
+    beta_prod_t_reshaped = beta_prod_t[:, None, None, None]
+    pred_original_sample = (x_t - beta_prod_t_reshaped ** 0.5 * eps_pred) / alpha_prod_t_reshaped ** 0.5
     
     # Clip x0 (only if scheduler is configured to do so)
     if clip_sample:
