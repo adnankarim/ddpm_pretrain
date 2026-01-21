@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
-OUTPUT_DIR="./ddpm_diffusers_results"
+OUTPUT_DIR="./results_phi_phi"
 CHECKPOINT_DIR="${OUTPUT_DIR}/checkpoints"
-INFERENCE_STEPS=1000  # Use  1000 for higher quality
+INFERENCE_STEPS=50  # Use  50 for higher quality
 NUM_SAMPLES=1000
 EVAL_SPLIT="test"
 
@@ -22,7 +22,8 @@ log() {
 CHECKPOINTS=(
   # Early–mid (diversity / structure)
 
-  "checkpoint_epoch_60.pt"
+  "checkpoint_epoch_100.pt",
+  "checkpoint_epoch_99.pt"
  
 )
 
