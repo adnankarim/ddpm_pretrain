@@ -909,63 +909,132 @@ def calculate_kl_divergence(noise_pred, noise_true):
     kl = 0.5 * mse
     return kl.item()
 
-def calculate_fid(real_images, fake_images, device):
+def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480, num_inference_steps=200):
     """
-    Calculate Fréchet Inception Distance (FID) between real and generated images.
+    Calculate evaluation metrics using torchmetrics (FID/KID) following reference pattern.
     
     Args:
-        real_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
-        fake_images: Tensor of shape [N, 3, H, W] in range [-1, 1]
+        model: The diffusion model
+        val_loader: Validation data loader
         device: torch device
+        num_samples: Number of samples to use for evaluation
+        num_inference_steps: Number of inference steps for generation
     
     Returns:
-        FID score (float) or None if calculation fails
+        dict with keys: 'overall_fid', 'overall_kid', 'fid_per_class', 'kid_per_class', 'average_fid', 'average_kid'
     """
     try:
-        from torchvision.models import inception_v3
-        from scipy import linalg
-        
-        # Load Inception v3 model
-        inception = inception_v3(pretrained=True, transform_input=False).to(device)
-        inception.eval()
-        inception.fc = torch.nn.Identity()  # Remove final classification layer
-        
-        def get_features(images):
-            """Extract features from Inception v3"""
-            # Normalize to [0, 1] for Inception
-            img_norm = (images + 1.0) / 2.0
-            # Resize to 299x299 (Inception input size)
-            img_resized = torch.nn.functional.interpolate(
-                img_norm, size=(299, 299), mode='bilinear', align_corners=False
-            )
-            with torch.no_grad():
-                features = inception(img_resized)
-            return features.cpu().numpy()
-        
-        # Extract features
-        real_features = get_features(real_images)
-        fake_features = get_features(fake_images)
-        
-        # Calculate mean and covariance
-        mu1, sigma1 = real_features.mean(axis=0), np.cov(real_features, rowvar=False)
-        mu2, sigma2 = fake_features.mean(axis=0), np.cov(fake_features, rowvar=False)
-        
-        # Calculate FID
-        diff = mu1 - mu2
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
-        if not np.isfinite(covmean).all():
-            # Handle numerical issues
-            offset = np.eye(sigma1.shape[0]) * 1e-6
-            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
-        
-        fid = diff.dot(diff) + np.trace(sigma1 + sigma2 - 2 * covmean)
-        return float(np.real(fid))
-        
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.kid import KernelInceptionDistance
+        TORCHMETRICS_AVAILABLE = True
     except ImportError:
+        print("  Warning: torchmetrics not available. Install with: pip install torchmetrics")
         return None
-    except Exception as e:
-        print(f"  Warning: FID calculation failed: {e}", flush=True)
-        return None
+    
+    model.model.eval()
+    
+    # Initialize metrics
+    fid_metric = FrechetInceptionDistance(normalize=True).to(device, non_blocking=True)
+    kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(device, non_blocking=True)
+    
+    # Group samples by compound for per-class metrics
+    generated_samples = {}  # compound_name -> list of tensors
+    target_samples = {}     # compound_name -> list of tensors
+    
+    sample_count = 0
+    with torch.no_grad():
+        from tqdm.auto import tqdm
+        for batch in tqdm(val_loader, desc="  Evaluating", leave=False):
+            if sample_count >= num_samples:
+                break
+            
+            ctrl = batch['control'].to(device)
+            real_t = batch['perturbed'].to(device)
+            fp = batch['fingerprint'].to(device)
+            compounds = batch['compound']  # List of compound names
+            
+            # Generate samples
+            generated = model.sample(ctrl, fp, num_inference_steps=num_inference_steps)
+            
+            # Normalize to [0, 1] range for torchmetrics (expects [0, 255] or [0, 1])
+            real_norm = torch.clamp(real_t * 0.5 + 0.5, min=0.0, max=1.0)
+            gen_norm = torch.clamp(generated * 0.5 + 0.5, min=0.0, max=1.0)
+            
+            # Convert to [0, 255] range for torchmetrics
+            real_uint8 = torch.floor(real_norm * 255.0).to(torch.uint8)
+            gen_uint8 = torch.floor(gen_norm * 255.0).to(torch.uint8)
+            
+            # Update overall metrics
+            fid_metric.update(real_uint8, real=True)
+            fid_metric.update(gen_uint8, real=False)
+            kid_metric.update(real_uint8, real=True)
+            kid_metric.update(gen_uint8, real=False)
+            
+            # Group by compound for per-class metrics
+            for i in range(real_t.shape[0]):
+                compound = compounds[i] if isinstance(compounds, list) else str(compounds[i])
+                if compound not in generated_samples:
+                    generated_samples[compound] = []
+                    target_samples[compound] = []
+                generated_samples[compound].append(gen_uint8[i])
+                target_samples[compound].append(real_uint8[i])
+            
+            sample_count += real_t.shape[0]
+    
+    # Compute overall FID and KID
+    fid = fid_metric.compute()
+    kid_mean, kid_std = kid_metric.compute()
+    
+    # Compute per-class FID and KID
+    fid_per_class = {}
+    kid_per_class = {}
+    
+    for compound in tqdm(generated_samples.keys(), desc="  Computing per-class metrics", leave=False):
+        if len(generated_samples[compound]) == 0:
+            continue
+        
+        try:
+            # Stack samples for this compound
+            gen_stack = torch.stack(generated_samples[compound]).to(device)
+            target_stack = torch.stack(target_samples[compound]).to(device)
+            
+            # Compute FID for this class
+            fid_metric_class = FrechetInceptionDistance(normalize=True).to(device, non_blocking=True)
+            fid_metric_class.update(target_stack, real=True)
+            fid_metric_class.update(gen_stack, real=False)
+            fid_per_class[compound] = float(fid_metric_class.compute().cpu().item())
+            
+            # Compute KID for this class
+            dynamic_subset_size = min(len(generated_samples[compound]), 100)
+            kid_metric_class = KernelInceptionDistance(subset_size=dynamic_subset_size, normalize=True).to(device, non_blocking=True)
+            kid_metric_class.update(target_stack, real=True)
+            kid_metric_class.update(gen_stack, real=False)
+            kid_mean_class, kid_std_class = kid_metric_class.compute()
+            kid_per_class[compound] = {
+                "mean": float(kid_mean_class.cpu().item()),
+                "std": float(kid_std_class.cpu().item())
+            }
+            
+            print(f"  {compound} ({len(generated_samples[compound])}): FID={fid_per_class[compound]:.2f}, KID={kid_per_class[compound]['mean']:.4f}±{kid_per_class[compound]['std']:.4f}", flush=True)
+        except Exception as e:
+            print(f"  Warning: Failed to compute metrics for {compound}: {e}", flush=True)
+            continue
+    
+    # Calculate averages
+    avg_fid = np.mean(list(fid_per_class.values())) if fid_per_class else None
+    avg_kid_mean = np.mean([v["mean"] for v in kid_per_class.values()]) if kid_per_class else None
+    avg_kid_std = np.mean([v["std"] for v in kid_per_class.values()]) if kid_per_class else None
+    
+    result = {
+        "overall_fid": float(fid.item()),
+        "overall_kid": {"mean": float(kid_mean.item()), "std": float(kid_std.item())},
+        "fid_per_class": fid_per_class,
+        "kid_per_class": kid_per_class,
+        "average_fid": float(avg_fid) if avg_fid is not None else None,
+        "average_kid": {"mean": avg_kid_mean, "std": avg_kid_std} if avg_kid_mean is not None else None,
+    }
+    
+    return result
 
 def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid=False, num_inference_steps=200, skip_other_metrics=False):
     """
@@ -1221,6 +1290,7 @@ Examples:
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file (auto-detected if not specified)")
     parser.add_argument("--calculate_fid", action="store_true", help="Enable FID and cFID calculation during evaluation (slower but more comprehensive metrics)")
     parser.add_argument("--eval_only", action="store_true", help="Run evaluation only (no training). Loads latest checkpoint from output_dir.")
+    parser.add_argument("--num_samples", type=int, default=20480, help="Number of samples to calculate FID and KID (default: 20480)")
     parser.add_argument("--inference_steps", type=int, default=200, help="Number of inference steps for generation (default: 200, use 1000 for full quality)")
     parser.add_argument("--fid_only", action="store_true", help="Only calculate FID metrics (skip KL, MSE, PSNR, SSIM for faster evaluation)")
     parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"], help="Data split to use for evaluation (default: val, falls back to test if val is empty)")
@@ -1395,35 +1465,47 @@ Examples:
         print(f"  FID only mode: {'Yes' if args.fid_only else 'No'}", flush=True)
         print(f"{'='*60}\n", flush=True)
         
-        # Run evaluation
+        # Run evaluation using torchmetrics
         print("Running evaluation...", flush=True)
-        metrics = calculate_metrics(model, val_loader, config.device, num_samples=1000,
-                                  calculate_fid=config.calculate_fid,
-                                  num_inference_steps=args.inference_steps,
-                                  skip_other_metrics=args.fid_only)
+        import json
+        metrics = calculate_metrics_torchmetrics(model, val_loader, config.device, 
+                                               num_samples=args.num_samples,
+                                               num_inference_steps=args.inference_steps)
+        
+        if metrics is None:
+            print("  Error: Failed to compute metrics. Make sure torchmetrics is installed.")
+            return
         
         # Print metrics
         print(f"\n{'='*60}", flush=True)
         print(f"EVALUATION RESULTS", flush=True)
         print(f"{'='*60}", flush=True)
-        if not args.fid_only:
-            if metrics['kl_divergence'] is not None:
-                print(f"  KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
-            if metrics['mse'] is not None:
-                print(f"  MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
-            if metrics['psnr'] is not None:
-                print(f"  PSNR:              {metrics['psnr']:.2f} dB", flush=True)
-            if metrics['ssim'] is not None:
-                print(f"  SSIM:              {metrics['ssim']:.4f}", flush=True)
-        if metrics['fid'] is not None:
-            print(f"  FID (Overall):     {metrics['fid']:.2f}", flush=True)
-        if metrics['cfid'] is not None:
-            print(f"  cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+        print(f"  Overall FID:        {metrics['overall_fid']:.2f}", flush=True)
+        print(f"  Overall KID:        mean={metrics['overall_kid']['mean']:.4f}, std={metrics['overall_kid']['std']:.4f}", flush=True)
+        if metrics['average_fid'] is not None:
+            print(f"  Average FID:        {metrics['average_fid']:.2f}", flush=True)
+        if metrics['average_kid'] is not None:
+            print(f"  Average KID:        mean={metrics['average_kid']['mean']:.4f}, std={metrics['average_kid']['std']:.4f}", flush=True)
         print(f"{'='*60}", flush=True)
         
-        # Log metrics
-        logger.update(start_epoch, 0.0, metrics, scheduler.get_last_lr()[0] if start_epoch > 0 else 0)
-        print(f"\n✅ Evaluation complete! Results saved to {logger.metrics_csv_path}", flush=True)
+        # Save results to JSON
+        output_name = f"mol_eval_{args.eval_split}_{args.num_samples}_{args.inference_steps}"
+        os.makedirs("outputs/evaluation", exist_ok=True)
+        json_path = f"outputs/evaluation/{output_name}.json"
+        
+        results = {
+            "model": "mol.py",
+            "checkpoint": checkpoint_path,
+            "eval_split": args.eval_split,
+            "num_samples": args.num_samples,
+            "inference_steps": args.inference_steps,
+            **metrics
+        }
+        
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=4)
+        
+        print(f"\n✅ Evaluation complete! Results saved to {json_path}", flush=True)
         return
     
     # Load checkpoint

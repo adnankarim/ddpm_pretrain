@@ -657,6 +657,165 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
 
 
 # =============================================================================
+# TORCHMETRICS EVALUATION
+# =============================================================================
+def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj, dataset, args, device, weight_dtype, num_samples=20480, num_inference_steps=50):
+    """
+    Calculate evaluation metrics using torchmetrics (FID/KID) following reference pattern.
+    """
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.kid import KernelInceptionDistance
+        TORCHMETRICS_AVAILABLE = True
+    except ImportError:
+        print("  Warning: torchmetrics not available. Install with: pip install torchmetrics")
+        return None
+    
+    controlnet.eval()
+    transformer.eval()
+    drug_proj.eval()
+    
+    # Initialize metrics
+    fid_metric = FrechetInceptionDistance(normalize=True).to(device, non_blocking=True)
+    kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(device, non_blocking=True)
+    
+    # Group samples by compound
+    generated_samples = {}
+    target_samples = {}
+    
+    eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
+    
+    sample_count = 0
+    with torch.no_grad():
+        from tqdm.auto import tqdm
+        for batch in tqdm(eval_loader, desc="  Evaluating", leave=False):
+            if sample_count >= num_samples:
+                break
+            
+            ctrl_px = batch["control"].to(device, dtype=weight_dtype)
+            tgt_px = batch["target"].to(device, dtype=weight_dtype)
+            fp = batch["fingerprint"].to(device, dtype=torch.float32)
+            prompts = batch["prompt"]
+            
+            # Prepare prompt embeddings
+            prompt_embeds, pooled_prompt_embeds, txt_ids = pipe.encode_prompt(prompts, prompt_2=prompts)
+            prompt_embeds = prompt_embeds.to(device=device, dtype=weight_dtype)
+            pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=weight_dtype)
+            txt_ids_b = txt_ids.unsqueeze(0).expand(prompt_embeds.shape[0], -1, -1).to(device=device, dtype=weight_dtype)
+            
+            # Add drug tokens
+            drug_tokens = drug_proj(fp).to(dtype=weight_dtype)
+            prompt_embeds = torch.cat([prompt_embeds, drug_tokens], dim=1)
+            drug_txt_ids = torch.zeros((txt_ids_b.shape[0], drug_proj.num_drug_tokens, txt_ids_b.shape[-1]),
+                                       device=device, dtype=weight_dtype)
+            txt_ids_b = torch.cat([txt_ids_b, drug_txt_ids], dim=1)
+            
+            # Convert control to [0, 1] for pipeline
+            control_image = (ctrl_px / 2 + 0.5).clamp(0, 1)
+            
+            # Generate
+            generator = torch.Generator(device=device).manual_seed(42)
+            images = pipe(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                control_image=control_image,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=3.5,
+                generator=generator,
+            ).images
+            
+            # Convert PIL to tensor and normalize
+            from torchvision.transforms import ToTensor, Normalize
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+            ])
+            generated = torch.stack([transform(img) for img in images]).to(device)
+            
+            # Normalize to [0, 1] for torchmetrics
+            real_norm = torch.clamp(tgt_px * 0.5 + 0.5, min=0.0, max=1.0)
+            gen_norm = torch.clamp(generated * 0.5 + 0.5, min=0.0, max=1.0)
+            
+            # Convert to [0, 255]
+            real_uint8 = torch.floor(real_norm * 255.0).to(torch.uint8)
+            gen_uint8 = torch.floor(gen_norm * 255.0).to(torch.uint8)
+            
+            # Update metrics
+            fid_metric.update(real_uint8, real=True)
+            fid_metric.update(gen_uint8, real=False)
+            kid_metric.update(real_uint8, real=True)
+            kid_metric.update(gen_uint8, real=False)
+            
+            # Group by compound
+            for i in range(tgt_px.shape[0]):
+                compound = "unknown"
+                if hasattr(dataset, 'metadata') and len(dataset.metadata) > sample_count + i:
+                    try:
+                        meta = dataset.metadata[dataset.treated[sample_count + i]]
+                        compound = meta.get('CPD_NAME', 'unknown')
+                    except:
+                        pass
+                
+                if compound not in generated_samples:
+                    generated_samples[compound] = []
+                    target_samples[compound] = []
+                generated_samples[compound].append(gen_uint8[i])
+                target_samples[compound].append(real_uint8[i])
+            
+            sample_count += tgt_px.shape[0]
+    
+    # Compute overall metrics
+    fid = fid_metric.compute()
+    kid_mean, kid_std = kid_metric.compute()
+    
+    # Compute per-class metrics
+    fid_per_class = {}
+    kid_per_class = {}
+    
+    for compound in tqdm(generated_samples.keys(), desc="  Computing per-class metrics", leave=False):
+        if len(generated_samples[compound]) == 0:
+            continue
+        
+        try:
+            gen_stack = torch.stack(generated_samples[compound]).to(device)
+            target_stack = torch.stack(target_samples[compound]).to(device)
+            
+            fid_metric_class = FrechetInceptionDistance(normalize=True).to(device, non_blocking=True)
+            fid_metric_class.update(target_stack, real=True)
+            fid_metric_class.update(gen_stack, real=False)
+            fid_per_class[compound] = float(fid_metric_class.compute().cpu().item())
+            
+            dynamic_subset_size = min(len(generated_samples[compound]), 100)
+            kid_metric_class = KernelInceptionDistance(subset_size=dynamic_subset_size, normalize=True).to(device, non_blocking=True)
+            kid_metric_class.update(target_stack, real=True)
+            kid_metric_class.update(gen_stack, real=False)
+            kid_mean_class, kid_std_class = kid_metric_class.compute()
+            kid_per_class[compound] = {
+                "mean": float(kid_mean_class.cpu().item()),
+                "std": float(kid_std_class.cpu().item())
+            }
+            
+            print(f"  {compound} ({len(generated_samples[compound])}): FID={fid_per_class[compound]:.2f}, KID={kid_per_class[compound]['mean']:.4f}±{kid_per_class[compound]['std']:.4f}", flush=True)
+        except Exception as e:
+            print(f"  Warning: Failed to compute metrics for {compound}: {e}", flush=True)
+            continue
+    
+    avg_fid = np.mean(list(fid_per_class.values())) if fid_per_class else None
+    avg_kid_mean = np.mean([v["mean"] for v in kid_per_class.values()]) if kid_per_class else None
+    avg_kid_std = np.mean([v["std"] for v in kid_per_class.values()]) if kid_per_class else None
+    
+    result = {
+        "overall_fid": float(fid.item()),
+        "overall_kid": {"mean": float(kid_mean.item()), "std": float(kid_std.item())},
+        "fid_per_class": fid_per_class,
+        "kid_per_class": kid_per_class,
+        "average_fid": float(avg_fid) if avg_fid is not None else None,
+        "average_kid": {"mean": avg_kid_mean, "std": avg_kid_std} if avg_kid_mean is not None else None,
+    }
+    
+    return result
+
+# =============================================================================
 # MAIN TRAINING
 # =============================================================================
 def parse_args():
@@ -680,6 +839,12 @@ def parse_args():
     p.add_argument("--eval_every", type=int, default=1000, help="Run evaluation (generate samples/video) every N steps")
     p.add_argument("--eval_split", type=str, default="test", choices=["train", "val", "test"], 
                    help="Data split to use for evaluation (default: test)")
+    
+    # Evaluation-only mode
+    p.add_argument("--eval_only", action="store_true", help="Run evaluation only (no training)")
+    p.add_argument("--checkpoint_dir", type=str, default=None, help="Checkpoint directory for evaluation (default: uses latest checkpoint-* in output_dir)")
+    p.add_argument("--num_samples", type=int, default=20480, help="Number of samples to calculate FID and KID (default: 20480)")
+    p.add_argument("--inference_steps", type=int, default=50, help="Number of inference steps for generation (default: 50)")
 
     # Drug tokens
     p.add_argument("--fingerprint_dim", type=int, default=1024)
@@ -859,6 +1024,115 @@ def main():
 
     # Copy scheduler for timestep sampling indices
     noise_scheduler_copy = FlowMatchEulerDiscreteScheduler.from_config(noise_scheduler.config)
+
+    # Handle eval_only mode
+    if args.eval_only:
+        if not accelerator.is_main_process:
+            return
+        
+        # Load checkpoint
+        import glob
+        if args.checkpoint_dir:
+            checkpoint_dir = args.checkpoint_dir
+        else:
+            # Find latest checkpoint
+            checkpoints = glob.glob(os.path.join(args.output_dir, "checkpoint-*"))
+            if not checkpoints:
+                print(f"ERROR: No checkpoints found in {args.output_dir}")
+                return
+            checkpoint_dir = max(checkpoints, key=os.path.getctime)
+        
+        print(f"Loading checkpoint from {checkpoint_dir}...")
+        # Load controlnet
+        controlnet_path = os.path.join(checkpoint_dir, "flux_controlnet")
+        if os.path.exists(controlnet_path):
+            controlnet = FluxControlNetModel.from_pretrained(controlnet_path)
+            controlnet.to(accelerator.device, dtype=weight_dtype)
+        
+        # Load LoRA
+        lora_path = os.path.join(checkpoint_dir, "lora")
+        if os.path.exists(lora_path):
+            from peft import PeftModel
+            transformer = PeftModel.from_pretrained(transformer, lora_path)
+        
+        # Load drug projector
+        drug_path = os.path.join(checkpoint_dir, "drug")
+        if os.path.exists(drug_path):
+            if SAFETENSORS_OK:
+                drug_proj.load_state_dict(safetensors_load(os.path.join(drug_path, "drug_projector.safetensors")))
+            else:
+                drug_proj.load_state_dict(torch.load(os.path.join(drug_path, "drug_projector.pt")))
+        
+        # Update pipe
+        pipe.controlnet = controlnet
+        pipe.transformer = transformer
+        
+        # Load eval dataset
+        eval_dataset = PairedBBBC021Dataset(
+            data_dir=args.data_dir,
+            metadata_file=args.metadata_file,
+            size=args.resolution,
+            split=args.eval_split,
+            paths_csv=args.paths_csv,
+        )
+        
+        if len(eval_dataset) == 0:
+            print(f"  Warning: Evaluation split '{args.eval_split}' is empty.")
+            fallback_split = "test" if args.eval_split == "val" else "train"
+            print(f"  Trying fallback split '{fallback_split}' for evaluation.")
+            eval_dataset = PairedBBBC021Dataset(
+                data_dir=args.data_dir,
+                metadata_file=args.metadata_file,
+                size=args.resolution,
+                split=fallback_split,
+                paths_csv=args.paths_csv,
+            )
+        
+        print(f"  Dataset loaded: {len(eval_dataset)} samples from '{args.eval_split}' split")
+        
+        # Run evaluation
+        print("Running evaluation with torchmetrics...", flush=True)
+        import json
+        metrics = calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
+                                                      accelerator.device, weight_dtype,
+                                                      num_samples=args.num_samples,
+                                                      num_inference_steps=args.inference_steps)
+        
+        if metrics is None:
+            print("  Error: Failed to compute metrics. Make sure torchmetrics is installed.")
+            return
+        
+        # Print metrics
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATION RESULTS", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  Overall FID:        {metrics['overall_fid']:.2f}", flush=True)
+        print(f"  Overall KID:        mean={metrics['overall_kid']['mean']:.4f}, std={metrics['overall_kid']['std']:.4f}", flush=True)
+        if metrics['average_fid'] is not None:
+            print(f"  Average FID:        {metrics['average_fid']:.2f}", flush=True)
+        if metrics['average_kid'] is not None:
+            print(f"  Average KID:        mean={metrics['average_kid']['mean']:.4f}, std={metrics['average_kid']['std']:.4f}", flush=True)
+        print(f"{'='*60}", flush=True)
+        
+        # Save results to JSON
+        output_name = f"flux_eval_{args.eval_split}_{args.num_samples}_{args.inference_steps}"
+        os.makedirs("outputs/evaluation", exist_ok=True)
+        json_path = f"outputs/evaluation/{output_name}.json"
+        
+        results = {
+            "model": "flux.py",
+            "checkpoint_dir": checkpoint_dir,
+            "eval_split": args.eval_split,
+            "num_samples": args.num_samples,
+            "inference_steps": args.inference_steps,
+            **metrics
+        }
+        
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=4)
+        
+        print(f"\n✅ Evaluation complete! Results saved to {json_path}", flush=True)
+        return
 
     controlnet.train()
     transformer.train()

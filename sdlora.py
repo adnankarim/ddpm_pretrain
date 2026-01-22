@@ -677,6 +677,164 @@ def load_checkpoint(unet, controlnet, drug_proj, optimizer, path, scheduler=None
 # MAIN
 # ============================================================================
 
+def calculate_metrics_torchmetrics_sd(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, dataset, config, num_samples=20480, num_inference_steps=50):
+    """
+    Calculate evaluation metrics using torchmetrics (FID/KID) following reference pattern.
+    """
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+        from torchmetrics.image.kid import KernelInceptionDistance
+        TORCHMETRICS_AVAILABLE = True
+    except ImportError:
+        print("  Warning: torchmetrics not available. Install with: pip install torchmetrics")
+        return None
+    
+    unet.eval()
+    controlnet.eval()
+    
+    # Initialize metrics
+    fid_metric = FrechetInceptionDistance(normalize=True).to(config.device, non_blocking=True)
+    kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device, non_blocking=True)
+    
+    # Group samples by compound for per-class metrics
+    generated_samples = {}
+    target_samples = {}
+    
+    eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
+    weight_dtype = torch.float32
+    
+    sample_count = 0
+    with torch.no_grad():
+        from tqdm.auto import tqdm
+        for batch in tqdm(eval_loader, desc="  Evaluating", leave=False):
+            if sample_count >= num_samples:
+                break
+            
+            ctrl_img = batch['control'].to(config.device, dtype=weight_dtype)
+            target_img = batch['target'].to(config.device, dtype=weight_dtype)
+            fp = batch['fingerprint'].to(config.device)
+            prompts = batch['prompt']
+            
+            # Prepare context
+            tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
+            text_emb = text_encoder(tokens)[0].to(dtype=weight_dtype)
+            drug_emb = drug_proj(fp.to(dtype=weight_dtype))
+            context = torch.cat([text_emb, drug_emb], dim=1)
+            
+            # Generate samples
+            latents = torch.randn_like(vae.encode(target_img.to(dtype=torch.float32)).latent_dist.mode() * vae.config.scaling_factor)
+            noise_scheduler.set_timesteps(num_inference_steps, device=config.device)
+            
+            for t in noise_scheduler.timesteps:
+                t_val = t.item() if isinstance(t, torch.Tensor) else t
+                t_val = min(t_val, noise_scheduler.config.num_train_timesteps - 1)
+                timestep = torch.full((latents.shape[0],), t_val, device=config.device, dtype=torch.long)
+                
+                down_block_res_samples, mid_block_res_sample = controlnet(
+                    latents, timestep, encoder_hidden_states=context,
+                    controlnet_cond=ctrl_img, return_dict=False,
+                )
+                
+                if hasattr(unet, 'base_model'):
+                    noise_pred = unet.base_model.model(
+                        latents, timestep, encoder_hidden_states=context,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                    ).sample
+                else:
+                    noise_pred = unet(
+                        latents, timestep, encoder_hidden_states=context,
+                        down_block_additional_residuals=down_block_res_samples,
+                        mid_block_additional_residual=mid_block_res_sample,
+                    ).sample
+                
+                latents = noise_scheduler.step(noise_pred, t_val, latents).prev_sample
+            
+            # Decode
+            generated = vae.decode((latents / vae.config.scaling_factor).float()).sample
+            generated = (generated / 2 + 0.5).clamp(0, 1)
+            real_norm = (target_img / 2 + 0.5).clamp(0, 1)
+            
+            # Convert to [0, 255] for torchmetrics
+            real_uint8 = torch.floor(real_norm * 255.0).to(torch.uint8)
+            gen_uint8 = torch.floor(generated * 255.0).to(torch.uint8)
+            
+            # Update metrics
+            fid_metric.update(real_uint8, real=True)
+            fid_metric.update(gen_uint8, real=False)
+            kid_metric.update(real_uint8, real=True)
+            kid_metric.update(gen_uint8, real=False)
+            
+            # Group by compound (extract from metadata if available)
+            for i in range(target_img.shape[0]):
+                # Try to get compound name from dataset metadata
+                compound = "unknown"
+                if hasattr(dataset, 'metadata') and len(dataset.metadata) > sample_count + i:
+                    try:
+                        meta = dataset.metadata[dataset.treated[sample_count + i]]
+                        compound = meta.get('CPD_NAME', 'unknown')
+                    except:
+                        pass
+                
+                if compound not in generated_samples:
+                    generated_samples[compound] = []
+                    target_samples[compound] = []
+                generated_samples[compound].append(gen_uint8[i])
+                target_samples[compound].append(real_uint8[i])
+            
+            sample_count += target_img.shape[0]
+    
+    # Compute overall metrics
+    fid = fid_metric.compute()
+    kid_mean, kid_std = kid_metric.compute()
+    
+    # Compute per-class metrics
+    fid_per_class = {}
+    kid_per_class = {}
+    
+    for compound in tqdm(generated_samples.keys(), desc="  Computing per-class metrics", leave=False):
+        if len(generated_samples[compound]) == 0:
+            continue
+        
+        try:
+            gen_stack = torch.stack(generated_samples[compound]).to(config.device)
+            target_stack = torch.stack(target_samples[compound]).to(config.device)
+            
+            fid_metric_class = FrechetInceptionDistance(normalize=True).to(config.device, non_blocking=True)
+            fid_metric_class.update(target_stack, real=True)
+            fid_metric_class.update(gen_stack, real=False)
+            fid_per_class[compound] = float(fid_metric_class.compute().cpu().item())
+            
+            dynamic_subset_size = min(len(generated_samples[compound]), 100)
+            kid_metric_class = KernelInceptionDistance(subset_size=dynamic_subset_size, normalize=True).to(config.device, non_blocking=True)
+            kid_metric_class.update(target_stack, real=True)
+            kid_metric_class.update(gen_stack, real=False)
+            kid_mean_class, kid_std_class = kid_metric_class.compute()
+            kid_per_class[compound] = {
+                "mean": float(kid_mean_class.cpu().item()),
+                "std": float(kid_std_class.cpu().item())
+            }
+            
+            print(f"  {compound} ({len(generated_samples[compound])}): FID={fid_per_class[compound]:.2f}, KID={kid_per_class[compound]['mean']:.4f}±{kid_per_class[compound]['std']:.4f}", flush=True)
+        except Exception as e:
+            print(f"  Warning: Failed to compute metrics for {compound}: {e}", flush=True)
+            continue
+    
+    avg_fid = np.mean(list(fid_per_class.values())) if fid_per_class else None
+    avg_kid_mean = np.mean([v["mean"] for v in kid_per_class.values()]) if kid_per_class else None
+    avg_kid_std = np.mean([v["std"] for v in kid_per_class.values()]) if kid_per_class else None
+    
+    result = {
+        "overall_fid": float(fid.item()),
+        "overall_kid": {"mean": float(kid_mean.item()), "std": float(kid_std.item())},
+        "fid_per_class": fid_per_class,
+        "kid_per_class": kid_per_class,
+        "average_fid": float(avg_fid) if avg_fid is not None else None,
+        "average_kid": {"mean": avg_kid_mean, "std": avg_kid_std} if avg_kid_mean is not None else None,
+    }
+    
+    return result
+
 def run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, dataset, config, logger, checkpoint_epoch=None, eval_split="train"):
     """
     Run evaluation: generate video, grid, and metrics without training.
@@ -878,6 +1036,8 @@ Examples:
     parser.add_argument("--paths_csv", type=str, default=None, help="Path to paths.csv file for robust file lookup")
     parser.add_argument("--eval_only", action="store_true", help="Run evaluation only: generate samples, plot grid, video, and metrics (no training)")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file for evaluation (default: uses latest.pt from output_dir)")
+    parser.add_argument("--num_samples", type=int, default=20480, help="Number of samples to calculate FID and KID (default: 20480)")
+    parser.add_argument("--inference_steps", type=int, default=50, help="Number of inference steps for generation (default: 50)")
     parser.add_argument("--eval_split", type=str, default="train", choices=["train", "test", "val"], help="Data split to use for evaluation (default: train)")
     args = parser.parse_args()
     
@@ -1019,10 +1179,48 @@ Examples:
         )
         print(f"  Dataset loaded: {len(dataset)} samples from '{eval_split}' split")
         
-        # Run evaluation
-        run_evaluation(unet, controlnet, vae, noise_scheduler, drug_proj, tokenizer, text_encoder, 
-                      dataset, config, logger, checkpoint_epoch, eval_split)
-        print("Evaluation complete!")
+        # Run evaluation using torchmetrics
+        print("Running evaluation with torchmetrics...", flush=True)
+        import json
+        metrics = calculate_metrics_torchmetrics_sd(unet, controlnet, vae, noise_scheduler, drug_proj, 
+                                                     tokenizer, text_encoder, dataset, config,
+                                                     num_samples=args.num_samples,
+                                                     num_inference_steps=args.inference_steps)
+        
+        if metrics is None:
+            print("  Error: Failed to compute metrics. Make sure torchmetrics is installed.")
+            return
+        
+        # Print metrics
+        print(f"\n{'='*60}", flush=True)
+        print(f"EVALUATION RESULTS", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"  Overall FID:        {metrics['overall_fid']:.2f}", flush=True)
+        print(f"  Overall KID:        mean={metrics['overall_kid']['mean']:.4f}, std={metrics['overall_kid']['std']:.4f}", flush=True)
+        if metrics['average_fid'] is not None:
+            print(f"  Average FID:        {metrics['average_fid']:.2f}", flush=True)
+        if metrics['average_kid'] is not None:
+            print(f"  Average KID:        mean={metrics['average_kid']['mean']:.4f}, std={metrics['average_kid']['std']:.4f}", flush=True)
+        print(f"{'='*60}", flush=True)
+        
+        # Save results to JSON
+        output_name = f"sdlora_eval_{eval_split}_{args.num_samples}_{args.inference_steps}"
+        os.makedirs("outputs/evaluation", exist_ok=True)
+        json_path = f"outputs/evaluation/{output_name}.json"
+        
+        results = {
+            "model": "sdlora.py",
+            "checkpoint": checkpoint_path,
+            "eval_split": eval_split,
+            "num_samples": args.num_samples,
+            "inference_steps": args.inference_steps,
+            **metrics
+        }
+        
+        with open(json_path, "w") as f:
+            json.dump(results, f, indent=4)
+        
+        print(f"\n✅ Evaluation complete! Results saved to {json_path}", flush=True)
         return
     
     # Load checkpoint for training
