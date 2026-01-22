@@ -63,8 +63,7 @@ class Config:
     kl_beta = 0.05        # Weight for KL anchor to pretrained model
     rollout_steps = 100   # Strided rollout (faster RL)
     cond_drop_prob = 0.1  # Probability of dropping conditioning for CFG training
-    cond_drop_prob = 0.1  # Probability of dropping conditioning for CFG training
-    guidance_scale = 2.0  # Classifier-free guidance scale for RL rollout & reward
+    guidance_scale = 1.0  # Classifier-free guidance scale (Init to 1.0 as pretrained model is not CFG-trained)
     
     # Logging
     log_file = "training_log.csv"
@@ -929,16 +928,15 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         # Use specific eval steps
         fake_trt, _ = rollout_with_logprobs(theta_model, ctrl, fp, steps=config.eval_steps)
         
-        # Normalize to [0, 1] for torchmetrics if not already? 
-        # rollout output is [-1, 1]. Torchmetrics expects [0, 1] or [0, 255].
-        # "normalize=True" argument in FID means input is [0, 1] or [0, 255].
-        # So we convert [-1, 1] -> [0, 1].
+        # Normalize to [0, 1] matching train2.py logic (quantized to 255 levels)
         
-        real_trt_norm = (trt + 1) / 2
-        fake_trt_norm = (fake_trt + 1) / 2
+        # Real
+        real_trt_norm = torch.clamp((trt + 1) / 2, 0, 1)
+        real_trt_norm = torch.floor(real_trt_norm * 255).to(torch.float32) / 255.0
         
-        real_trt_norm = torch.clamp(real_trt_norm, 0, 1)
-        fake_trt_norm = torch.clamp(fake_trt_norm, 0, 1)
+        # Fake
+        fake_trt_norm = torch.clamp((fake_trt + 1) / 2, 0, 1)
+        fake_trt_norm = torch.floor(fake_trt_norm * 255).to(torch.float32) / 255.0
         
         fid_metric_treated.update(real_trt_norm, real=True)
         fid_metric_treated.update(fake_trt_norm, real=False)
@@ -948,11 +946,13 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         # 2. Evaluate Phi (Trt -> Fake Ctrl) => Compare with Real Ctrl
         fake_ctrl, _ = rollout_with_logprobs(phi_model, trt, fp, steps=config.eval_steps)
         
-        real_ctrl_norm = (ctrl + 1) / 2
-        fake_ctrl_norm = (fake_ctrl + 1) / 2
+        # Real
+        real_ctrl_norm = torch.clamp((ctrl + 1) / 2, 0, 1)
+        real_ctrl_norm = torch.floor(real_ctrl_norm * 255).to(torch.float32) / 255.0
         
-        real_ctrl_norm = torch.clamp(real_ctrl_norm, 0, 1)
-        fake_ctrl_norm = torch.clamp(fake_ctrl_norm, 0, 1)
+        # Fake
+        fake_ctrl_norm = torch.clamp((fake_ctrl + 1) / 2, 0, 1)
+        fake_ctrl_norm = torch.floor(fake_ctrl_norm * 255).to(torch.float32) / 255.0
         
         fid_metric_control.update(real_ctrl_norm, real=True)
         fid_metric_control.update(fake_ctrl_norm, real=False)
@@ -1078,6 +1078,48 @@ def main():
     test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     test_loader = PairedDataLoader(test_ds, config.batch_size, shuffle=False)
     
+    # Print dataset details
+    print(f"\n{'='*60}")
+    print(f"Dataset Details:")
+    print(f"{'='*60}")
+    
+    try:
+        train_count = len(ds)
+        test_count = len(test_ds)
+        print(f"Train split: {train_count} samples")
+        print(f"Test split: {test_count} samples")
+        print(f"Total samples: {train_count + test_count}")
+        
+        # Count compounds
+        if hasattr(ds, 'metadata') and ds.metadata:
+            train_compounds = len(set([m.get('CPD_NAME', '') for m in ds.metadata]))
+            test_compounds = len(set([m.get('CPD_NAME', '') for m in test_ds.metadata]))
+            print(f"Train compounds: {train_compounds}")
+            print(f"Test compounds: {test_compounds}")
+            
+            # Count batches
+            train_batches = len(set([m.get('BATCH', '') for m in ds.metadata]))
+            test_batches = len(set([m.get('BATCH', '') for m in test_ds.metadata]))
+            print(f"Train batches: {train_batches}")
+            print(f"Test batches: {test_batches}")
+            
+            # Count DMSO vs perturbed
+            train_dmso = sum([1 for m in ds.metadata if str(m.get('CPD_NAME', '')).upper() == 'DMSO'])
+            train_perturbed = len(ds.metadata) - train_dmso
+            test_dmso = sum([1 for m in test_ds.metadata if str(m.get('CPD_NAME', '')).upper() == 'DMSO'])
+            test_perturbed = len(test_ds.metadata) - test_dmso
+            print(f"Train - DMSO: {train_dmso}, Perturbed: {train_perturbed}")
+            print(f"Test - DMSO: {test_dmso}, Perturbed: {test_perturbed}")
+        else:
+            print("Warning: Could not access dataset metadata for detailed statistics")
+        
+        print(f"{'='*60}\n")
+    except Exception as e:
+        print(f"Error printing dataset details: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+
     # Save a random dataset sample image to verify loading is correct
     print("\nSaving random dataset sample images to verify loading...")
     try:
