@@ -1074,6 +1074,57 @@ def main():
     test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     test_loader = PairedDataLoader(test_ds, config.batch_size, shuffle=False)
     
+    # Save a random dataset sample image to verify loading is correct
+    print("\nSaving random dataset sample images to verify loading...")
+    try:
+        import random
+        from PIL import Image
+        
+        # Get a random sample from train dataset
+        if len(ds) > 0:
+            random_idx = random.randint(0, len(ds) - 1)
+            sample = ds[random_idx]
+            
+            # Convert tensor to numpy image
+            img_tensor = sample['image']  # Shape: [3, H, W], range [-1, 1]
+            img_np = ((img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+            img_np = np.clip(img_np, 0, 255)
+            
+            # Save as JPG in current working directory
+            img_pil = Image.fromarray(img_np)
+            sample_filename = f"ppo_dataset_sample_{sample['compound'].replace('/', '_').replace(' ', '_')}.jpg"
+            sample_path = os.path.abspath(sample_filename)
+            img_pil.save(sample_path, "JPEG", quality=95)
+            print(f"  ✓ Saved random train sample to: {sample_path}")
+            print(f"    Compound: {sample['compound']}")
+            print(f"    Image shape: {img_tensor.shape}")
+            print(f"    Image range: [{img_tensor.min():.2f}, {img_tensor.max():.2f}]")
+        
+        # Also save a random test sample
+        if len(test_ds) > 0:
+            random_idx = random.randint(0, len(test_ds) - 1)
+            sample = test_ds[random_idx]
+            
+            img_tensor = sample['image']
+            img_np = ((img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+            img_np = np.clip(img_np, 0, 255)
+            
+            img_pil = Image.fromarray(img_np)
+            sample_filename = f"ppo_test_sample_{sample['compound'].replace('/', '_').replace(' ', '_')}.jpg"
+            sample_path = os.path.abspath(sample_filename)
+            img_pil.save(sample_path, "JPEG", quality=95)
+            print(f"  ✓ Saved random test sample to: {sample_path}")
+            print(f"    Compound: {sample['compound']}")
+            print(f"    Image shape: {img_tensor.shape}")
+            print(f"    Image range: [{img_tensor.min():.2f}, {img_tensor.max():.2f}]")
+            
+    except Exception as e:
+        print(f"  Warning: Could not save sample images: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print()  # Empty line for readability
+    
     # Initialize CSV Log
     if not os.path.exists(config.log_file):
         with open(config.log_file, 'w') as f:
