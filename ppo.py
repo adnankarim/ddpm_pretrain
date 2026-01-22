@@ -117,11 +117,12 @@ class BBBC021Dataset(Dataset):
         self.data_dir = Path(data_dir).resolve()
         self.image_size = image_size
         self.encoder = encoder
+        self._first_load_logged = False  # Track if we've logged the first successful load
         
         # Robust CSV loading
         csv_full_path = os.path.join(data_dir, metadata_file)
         if not os.path.exists(csv_full_path):
-            csv_full_path = metadata_file
+            csv_full_path = metadata_file  # Try relative path
             
         df = pd.read_csv(csv_full_path)
         if 'SPLIT' in df.columns: 
@@ -138,21 +139,55 @@ class BBBC021Dataset(Dataset):
                 smiles = row.get('SMILES', '')
                 self.fingerprints[cpd] = self.encoder.encode(smiles)
         
-        # Paths CSV handling (Simplified for brevity, assuming standard paths or paths.csv exists)
-        self.paths_lookup = {}
-        if paths_csv and os.path.exists(paths_csv):
-             paths_df = pd.read_csv(paths_csv)
-             for _, row in paths_df.iterrows():
-                 self.paths_lookup[row['filename']] = row['relative_path']
+        # Load paths.csv for robust file lookup (same as train2.py)
+        self.paths_lookup = {}  # filename -> list of relative_paths
+        self.paths_by_rel = {}  # relative_path -> full info
+        self.paths_by_basename = {}  # basename (without extension) -> list of paths
+        
+        if paths_csv:
+            paths_csv_path = Path(paths_csv)
+        else:
+            paths_csv_path = Path("paths.csv")
+            if not paths_csv_path.exists():
+                paths_csv_path = Path(data_dir) / "paths.csv"
+        
+        if paths_csv_path.exists():
+            print(f"Loading file paths from {paths_csv_path}...")
+            paths_df = pd.read_csv(paths_csv_path)
+            
+            for _, row in paths_df.iterrows():
+                filename = row['filename']
+                rel_path = row['relative_path']
+                basename = Path(filename).stem  # filename without extension
+                
+                # Lookup by exact filename
+                if filename not in self.paths_lookup:
+                    self.paths_lookup[filename] = []
+                self.paths_lookup[filename].append(rel_path)
+                
+                # Lookup by relative path
+                self.paths_by_rel[rel_path] = row.to_dict()
+                
+                # Lookup by basename (for matching without extension)
+                if basename not in self.paths_by_basename:
+                    self.paths_by_basename[basename] = []
+                self.paths_by_basename[basename].append(rel_path)
+            
+            print(f"  Loaded {len(self.paths_lookup)} unique filenames from paths.csv")
+        else:
+            print("  Note: paths.csv not found, will use fallback path resolution")
 
     def _group_by_batch(self):
         groups = {}
         for idx, row in enumerate(self.metadata):
             b = row.get('BATCH', 'unknown')
             if b not in groups: groups[b] = {'ctrl': [], 'trt': []}
+            
             cpd = str(row.get('CPD_NAME', '')).upper()
-            if cpd == 'DMSO': groups[b]['ctrl'].append(idx)
-            else: groups[b]['trt'].append(idx)
+            if cpd == 'DMSO': 
+                groups[b]['ctrl'].append(idx)
+            else: 
+                groups[b]['trt'].append(idx)
         return groups
 
     def get_perturbed_indices(self):
@@ -163,57 +198,249 @@ class BBBC021Dataset(Dataset):
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
             ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
-        return (trt_idx, trt_idx)
+        return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
     def __len__(self): return len(self.metadata)
 
     def _find_file_path(self, path):
-        # Simplified path finding
-        if not path: return None
+        """
+        Robust file path finding using paths.csv lookup (same logic as train2.py).
+        Returns Path object if found, None otherwise.
+        """
+        if not path:
+            return None
+        
         path_obj = Path(path)
+        filename = path_obj.name
+        basename = path_obj.stem  # filename without extension
         
-        # Try lookup
-        if path_obj.name in self.paths_lookup:
-            cand = self.data_dir / self.paths_lookup[path_obj.name]
-            if cand.exists(): return cand
-            cand = self.data_dir.parent / self.paths_lookup[path_obj.name]
-            if cand.exists(): return cand
-
-        # Try direct
-        cand = self.data_dir / path
-        if cand.exists(): return cand
+        # Strategy 1: Parse SAMPLE_KEY format (Week7_34681_7_3338_348.0 -> Week7/34681/7_3338_348.0.npy)
+        if '_' in path and path.startswith('Week'):
+            parts = path.replace('.0', '').split('_')
+            if len(parts) >= 5:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1]  # 34681
+                table_part = parts[2]  # 7
+                image_part = parts[3]  # 3338
+                object_part = parts[4]  # 348
+                
+                # Construct expected filename: table_image_object.0.npy
+                expected_filename = f"{table_part}_{image_part}_{object_part}.0.npy"
+                expected_dir = f"{week_part}/{batch_part}"
+                
+                # Try to find in paths.csv
+                if self.paths_lookup and expected_filename in self.paths_lookup:
+                    for rel_path in self.paths_lookup[expected_filename]:
+                        rel_path_str = str(rel_path)
+                        # Check if this path is in the expected directory
+                        if expected_dir in rel_path_str or f"{week_part}/{batch_part}" in rel_path_str:
+                            # Handle path resolution (same as train2.py)
+                            candidates = []
+                            if self.data_dir.name in rel_path_str:
+                                if rel_path_str.startswith(self.data_dir.name + '/'):
+                                    rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                                    candidates.append(self.data_dir / rel_path_clean)
+                                candidates.append(self.data_dir.parent / rel_path)
+                            candidates.append(Path(rel_path).resolve())
+                            candidates.append(self.data_dir / rel_path)
+                            candidates.append(self.data_dir.parent / rel_path)
+                            
+                            candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                            for candidate in candidates:
+                                if candidate.exists():
+                                    return candidate
+                
+                # Also try direct directory search
+                search_dir = self.data_dir / week_part / batch_part
+                if not search_dir.exists():
+                    search_dir = self.data_dir.parent / week_part / batch_part
+                
+                if search_dir.exists():
+                    candidate = search_dir / expected_filename
+                    if candidate.exists():
+                        return candidate
         
-        # Try glob
-        matches = list(self.data_dir.rglob(path_obj.name))
-        if matches: return matches[0]
+        # Strategy 2: Search paths.csv by SAMPLE_KEY in relative_path
+        if self.paths_lookup:
+            for rel_path_key, rel_path_info in self.paths_by_rel.items():
+                if path in rel_path_key or path.replace('.0', '') in rel_path_key:
+                    rel_path = rel_path_info['relative_path']
+                    candidates = []
+                    
+                    rel_path_str = str(rel_path)
+                    if self.data_dir.name in rel_path_str:
+                        if rel_path_str.startswith(self.data_dir.name + '/'):
+                            rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                            candidates.append(self.data_dir / rel_path_clean)
+                        candidates.append(self.data_dir.parent / rel_path)
+                    candidates.append(Path(rel_path).resolve())
+                    candidates.append(self.data_dir / rel_path)
+                    candidates.append(self.data_dir.parent / rel_path)
+                    
+                    candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                    for candidate in candidates:
+                        if candidate.exists():
+                            return candidate
+        
+        # Strategy 3: Exact filename match in paths.csv
+        if self.paths_lookup and filename in self.paths_lookup:
+            for rel_path in self.paths_lookup[filename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Strategy 4: Basename match in paths.csv
+        if self.paths_lookup and basename in self.paths_by_basename:
+            for rel_path in self.paths_by_basename[basename]:
+                rel_path_str = str(rel_path)
+                candidates = []
+                
+                if self.data_dir.name in rel_path_str:
+                    if rel_path_str.startswith(self.data_dir.name + '/'):
+                        rel_path_clean = rel_path_str[len(self.data_dir.name) + 1:]
+                        candidates.append(self.data_dir / rel_path_clean)
+                    candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates.append(Path(rel_path).resolve())
+                candidates.append(self.data_dir / rel_path)
+                candidates.append(self.data_dir.parent / rel_path)
+                
+                candidates = list(dict.fromkeys([c for c in candidates if c is not None]))
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+        
+        # Fallback: Direct path matching
+        for candidate in [self.data_dir / path, self.data_dir / (path + '.npy')]:
+            if candidate.exists():
+                return candidate
+        
+        # Last resort: Recursive search
+        search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
+        matches = list(self.data_dir.rglob(search_pattern))
+        if matches:
+            return matches[0]
+        
+        # Also try recursive search for SAMPLE_KEY in directory structure
+        if '_' in path:
+            parts = path.split('_')
+            if len(parts) >= 2:
+                week_part = parts[0]  # Week7
+                batch_part = parts[1] if len(parts) > 1 else None  # 34681
+                
+                if batch_part:
+                    search_dir = self.data_dir / week_part / batch_part
+                    if search_dir.exists():
+                        search_pattern = path if path.endswith('.npy') else path + '.npy'
+                        matches = list(search_dir.rglob(search_pattern))
+                        if matches:
+                            return matches[0]
         
         return None
 
     def __getitem__(self, idx):
         meta = self.metadata[idx]
         path = meta.get('image_path') or meta.get('SAMPLE_KEY')
+        
+        if not path:
+            raise ValueError(
+                f"CRITICAL: No image path found in metadata!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  Metadata keys: {list(meta.keys())}"
+            )
+        
+        # Use robust path finding (same as train2.py)
         full_path = self._find_file_path(path)
         
+        # CRITICAL: Check if file exists before attempting to load
         if full_path is None or not full_path.exists():
-            # Create dummy data if file missing to avoid crash during dev
-            # print(f"Warning: File not found {path}, returning zeros")
-            return {
-                'image': torch.zeros((3, self.image_size, self.image_size)),
-                'fingerprint': torch.zeros((1024,)),
-                'compound': 'Unknown'
-            }
+            raise FileNotFoundError(
+                f"CRITICAL: Image file not found!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  Path from metadata: {path}\n"
+                f"  Data directory: {self.data_dir}\n"
+                f"  Data directory exists: {self.data_dir.exists()}\n"
+                f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
+            )
+            
+        try:
+            # Get file size before loading
+            file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
+            
+            img = np.load(full_path)
+            original_shape = img.shape
+            original_dtype = img.dtype
+            original_min = float(img.min())
+            original_max = float(img.max())
+            
+            # Handle [H, W, C] -> [C, H, W]
+            if img.ndim == 3 and img.shape[-1] == 3: 
+                img = img.transpose(2, 0, 1)
+            # Also handle [C, H, W] case (if shape[0] == 3, it's already CHW)
+            elif img.ndim == 3 and img.shape[0] == 3:
+                # Already in CHW format, no transpose needed
+                pass
+            img = torch.from_numpy(img).float()
+            
+            # Normalize [0, 255] or [0, 1] -> [-1, 1]
+            if img.max() > 1.0: 
+                img = (img / 127.5) - 1.0
+            else:
+                img = (img * 2.0) - 1.0
+                
+            img = torch.clamp(img, -1, 1)
+            
+            # Log details for first successful load (or first few)
+            if not self._first_load_logged or idx < 3:
+                print(f"\n{'='*60}", flush=True)
+                print(f"✓ Successfully loaded image #{idx}", flush=True)
+                print(f"{'='*60}", flush=True)
+                print(f"  Compound: {meta.get('CPD_NAME', 'unknown')}", flush=True)
+                print(f"  File path: {full_path}", flush=True)
+                print(f"  File size: {file_size_bytes:,} bytes ({file_size_bytes / 1024:.2f} KB)", flush=True)
+                print(f"  Original shape: {original_shape} (dtype: {original_dtype})", flush=True)
+                print(f"  Original range: [{original_min:.2f}, {original_max:.2f}]", flush=True)
+                print(f"  Processed shape: {img.shape} (dtype: {img.dtype})", flush=True)
+                print(f"  Processed range: [{img.min():.2f}, {img.max():.2f}]", flush=True)
+                print(f"  Fingerprint shape: {self.fingerprints.get(meta.get('CPD_NAME', 'DMSO'), np.zeros(1024)).shape}", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                if idx >= 3:
+                    self._first_load_logged = True
+                    
+        except Exception as e:
+            # Show the actual error instead of silently failing
+            raise RuntimeError(
+                f"CRITICAL: Failed to load image file!\n"
+                f"  Index: {idx}\n"
+                f"  Compound: {meta.get('CPD_NAME', 'unknown')}\n"
+                f"  File path: {full_path}\n"
+                f"  Original error: {type(e).__name__}: {str(e)}"
+            ) from e
 
-        img = np.load(full_path)
-        if img.ndim == 3 and img.shape[-1] == 3: img = img.transpose(2, 0, 1)
-        img = torch.from_numpy(img).float()
-        if img.max() > 1.0: img = (img / 127.5) - 1.0
-        else: img = (img * 2.0) - 1.0
-        img = torch.clamp(img, -1, 1)
-        
         cpd = meta.get('CPD_NAME', 'DMSO')
         fp = self.fingerprints.get(cpd, np.zeros(1024))
         
-        return {'image': img, 'fingerprint': torch.from_numpy(fp).float(), 'compound': cpd}
+        return {
+            'image': img, 
+            'fingerprint': torch.from_numpy(fp).float(), 
+            'compound': cpd
+        }
 
 class PairedDataLoader:
     def __init__(self, dataset, batch_size, shuffle=True):
@@ -771,6 +998,7 @@ def main():
     parser.add_argument('--phi_checkpoint', type=str, default='./results_phi_phi/checkpoints/checkpoint_epoch_100.pt',
                         help='Path to phi checkpoint (default: pretrained from config)')
     parser.add_argument('--output_dir', type=str, default='ddpm_ddmec_results', help='Output directory for checkpoints and logs')
+    parser.add_argument('--paths_csv', type=str, default=None, help='Path to paths.csv file for robust file lookup (auto-detected if not specified)')
     args = parser.parse_args()
     
     config = Config()
@@ -839,11 +1067,11 @@ def main():
     
     # 3. Data
     encoder = MorganFingerprintEncoder()
-    ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder)
+    ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='train', encoder=encoder, paths_csv=args.paths_csv)
     loader = PairedDataLoader(ds, config.batch_size, shuffle=True)
     
     # Test Data for Evaluation (FIX: Use test split as requested)
-    test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder)
+    test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     test_loader = PairedDataLoader(test_ds, config.batch_size, shuffle=False)
     
     # Initialize CSV Log
