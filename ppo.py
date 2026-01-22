@@ -761,10 +761,16 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--iters', type=int, default=100)
+    parser = argparse.ArgumentParser(description='DDMEC-PPO Training')
+    parser.add_argument('--iters', type=int, default=100, help='Total number of training iterations')
     parser.add_argument('--eval_samples', type=int, default=1000, help='Number of samples for evaluation')
     parser.add_argument('--eval_steps', type=int, default=50, help='Number of inference steps for evaluation')
+    parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint in output_dir')
+    parser.add_argument('--theta_checkpoint', type=str, default='./ddpm_diffusers_results/checkpoints/checkpoint_epoch_60.pt', 
+                        help='Path to theta checkpoint (default: pretrained from config)')
+    parser.add_argument('--phi_checkpoint', type=str, default='./results_phi_phi/checkpoints/checkpoint_epoch_100.pt',
+                        help='Path to phi checkpoint (default: pretrained from config)')
+    parser.add_argument('--output_dir', type=str, default='ddpm_ddmec_results', help='Output directory for checkpoints and logs')
     args = parser.parse_args()
     
     config = Config()
@@ -772,14 +778,50 @@ def main():
     # Override config with args
     config.eval_max_samples = args.eval_samples
     config.eval_steps = args.eval_steps
+    config.output_dir = args.output_dir
     
     os.makedirs(config.output_dir, exist_ok=True)
     
     print("Initializing Models...")
     
+    # Determine starting iteration and checkpoint paths
+    start_iter = 0
+    if args.resume:
+        # Find latest checkpoints in output directory
+        import glob
+        theta_checkpoints = glob.glob(f"{config.output_dir}/theta_*.pt")
+        phi_checkpoints = glob.glob(f"{config.output_dir}/phi_*.pt")
+        
+        if theta_checkpoints and phi_checkpoints:
+            # Extract iteration numbers and find the latest
+            theta_iters = [int(os.path.basename(f).split('_')[1].split('.')[0]) for f in theta_checkpoints]
+            phi_iters = [int(os.path.basename(f).split('_')[1].split('.')[0]) for f in phi_checkpoints]
+            
+            # Use the minimum of the two to ensure both models are at the same iteration
+            start_iter = min(max(theta_iters), max(phi_iters))
+            
+            theta_checkpoint_path = f"{config.output_dir}/theta_{start_iter}.pt"
+            phi_checkpoint_path = f"{config.output_dir}/phi_{start_iter}.pt"
+            
+            print(f"\n{'='*60}")
+            print(f"RESUMING TRAINING FROM ITERATION {start_iter}")
+            print(f"{'='*60}")
+            print(f"  Theta checkpoint: {theta_checkpoint_path}")
+            print(f"  Phi checkpoint: {phi_checkpoint_path}")
+            print(f"  Will train for {args.iters - start_iter} more iterations")
+            print(f"{'='*60}\n")
+        else:
+            print("Warning: --resume specified but no checkpoints found. Starting from pretrained models.")
+            theta_checkpoint_path = config.theta_checkpoint
+            phi_checkpoint_path = config.phi_checkpoint
+    else:
+        # Use command-line specified checkpoints or defaults from config
+        theta_checkpoint_path = args.theta_checkpoint if args.theta_checkpoint else config.theta_checkpoint
+        phi_checkpoint_path = args.phi_checkpoint if args.phi_checkpoint else config.phi_checkpoint
+    
     # 1. Load Theta (Forward)
     theta_model = DiffusionModel(config)
-    theta_model.load_checkpoint(config.theta_checkpoint)
+    theta_model.load_checkpoint(theta_checkpoint_path)
     theta_ref = copy.deepcopy(theta_model)
     theta_ref.model.requires_grad_(False)
     theta_ref.model.eval()
@@ -789,7 +831,7 @@ def main():
     
     # 2. Load Phi (Reverse)
     phi_model = DiffusionModel(config)
-    phi_model.load_checkpoint(config.phi_checkpoint)
+    phi_model.load_checkpoint(phi_checkpoint_path)
     phi_ref = copy.deepcopy(phi_model)
     phi_ref.model.requires_grad_(False)
     phi_ref.model.eval()
@@ -809,13 +851,16 @@ def main():
         with open(config.log_file, 'w') as f:
             f.write("iteration,theta_reward,phi_reward,theta_ppo_loss,phi_ppo_loss,theta_sup_loss,phi_sup_loss,fid_control,fid_treated,kid_control,kid_treated\n")
             
-    print(f"Starting DDMEC-PPO Loop for {args.iters} iterations...")
+    if start_iter > 0:
+        print(f"Continuing DDMEC-PPO Loop from iteration {start_iter} to {args.iters}...")
+    else:
+        print(f"Starting DDMEC-PPO Loop for {args.iters} iterations...")
     iterator = iter(loader)
     
     theta_losses = []
     phi_losses = []
 
-    for it in range(args.iters):
+    for it in range(start_iter, args.iters):
         try:
             batch = next(iterator)
         except StopIteration:
@@ -913,8 +958,8 @@ def main():
         torch.nn.utils.clip_grad_norm_(theta_model.parameters(), 1.0)
         theta_opt.step()
         
-        # Save & Vis
-        if (it + 1) % 1 == 0:
+        # Save & Vis & Evaluate every 15 iterations
+        if (it + 1) % 15 == 0:
             torch.save({'model': theta_model.model.state_dict()}, f"{config.output_dir}/theta_{it+1}.pt")
             torch.save({'model': phi_model.model.state_dict()}, f"{config.output_dir}/phi_{it+1}.pt")
             
@@ -937,12 +982,16 @@ def main():
                 print(f"Saved visualization to {config.output_dir}")
                 
             # Evaluation on TEST Set
+            print(f"\n{'='*60}")
+            print(f"Running Evaluation at Iteration {it+1}")
+            print(f"{'='*60}")
             metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
             print(f"Iter {it+1} Evaluation:")
             print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
             print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
             print(f"  KID_Control: {metrics['KID_Control']:.4f}")
             print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+            print(f"{'='*60}\n")
             
             # Log to CSV
             # Get latest losses (defaults to 0 if list empty or index error, though loop ensures append)
