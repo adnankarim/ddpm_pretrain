@@ -351,7 +351,7 @@ class BBBC021TrainOnlyDataset(Dataset):
                         matches = list(search_dir.rglob(search_pattern))
                         if matches:
                             return matches[0]
-        
+            
         return None
 
     def __len__(self):
@@ -381,7 +381,7 @@ class BBBC021TrainOnlyDataset(Dataset):
                 f"  Data directory exists: {self.data_dir.exists()}\n"
                 f"  paths.csv loaded: {len(self.paths_lookup) > 0}"
             )
-            
+
         try:
             # Get file size before loading
             file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
@@ -398,7 +398,7 @@ class BBBC021TrainOnlyDataset(Dataset):
             img = torch.from_numpy(img).float()
             
             # Normalize [0, 255] or [0, 1] -> [-1, 1]
-            if img.max() > 1.0: 
+            if img.max() > 1.0:
                 img = (img / 127.5) - 1.0
             else:
                 img = (img * 2.0) - 1.0

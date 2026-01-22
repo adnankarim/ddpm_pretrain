@@ -308,10 +308,10 @@ class BBBC021Dataset(Dataset):
         # Pre-encode chemicals
         self.fingerprints = {}
         if 'CPD_NAME' in df.columns:
-            for cpd in df['CPD_NAME'].unique():
+        for cpd in df['CPD_NAME'].unique():
                 row = df[df['CPD_NAME'] == cpd].iloc[0]
                 smiles = row.get('SMILES', '')
-                self.fingerprints[cpd] = self.encoder.encode(smiles)
+            self.fingerprints[cpd] = self.encoder.encode(smiles)
         
         # Load paths.csv for robust file lookup (same as infer.py)
         self.paths_lookup = {}  # filename -> list of relative_paths

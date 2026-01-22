@@ -135,10 +135,10 @@ class MorganEncoder:
 
         if RDKIT_OK and smiles and smiles not in ["DMSO", ""]:
             try:
-                mol = Chem.MolFromSmiles(smiles)
+    mol = Chem.MolFromSmiles(smiles)
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=self.n_bits)
                 arr = np.zeros((self.n_bits,), dtype=np.float32)
-                DataStructs.ConvertToNumpyArray(fp, arr)
+    DataStructs.ConvertToNumpyArray(fp, arr)
                 self.cache[smiles] = arr
                 return arr
             except Exception:
@@ -227,8 +227,8 @@ class PairedBBBC021Dataset(Dataset):
         self.transform = transforms.Compose([
             transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
 
     def _find_file_path(self, path):
@@ -369,7 +369,7 @@ class PairedBBBC021Dataset(Dataset):
             # normalize to uint8 0..255 for PIL
             if img.max() > 1.0:
                 img = img.astype(np.uint8)
-            else:
+        else:
                 if img.min() < 0:
                     img = (img + 1.0) / 2.0
                 img = (img * 255).astype(np.uint8)
