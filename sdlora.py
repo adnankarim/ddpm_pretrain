@@ -700,20 +700,35 @@ def calculate_metrics_torchmetrics_sd(unet, controlnet, vae, noise_scheduler, dr
     generated_samples = {}
     target_samples = {}
     
-    eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
+    # Calculate expected number of batches
+    batch_size = 4
+    total_dataset_samples = len(dataset)
+    expected_batches = min((num_samples + batch_size - 1) // batch_size, (total_dataset_samples + batch_size - 1) // batch_size)
+    print(f"  Processing {num_samples} samples from {total_dataset_samples} available (will process ~{expected_batches} batches)", flush=True)
+    eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
     weight_dtype = torch.float32
     
     sample_count = 0
     with torch.no_grad():
         from tqdm.auto import tqdm
-        for batch in tqdm(eval_loader, desc="  Evaluating", leave=False):
+        pbar = tqdm(eval_loader, desc=f"  Evaluating ({num_samples} samples)", total=expected_batches, leave=False)
+        for batch in pbar:
             if sample_count >= num_samples:
                 break
             
-            ctrl_img = batch['control'].to(config.device, dtype=weight_dtype)
-            target_img = batch['target'].to(config.device, dtype=weight_dtype)
-            fp = batch['fingerprint'].to(config.device)
-            prompts = batch['prompt']
+            # Handle last batch that might exceed num_samples
+            remaining_samples = num_samples - sample_count
+            if remaining_samples < batch_size:
+                # Only process the first remaining_samples from this batch
+                ctrl_img = batch['control'][:remaining_samples].to(config.device, dtype=weight_dtype)
+                target_img = batch['target'][:remaining_samples].to(config.device, dtype=weight_dtype)
+                fp = batch['fingerprint'][:remaining_samples].to(config.device)
+                prompts = batch['prompt'][:remaining_samples] if isinstance(batch['prompt'], list) else batch['prompt']
+            else:
+                ctrl_img = batch['control'].to(config.device, dtype=weight_dtype)
+                target_img = batch['target'].to(config.device, dtype=weight_dtype)
+                fp = batch['fingerprint'].to(config.device)
+                prompts = batch['prompt']
             
             # Prepare context
             tokens = tokenizer(prompts, padding="max_length", truncation=True, return_tensors="pt").input_ids.to(config.device)
@@ -766,7 +781,8 @@ def calculate_metrics_torchmetrics_sd(unet, controlnet, vae, noise_scheduler, dr
             kid_metric.update(gen_uint8, real=False)
             
             # Group by compound (extract from metadata if available)
-            for i in range(target_img.shape[0]):
+            actual_batch_size = target_img.shape[0]
+            for i in range(actual_batch_size):
                 # Try to get compound name from dataset metadata
                 compound = "unknown"
                 if hasattr(dataset, 'metadata') and len(dataset.metadata) > sample_count + i:
@@ -782,7 +798,8 @@ def calculate_metrics_torchmetrics_sd(unet, controlnet, vae, noise_scheduler, dr
                 generated_samples[compound].append(gen_uint8[i])
                 target_samples[compound].append(real_uint8[i])
             
-            sample_count += target_img.shape[0]
+            sample_count += actual_batch_size
+            pbar.set_postfix({"samples": sample_count, "target": num_samples})
     
     # Compute overall metrics
     fid = fid_metric.compute()
