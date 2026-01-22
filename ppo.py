@@ -406,6 +406,10 @@ class BBBC021Dataset(Dataset):
                 
             img = torch.clamp(img, -1, 1)
             
+            # Debug: Check for constant images (Grey/Black)
+            if img.min() == img.max():
+                print(f"WARNING: Loade image {full_path} is constant value {img.min()}! (Original range: [{original_min}, {original_max}])")
+            
             # Log details for first successful load (or first few)
             if not self._first_load_logged or idx < 3:
                 print(f"\n{'='*60}", flush=True)
@@ -1135,6 +1139,31 @@ def main():
     else:
         print(f"Starting DDMEC-PPO Loop for {args.iters} iterations...")
     iterator = iter(loader)
+    
+    # --- Initial Evaluation ---
+    print(f"\n{'='*60}")
+    print(f"Running Initial Evaluation (Before Training)")
+    print(f"{'='*60}")
+    # Run a quick check with fewer samples if needed, or full eval as configured
+    # Using config settings standardizes it
+    try:
+        metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
+        print(f"Initial Evaluation Results:")
+        print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
+        print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
+        print(f"  KID_Control: {metrics['KID_Control']:.4f}")
+        print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+        
+        # Log initial values (iteration 0)
+        with open(config.log_file, 'a') as f:
+            f.write(f"0,0,0,0,0,0,0,"
+                    f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
+                    
+    except Exception as e:
+        print(f"Warning: Initial evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+    print(f"{'='*60}\n")
     
     theta_losses = []
     phi_losses = []
