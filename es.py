@@ -770,7 +770,7 @@ def es_perturb_inplace(module: torch.nn.Module, seed: int, sigma: float, negate:
     # Use a single generator so noise differs across parameters but is reproducible
     gen = None
 
-    for p in module.parameters():
+    for name, p in sorted(module.named_parameters()):
         if not p.requires_grad:
             continue
         if gen is None:
@@ -802,7 +802,7 @@ def es_step_update(
 
     for i, s in enumerate(seeds):
         es_perturb_inplace(model, s, sigma)
-        r = eval_fn(model)
+        r = eval_fn(model, s)
         # allow torch scalar or float
         rewards[i] = float(r.item() if torch.is_tensor(r) else r)
         es_restore_inplace(model, s, sigma)
@@ -813,11 +813,11 @@ def es_step_update(
     z = (rewards - r_mean) / r_std
 
     # 4) decomposed in-place parameter update (seed-by-seed, param-by-param)
-    # coeff absorbs (alpha/N) like Algorithm 2
+    # coeff absorbs (alpha/N) like Algorithm 2, plus 1/sigma for standard ES estimator
     for i, s in enumerate(seeds):
-        coeff = (alpha / population_size) * float(z[i])
+        coeff = (alpha / (population_size * sigma)) * float(z[i])
         gen = None
-        for p in model.parameters():
+        for name, p in sorted(model.named_parameters()):
             if not p.requires_grad:
                 continue
             if gen is None:
@@ -951,6 +951,7 @@ def main():
                         help='Path to phi checkpoint (default: pretrained from config)')
     parser.add_argument('--output_dir', type=str, default='ddpm_es_results', help='Output directory for checkpoints and logs')
     parser.add_argument('--paths_csv', type=str, default=None, help='Path to paths.csv file for robust file lookup (auto-detected if not specified)')
+    parser.add_argument('--skip_initial_eval', action='store_true', help='Skip the initial evaluation before training starts')
     args = parser.parse_args()
     
     config = Config()
@@ -1022,6 +1023,48 @@ def main():
     test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     test_loader = PairedDataLoader(test_ds, config.batch_size, shuffle=False)
     
+    # Print dataset details
+    print(f"\n{'='*60}")
+    print(f"Dataset Details:")
+    print(f"{'='*60}")
+    
+    try:
+        train_count = len(ds)
+        test_count = len(test_ds)
+        print(f"Train split: {train_count} samples")
+        print(f"Test split: {test_count} samples")
+        print(f"Total samples: {train_count + test_count}")
+        
+        # Count compounds
+        if hasattr(ds, 'metadata') and ds.metadata:
+            train_compounds = len(set([m.get('CPD_NAME', '') for m in ds.metadata]))
+            test_compounds = len(set([m.get('CPD_NAME', '') for m in test_ds.metadata]))
+            print(f"Train compounds: {train_compounds}")
+            print(f"Test compounds: {test_compounds}")
+            
+            # Count batches
+            train_batches = len(set([m.get('BATCH', '') for m in ds.metadata]))
+            test_batches = len(set([m.get('BATCH', '') for m in test_ds.metadata]))
+            print(f"Train batches: {train_batches}")
+            print(f"Test batches: {test_batches}")
+            
+            # Count DMSO vs perturbed
+            train_dmso = sum([1 for m in ds.metadata if str(m.get('CPD_NAME', '')).upper() == 'DMSO'])
+            train_perturbed = len(ds.metadata) - train_dmso
+            test_dmso = sum([1 for m in test_ds.metadata if str(m.get('CPD_NAME', '')).upper() == 'DMSO'])
+            test_perturbed = len(test_ds.metadata) - test_dmso
+            print(f"Train - DMSO: {train_dmso}, Perturbed: {train_perturbed}")
+            print(f"Test - DMSO: {test_dmso}, Perturbed: {test_perturbed}")
+        else:
+            print("Warning: Could not access dataset metadata for detailed statistics")
+        
+        print(f"{'='*60}\n")
+    except Exception as e:
+        print(f"Error printing dataset details: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*60}\n")
+    
     # Save a random dataset sample image to verify loading is correct
     print("\nSaving random dataset sample images to verify loading...")
     try:
@@ -1085,28 +1128,31 @@ def main():
     iterator = iter(loader)
     
     # --- Initial Evaluation ---
-    print(f"\n{'='*60}")
-    print(f"Running Initial Evaluation (Before Training)")
-    print(f"{'='*60}")
-    try:
-        metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
-        print(f"Initial Evaluation Results:")
-        print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
-        print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
-        print(f"  KID_Control: {metrics['KID_Control']:.4f}")
-        print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+    if not args.skip_initial_eval:
+        print(f"\n{'='*60}")
+        print(f"Running Initial Evaluation (Before Training)")
+        print(f"{'='*60}")
+        try:
+            metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
+            print(f"Initial Evaluation Results:")
+            print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
+            print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
+            print(f"  KID_Control: {metrics['KID_Control']:.4f}")
+            print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
         
-        # Log initial values (iteration 0)
-        with open(config.log_file, 'a') as f:
-            f.write(f"0,0,0,0,0,0,0,0,0,"
-                    f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
+            # Log initial values (iteration 0)
+            with open(config.log_file, 'a') as f:
+                f.write(f"0,0,0,0,0,"
+                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
                     
-    except Exception as e:
-        print(f"Warning: Initial evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-    print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"Warning: Initial evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+        print(f"{'='*60}\n")
     
+    else:
+        print("\nSkipping Initial Evaluation (--skip_initial_eval set)\n")
     # Seed RNG for ES
     seed_rng = np.random.default_rng(0) 
 
@@ -1121,37 +1167,68 @@ def main():
         trt = batch['perturbed'].to(config.device)
         fp = batch['fingerprint'].to(config.device)
         
-        # Setup Deterministic Evaluation Functions for this iteration/batch
+        # Setup Evaluation Functions for this iteration/batch
+        # Note: We now use strict Algorithm 2 seeding (reset RNG per candidate using seed s)
+        # to match the pseudocode exactly.
         eval_seed = config.es_eval_seed_base + it  # deterministic per-iteration
         device = config.device
 
-        def theta_eval_fn(current_theta_model):
-            rng = torch.Generator(device=device)
-            rng.manual_seed(eval_seed)
-            # Rollout with current theta (perturbed or not)
+        def theta_eval_fn(current_unet, s):
+            # Note: current_unet is the perturbed UNet passed by es_step_update.
+            # Since perturbation is in-place, theta_model.model REFERS to this same object.
+            # We pass 'theta_model' (wrapper) to rollout_sample because it needs the scheduler/config.
+            
+            # Strict Algorithm 2 Seeding: Per-candidate RNG reset
+            # Mix iteration-level seed (eval_seed) with candidate seed (s)
+            s32 = int(s) & 0x7fffffff
+            roll_seed = (eval_seed ^ s32) & 0x7fffffff
+            rew_seed = ((eval_seed + 999) ^ s32) & 0x7fffffff
+
+            rng_roll = torch.Generator(device=device)
+            rng_roll.manual_seed(roll_seed)
+            
+            rng_rew = torch.Generator(device=device)
+            rng_rew.manual_seed(rew_seed)
+            
+            # Rollout with current theta (perturbed via in-place updates to theta_model.model)
             x0_gen = rollout_sample(
-                current_theta_model, cond_img=ctrl, fingerprint=fp,
-                steps=config.es_eval_steps, rng=rng
+                theta_model, cond_img=ctrl, fingerprint=fp,
+                steps=config.es_eval_steps, rng=rng_roll
             )
             # Reward: How well does Phi think this x0_gen is 'treated'?
+            # We want to maximize -log p_phi(ctrl | x0_gen)
             r = reward_negloglik_ddpm(
                 phi_model, target_img=ctrl, cond_img=x0_gen, fingerprint=fp,
-                n_terms=config.es_reward_n_terms, mc=config.es_reward_mc, rng=rng
+                n_terms=config.es_reward_n_terms, mc=config.es_reward_mc, rng=rng_rew
             )
             return r.mean()
 
-        def phi_eval_fn(current_phi_model):
-            rng = torch.Generator(device=device)
-            rng.manual_seed(eval_seed)
+        def phi_eval_fn(current_unet, s):
+            # Note: current_unet is the perturbed UNet passed by es_step_update.
+            # Since perturbation is in-place, phi_model.model REFERS to this same object.
+            
+            # Strict Algorithm 2 Seeding: Per-candidate RNG reset
+            # Mix iteration-level seed (eval_seed) with candidate seed (s)
+            s32 = int(s) & 0x7fffffff
+            roll_seed = (eval_seed ^ s32) & 0x7fffffff
+            rew_seed = ((eval_seed + 999) ^ s32) & 0x7fffffff
+
+            rng_roll = torch.Generator(device=device)
+            rng_roll.manual_seed(roll_seed)
+
+            rng_rew = torch.Generator(device=device)
+            rng_rew.manual_seed(rew_seed)
+            
             # Rollout with current phi
             y0_gen = rollout_sample(
-                current_phi_model, cond_img=trt, fingerprint=fp,
-                steps=config.es_eval_steps, rng=rng
+                phi_model, cond_img=trt, fingerprint=fp,
+                steps=config.es_eval_steps, rng=rng_roll
             )
             # Reward: How well does Theta think this y0_gen is 'control'?
+            # We want to maximize -log p_theta(trt | y0_gen)
             r = reward_negloglik_ddpm(
                 theta_model, target_img=trt, cond_img=y0_gen, fingerprint=fp,
-                n_terms=config.es_reward_n_terms, mc=config.es_reward_mc, rng=rng
+                n_terms=config.es_reward_n_terms, mc=config.es_reward_mc, rng=rng_rew
             )
             return r.mean()
         
@@ -1160,7 +1237,7 @@ def main():
         # ====================================================================
         
         theta_stats = es_step_update(
-            model=theta_model,
+            model=theta_model.model,    # Operate on UNet directly
             eval_fn=theta_eval_fn,
             population_size=config.es_population_size,
             sigma=config.es_sigma,
@@ -1193,7 +1270,7 @@ def main():
         # ====================================================================
         
         phi_stats = es_step_update(
-            model=phi_model,
+            model=phi_model.model,      # Operate on UNet directly
             eval_fn=phi_eval_fn,
             population_size=config.es_population_size,
             sigma=config.es_sigma,
