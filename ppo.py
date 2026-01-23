@@ -772,8 +772,16 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
     # Note: DDMEC paper likely weights this by 1/sigma_t^2 or similar. 
     # This unweighted sum is a simplified surrogate.
     negloglik = 0.5 * acc
+    
+    # Safety: Clamp reward to avoid extreme values
+    # negloglik is L2 error, so always positive. We return -negloglik.
+    # If error is huge, reward is very negative.
+    negloglik = torch.nan_to_num(negloglik, nan=1000.0, posinf=1000.0, neginf=0.0)
+    negloglik = torch.clamp(negloglik, 0, 1000.0)
 
     # reward = - negloglik
+    # Scale reward to be roughly N(0,1) friendly? Or just clamp.
+    # Taking a soft limit might be better but hard clamp is robust.
     return -negloglik
 
 def ppo_update_from_batch(model, ref_model, optimizer, batch, config):
@@ -814,7 +822,13 @@ def ppo_update_from_batch(model, ref_model, optimizer, batch, config):
     
     # 2. Ratio
     # log(a/b) = log(a) - log(b) -> a/b = exp(log(a) - log(b))
-    ratio = torch.exp(new_logprob - old_logprob)
+    log_ratio = new_logprob - old_logprob
+    # Clamp log_ratio to prevent explosion/underflow
+    log_ratio = torch.clamp(log_ratio, -20, 20)
+    ratio = torch.exp(log_ratio)
+    
+    # Extra safety for NaNs
+    ratio = torch.nan_to_num(ratio, nan=1.0, posinf=10.0, neginf=0.1)
     
     # 3. PPO Loss
     surr1 = ratio * adv
@@ -1003,6 +1017,7 @@ def main():
                         help='Path to phi checkpoint (default: pretrained from config)')
     parser.add_argument('--output_dir', type=str, default='ddpm_ddmec_results', help='Output directory for checkpoints and logs')
     parser.add_argument('--paths_csv', type=str, default=None, help='Path to paths.csv file for robust file lookup (auto-detected if not specified)')
+    parser.add_argument('--skip_initial_eval', action='store_true', help='Skip the initial evaluation before training starts')
     args = parser.parse_args()
     
     config = Config()
@@ -1183,29 +1198,32 @@ def main():
     iterator = iter(loader)
     
     # --- Initial Evaluation ---
-    print(f"\n{'='*60}")
-    print(f"Running Initial Evaluation (Before Training)")
-    print(f"{'='*60}")
-    # Run a quick check with fewer samples if needed, or full eval as configured
-    # Using config settings standardizes it
-    try:
-        metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
-        print(f"Initial Evaluation Results:")
-        print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
-        print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
-        print(f"  KID_Control: {metrics['KID_Control']:.4f}")
-        print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
-        
-        # Log initial values (iteration 0)
-        with open(config.log_file, 'a') as f:
-            f.write(f"0,0,0,0,0,0,0,"
-                    f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
-                    
-    except Exception as e:
-        print(f"Warning: Initial evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
-    print(f"{'='*60}\n")
+    if not args.skip_initial_eval:
+        print(f"\n{'='*60}")
+        print(f"Running Initial Evaluation (Before Training)")
+        print(f"{'='*60}")
+        # Run a quick check with fewer samples if needed, or full eval as configured
+        # Using config settings standardizes it
+        try:
+            metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
+            print(f"Initial Evaluation Results:")
+            print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
+            print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
+            print(f"  KID_Control: {metrics['KID_Control']:.4f}")
+            print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+            
+            # Log initial values (iteration 0)
+            with open(config.log_file, 'a') as f:
+                f.write(f"0,0,0,0,0,0,0,"
+                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
+                        
+        except Exception as e:
+            print(f"Warning: Initial evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+        print(f"{'='*60}\n")
+    else:
+        print("\nSkipping Initial Evaluation (--skip_initial_eval set)\n")
     
     theta_losses = []
     phi_losses = []
