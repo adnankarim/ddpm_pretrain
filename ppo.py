@@ -60,8 +60,8 @@ class Config:
     # PPO Specifics
     ppo_epochs = 4        # K optimization epochs per rollout
     ppo_clip_range = 0.1  # Clipping parameter epsilon
-    kl_beta = 0.05        # Weight for KL anchor to pretrained model
-    rollout_steps = 100   # Strided rollout (faster RL)
+    kl_beta = 0.5         # Weight for KL anchor to pretrained model (Increased from 0.05)
+    rollout_steps = 1000  # Full rollout (temporarily disable striding)
     cond_drop_prob = 0.1  # Probability of dropping conditioning for CFG training
     guidance_scale = 1.0  # Classifier-free guidance scale (Init to 1.0 as pretrained model is not CFG-trained)
     
@@ -686,11 +686,13 @@ def rollout_with_logprobs(model: DiffusionModel, cond_img, fingerprint, steps=No
         
         # 1. Model Prediction (CFG)
         eps_cond = model.model(x, t_batch, cond_img, fingerprint, drop_cond=False)
-        eps_uncond = model.model(x, t_batch, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
-        
-        # Micro-fix 1: Explicit config access
         w = model.cfg.guidance_scale
-        eps_pred = eps_uncond + w * (eps_cond - eps_uncond)
+        
+        if abs(w - 1.0) > 1e-6:
+            eps_uncond = model.model(x, t_batch, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
+            eps_pred = eps_uncond + w * (eps_cond - eps_uncond)
+        else:
+            eps_pred = eps_cond
         
         # 2. Get Posterior Distribution
         mu, var, x0_pred = get_posterior_mean_variance(scheduler, x, eps_pred, t_batch, prev_t_batch, clip_sample=clip_sample)
@@ -744,33 +746,49 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
     device = other_model.cfg.device
     b = target_img.shape[0]
 
-    # Accumulate MSE terms
+    # Weighting by 1/sigma_t^2 (SNR weighting) to improve reward contrast
+    # sigma_t^2 = 1 - alpha_cumprod_t
+    alpha_prod_t = scheduler.alphas_cumprod.to(device)[t_batch] # [n_terms, b]
+    sigma2_t = 1 - alpha_prod_t
+    weights = 1.0 / (sigma2_t + 1e-5) # Avoid division by zero
+    
+    # Pre-fetch scale
+    w_cfg = other_model.cfg.guidance_scale
+    
     acc = torch.zeros((b,), device=device)
 
     for _ in range(mc):
         # sample a set of timesteps per batch element
-        t_batch = torch.randint(0, scheduler.config.num_train_timesteps, (n_terms, b), device=device).long()
+        t_batch_mc = torch.randint(0, scheduler.config.num_train_timesteps, (n_terms, b), device=device).long()
+        
+        # Precompute weights for this batch of timesteps
+        alpha_prod_t_mc = scheduler.alphas_cumprod.to(device)[t_batch_mc]
+        weights_mc = 1.0 / (1 - alpha_prod_t_mc + 1e-5)
+        
         for k in range(n_terms):
-            tk = t_batch[k]
+            tk = t_batch_mc[k]
             noise = torch.randn_like(target_img)
             y_t = scheduler.add_noise(target_img, noise, tk)
             
             # Use CFG for reward likelihood proxy
             eps_cond = other_model.model(y_t, tk, cond_img, fingerprint, drop_cond=False)
-            eps_uncond = other_model.model(y_t, tk, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
             
-            # Micro-fix 1: Explicit config access
-            w = other_model.cfg.guidance_scale
-            eps_pred = eps_uncond + w * (eps_cond - eps_uncond)
+            if abs(w_cfg - 1.0) > 1e-6:
+                eps_uncond = other_model.model(y_t, tk, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
+                eps_pred = eps_uncond + w_cfg * (eps_cond - eps_uncond)
+            else:
+                eps_pred = eps_cond
             
-            mse = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))
-            acc += mse
+            # Weighted MSE for this term
+            mse_term = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))
+            
+            # Apply weight
+            weight_k = weights_mc[k]
+            acc += mse_term * weight_k
 
     acc = acc / (mc * n_terms)
 
-    # Eq(8) has 1/2 factor; constant irrelevant
-    # Note: DDMEC paper likely weights this by 1/sigma_t^2 or similar. 
-    # This unweighted sum is a simplified surrogate.
+    # Eq(8) has 1/2 factor
     negloglik = 0.5 * acc
     
     # Safety: Clamp reward to avoid extreme values

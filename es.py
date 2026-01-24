@@ -57,14 +57,15 @@ class Config:
     batch_size = 32       # Batch size for initial sampling (rollouts will be broken into minibatches)
     ppo_minibatch_size = 64 # Minibatch size for PPO updates
     
-    # ES Specifics (Algorithm 2)
-    es_population_size = 30
-    es_sigma = 0.001
-    es_alpha = 0.0005
-    es_eval_steps = 100          # can reuse rollout_steps; keep small for speed
-    es_reward_n_terms = 32       # can reuse reward_n_terms
-    es_reward_mc = 3             # can reuse reward_mc
-    es_eval_seed_base = 12345    # deterministic eval seed baseline
+    # ES Specifics (Algorithm 2) - Updated for Stability
+    es_population_size = 16 
+    es_sigma = 0.01        # Increased from 0.001 to prevent tiny-step explosion
+    es_alpha = 0.0001      # Reduced from 0.0005 to slow down updates
+    es_eval_steps = 100          
+    es_reward_n_terms = 32       
+    es_reward_mc = 3             
+    es_eval_seed_base = 12345 
+
     
     rollout_steps = 100   # Strided rollout (faster RL)
     cond_drop_prob = 0.1  # Probability of dropping conditioning for CFG training
@@ -685,9 +686,13 @@ def rollout_sample(model: DiffusionModel, cond_img, fingerprint, steps=None, rng
         prev_t_batch = torch.full((b,), prev_t_int, device=device, dtype=torch.long)
 
         eps_cond = model.model(x, t_batch, cond_img, fingerprint, drop_cond=False)
-        eps_uncond = model.model(x, t_batch, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
         w_cfg = model.cfg.guidance_scale
-        eps_pred = eps_uncond + w_cfg * (eps_cond - eps_uncond)
+        
+        if abs(w_cfg - 1.0) > 1e-6:
+            eps_uncond = model.model(x, t_batch, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
+            eps_pred = eps_uncond + w_cfg * (eps_cond - eps_uncond)
+        else:
+            eps_pred = eps_cond
 
         mu, var, x0_pred = get_posterior_mean_variance(
             scheduler, x, eps_pred, t_batch, prev_t_batch, clip_sample=clip_sample
@@ -717,9 +722,8 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
                           rng: torch.Generator=None):
     """
     Approximate -log p_other(target | cond) up to a constant using Eq.(8):
-      const + 1/2 * sum_t E||eps - eps_phi(y_t, x, t)||^2
+      const + 1/2 * sum_t 1/sigma_t^2 * E||eps - eps_phi(y_t, x, t)||^2
     We Monte-Carlo it by sampling timesteps and noises.
-    Return REWARD = -negloglik (higher is better), like the paper’s RL objective.
     """
     other_model.model.eval()
     scheduler = other_model.noise_scheduler
@@ -729,14 +733,21 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
     # Accumulate MSE terms
     acc = torch.zeros((b,), device=device)
 
+    # Pre-fetch scale
+    w_cfg = other_model.cfg.guidance_scale
+
     for _ in range(mc):
-        # torch.randint supports generator=
-        t_batch = torch.randint(
+        t_batch_mc = torch.randint(
             0, scheduler.config.num_train_timesteps, (n_terms, b), device=device, dtype=torch.long,
             generator=rng
         )
+        
+        # Precompute weights for this batch of timesteps (1 / (1 - alpha_bar_t))
+        alpha_prod_t_mc = scheduler.alphas_cumprod.to(device)[t_batch_mc]
+        weights_mc = 1.0 / (1 - alpha_prod_t_mc + 1e-5)
+
         for k in range(n_terms):
-            tk = t_batch[k]
+            tk = t_batch_mc[k]
             if rng is None:
                 noise = torch.randn_like(target_img)
             else:
@@ -746,20 +757,23 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
             
             # Use CFG for reward likelihood proxy
             eps_cond = other_model.model(y_t, tk, cond_img, fingerprint, drop_cond=False)
-            eps_uncond = other_model.model(y_t, tk, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
             
-            # Micro-fix 1: Explicit config access
-            w = other_model.cfg.guidance_scale
-            eps_pred = eps_uncond + w * (eps_cond - eps_uncond)
+            if abs(w_cfg - 1.0) > 1e-6:
+                eps_uncond = other_model.model(y_t, tk, torch.zeros_like(cond_img), torch.zeros_like(fingerprint), drop_cond=True)
+                eps_pred = eps_uncond + w_cfg * (eps_cond - eps_uncond)
+            else:
+                eps_pred = eps_cond
             
-            mse = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))
-            acc += mse
+            # Weighted MSE for this term
+            mse_term = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))
+            
+            # Apply weight
+            weight_k = weights_mc[k]
+            acc += mse_term * weight_k
 
     acc = acc / (mc * n_terms)
 
-    # Eq(8) has 1/2 factor; constant irrelevant
-    # Note: DDMEC paper likely weights this by 1/sigma_t^2 or similar. 
-    # This unweighted sum is a simplified surrogate.
+    # Eq(8) has 1/2 factor
     negloglik = 0.5 * acc
 
     # reward = - negloglik
@@ -786,6 +800,17 @@ def es_restore_inplace(module: torch.nn.Module, seed: int, sigma: float):
     # Restore is just negate=True with same seed and sigma
     es_perturb_inplace(module, seed, sigma, negate=True)
 
+def compute_centered_ranks(x):
+    """
+    Map rewards to [-0.5, 0.5] uniform distribution (rank-based shaping).
+    Robust to outliers and invariant to reward scaling.
+    """
+    y = np.argsort(x)
+    ranks = np.zeros_like(x)
+    ranks[y] = np.arange(len(x))
+    ranks = ranks / (len(x) - 1) - 0.5
+    return ranks
+
 def es_step_update(
     model: torch.nn.Module,
     eval_fn,                      # callable(model)-> scalar reward (python float or 0-d tensor)
@@ -794,28 +819,40 @@ def es_step_update(
     alpha: float,
     seed_rng: np.random.Generator
 ):
-    # 1) sample seeds
+    # 1) Sample seeds
     seeds = seed_rng.integers(0, 2**31 - 1, size=population_size, dtype=np.int64).tolist()
 
-    # 2) evaluate perturbed models
+    # 2) Evaluate perturbed models
     rewards = np.zeros((population_size,), dtype=np.float32)
 
     for i, s in enumerate(seeds):
         es_perturb_inplace(model, s, sigma)
         r = eval_fn(model, s)
-        # allow torch scalar or float
         rewards[i] = float(r.item() if torch.is_tensor(r) else r)
         es_restore_inplace(model, s, sigma)
 
-    # 3) z-score normalize rewards
+    # 3) Rank-based Reward Shaping (Robust ES)
+    # Instead of z-score which explodes with low variance, use centered ranks.
+    adv = compute_centered_ranks(rewards)
+    
+    # Optional: Safety floor for std (if we were using z-score, not needed for ranks but good for stats)
     r_mean = float(rewards.mean())
-    r_std = float(rewards.std() + 1e-8)
-    z = (rewards - r_mean) / r_std
+    r_std = float(rewards.std())
+    safe_std = max(r_std, 0.1) 
 
-    # 4) decomposed in-place parameter update (seed-by-seed, param-by-param)
-    # coeff absorbs (alpha/N) like Algorithm 2, plus 1/sigma for standard ES estimator
+    # 4) Decomposed in-place parameter update
+    # Gradient estimate ~ avg(adv[i] * noise[i] / sigma)
+    # Update: theta <- theta + alpha * Gradient
+    
     for i, s in enumerate(seeds):
-        coeff = (alpha / (population_size * sigma)) * float(z[i])
+        # Calculate raw coefficient
+        # For rank-based, adv is [-0.5, 0.5], so coeff scale is roughly alpha/(N*sigma)
+        coeff = (alpha / (population_size * sigma)) * float(adv[i])
+        
+        # CRITICAL SAFETY: Clamp coefficient to prevent massive jumps
+        # Limits max single-step update contribution from one member
+        coeff = np.clip(coeff, -1e-3, 1e-3)
+        
         gen = None
         for name, p in sorted(model.named_parameters()):
             if not p.requires_grad:
@@ -833,6 +870,7 @@ def es_step_update(
         "reward_std": r_std,
         "reward_min": float(rewards.min()),
         "reward_max": float(rewards.max()),
+        "safe_std_used": safe_std # Logic check
     }
 
 # ============================================================================

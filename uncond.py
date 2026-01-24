@@ -1268,6 +1268,14 @@ def train_unconditional_model(model, train_loader, config, output_dir, model_nam
     print(f"  Batch size: {config.batch_size}")
     print(f"{'='*60}\n")
     
+    # Generate initial samples (before training starts)
+    print("  Generating initial samples (before training)...")
+    with torch.no_grad():
+        initial_samples = model.sample(batch_size=16, num_inference_steps=200)
+        save_image(initial_samples, f"{output_dir}/plots/samples_epoch_0_initial.png", 
+                  nrow=4, normalize=True, value_range=(-1, 1))
+        print(f"  ✓ Initial samples saved to {output_dir}/plots/samples_epoch_0_initial.png\n")
+    
     for epoch in range(config.epochs):
         model.model.train()
         losses = []
@@ -1287,8 +1295,8 @@ def train_unconditional_model(model, train_loader, config, output_dir, model_nam
         print(f"Epoch {epoch+1}/{config.epochs} | Loss: {avg_loss:.5f} | LR: {current_lr:.2e}")
         logger.update(epoch+1, avg_loss, None, current_lr)
         
-        # Generate samples every eval_freq epochs
-        if (epoch + 1) % config.eval_freq == 0:
+        # Generate samples at epoch 1, then every eval_freq epochs
+        if (epoch + 1) == 1 or (epoch + 1) % config.eval_freq == 0:
             print(f"  Generating samples...")
             with torch.no_grad():
                 samples = model.sample(batch_size=16, num_inference_steps=200)
@@ -1314,6 +1322,14 @@ def train_unconditional_model(model, train_loader, config, output_dir, model_nam
         }, f"{output_dir}/checkpoints/latest.pt")
         
         print(f"  ✓ Checkpoint saved: {checkpoint_path}\n")
+    
+    # Generate final samples (after training completes)
+    print(f"  Generating final samples (after training)...")
+    with torch.no_grad():
+        final_samples = model.sample(batch_size=16, num_inference_steps=200)
+        save_image(final_samples, f"{output_dir}/plots/samples_epoch_{config.epochs}_final.png", 
+                  nrow=4, normalize=True, value_range=(-1, 1))
+        print(f"  ✓ Final samples saved to {output_dir}/plots/samples_epoch_{config.epochs}_final.png")
     
     print(f"\n✅ {model_name} model training complete!")
     print(f"   Final checkpoint: {output_dir}/checkpoints/checkpoint_epoch_{config.epochs}.pt\n")
