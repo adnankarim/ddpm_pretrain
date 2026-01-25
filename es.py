@@ -61,6 +61,7 @@ class Config:
     es_population_size = 16 
     es_sigma = 0.01        # Increased from 0.001 to prevent tiny-step explosion
     es_alpha = 0.0001      # Reduced from 0.0005 to slow down updates
+    es_anchor_coeff = 1.0  # Strength of L2 anchor to initial weights
     es_eval_steps = 100          
     es_reward_n_terms = 32       
     es_reward_mc = 3             
@@ -817,7 +818,9 @@ def es_step_update(
     population_size: int,
     sigma: float,
     alpha: float,
-    seed_rng: np.random.Generator
+    seed_rng: np.random.Generator,
+    initial_state_dict: dict = None,
+    anchor_coeff: float = 0.0
 ):
     # 1) Sample seeds
     seeds = seed_rng.integers(0, 2**31 - 1, size=population_size, dtype=np.int64).tolist()
@@ -882,6 +885,11 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
     print("Running Evaluation (FID/KID)...")
     theta_model.model.eval()
     phi_model.model.eval()
+
+    # Capture initial states for Anchoring (keep on CPU to save VRAM)
+    print("Capturing initial model states for anchoring...")
+    theta_init_state = {k: v.cpu().clone() for k, v in theta_model.model.named_parameters()}
+    phi_init_state = {k: v.cpu().clone() for k, v in phi_model.model.named_parameters()}
     
     fid_metric_control = FrechetInceptionDistance(normalize=True).to(config.device) # FIDc (Real Ctrl vs Fake Ctrl from Trt)
     kid_metric_control = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device)
@@ -1280,7 +1288,9 @@ def main():
             population_size=config.es_population_size,
             sigma=config.es_sigma,
             alpha=config.es_alpha,
-            seed_rng=seed_rng
+            seed_rng=seed_rng,
+            initial_state_dict=theta_init_state,
+            anchor_coeff=config.es_anchor_coeff
         )
         print(f"Iter {it} | ES-Theta reward mean: {theta_stats['reward_mean']:.4f} "
               f"(min {theta_stats['reward_min']:.4f}, max {theta_stats['reward_max']:.4f})")
@@ -1313,7 +1323,9 @@ def main():
             population_size=config.es_population_size,
             sigma=config.es_sigma,
             alpha=config.es_alpha,
-            seed_rng=seed_rng
+            seed_rng=seed_rng,
+            initial_state_dict=phi_init_state,
+            anchor_coeff=config.es_anchor_coeff
         )
         print(f"Iter {it} | ES-Phi reward mean:   {phi_stats['reward_mean']:.4f} "
               f"(min {phi_stats['reward_min']:.4f}, max {phi_stats['reward_max']:.4f})")

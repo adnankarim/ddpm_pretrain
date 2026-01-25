@@ -746,11 +746,7 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
     device = other_model.cfg.device
     b = target_img.shape[0]
 
-    # Weighting by 1/sigma_t^2 (SNR weighting) to improve reward contrast
-    # sigma_t^2 = 1 - alpha_cumprod_t
-    alpha_prod_t = scheduler.alphas_cumprod.to(device)[t_batch] # [n_terms, b]
-    sigma2_t = 1 - alpha_prod_t
-    weights = 1.0 / (sigma2_t + 1e-5) # Avoid division by zero
+
     
     # Pre-fetch scale
     w_cfg = other_model.cfg.guidance_scale
