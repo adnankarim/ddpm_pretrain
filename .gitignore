@@ -26,3 +26,5 @@ Thumbs.db
 wandb/
 ddpm_ddmec_results/
 ddpm_es_results/
+training_log.csv
+log_files.txt
