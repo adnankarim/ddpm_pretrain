@@ -887,9 +887,10 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
     phi_model.model.eval()
 
     # Capture initial states for Anchoring (keep on CPU to save VRAM)
-    print("Capturing initial model states for anchoring...")
-    theta_init_state = {k: v.cpu().clone() for k, v in theta_model.model.named_parameters()}
-    phi_init_state = {k: v.cpu().clone() for k, v in phi_model.model.named_parameters()}
+    # Capture initial states for Anchoring (keep on CPU to save VRAM)
+    # print("Capturing initial model states for anchoring...")
+    # theta_init_state = {k: v.cpu().clone() for k, v in theta_model.model.named_parameters()}
+    # phi_init_state = {k: v.cpu().clone() for k, v in phi_model.model.named_parameters()}
     
     fid_metric_control = FrechetInceptionDistance(normalize=True).to(config.device) # FIDc (Real Ctrl vs Fake Ctrl from Trt)
     kid_metric_control = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device)
@@ -1059,6 +1060,12 @@ def main():
     phi_model.load_checkpoint(phi_checkpoint_path)
     # Phi needs an optimizer for phase B (supervised)
     phi_opt = torch.optim.AdamW(phi_model.parameters(), lr=config.lr)
+
+    # Capture initial states for Anchoring (keep on CPU to save VRAM)
+    # This is required for es_step_update
+    print("Capturing initial model states for anchoring...")
+    theta_init_state = {k: v.cpu().clone() for k, v in theta_model.model.named_parameters()}
+    phi_init_state = {k: v.cpu().clone() for k, v in phi_model.model.named_parameters()}
     
     # 3. Data
     encoder = MorganFingerprintEncoder()
