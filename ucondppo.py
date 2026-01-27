@@ -14,6 +14,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.kid import KernelInceptionDistance
+import json
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 # Check for diffusers
 try:
@@ -73,6 +76,13 @@ class Config:
     theta_pretrained = "./ddpm_uncond_perturbed/checkpoints/latest.pt" # Trained on Treated
     phi_pretrained = "./ddpm_uncond_control/checkpoints/latest.pt"     # Trained on Control
     output_dir = "ddpm_ddmec_drug_results"
+    
+    # Evaluation & Logging
+    eval_every = 10           # Evaluate FID/KID every N iterations
+    eval_steps = 50           # Number of diffusion steps for evaluation
+    eval_samples = 5000       # Number of samples for FID/KID
+    save_checkpoint_every = 50  # Save checkpoint every N iterations
+    log_every = 1             # Log metrics every N iterations
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -368,7 +378,24 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
 
         t_batch = torch.full((b,), t_int, device=device, dtype=torch.long)
 
-        eps = model.model(x, t_batch, cond_img, fingerprint, drop_cond=False)
+        # Classifier-Free Guidance (CFG) Sampling
+        guidance_scale = model.cfg.guidance_scale
+        
+        if guidance_scale != 1.0:
+            # Conditional prediction
+            eps_cond = model.model(x, t_batch, cond_img, fingerprint, drop_cond=False)
+            
+            # Unconditional prediction
+            eps_uncond = model.model(x, t_batch, 
+                                    torch.zeros_like(cond_img), 
+                                    torch.zeros_like(fingerprint), 
+                                    drop_cond=True)
+            
+            # CFG combination: eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        else:
+            # No guidance: use conditional prediction only
+            eps = model.model(x, t_batch, cond_img, fingerprint, drop_cond=False)
 
         # Scalars -> broadcastable [1,1,1,1]
         alpha_prod_t = alphas_cumprod[t_int].view(1, 1, 1, 1)
@@ -457,7 +484,18 @@ def reward_negloglik(other_model, target_img, cond_img, fingerprint):
             # Phi inputs: (Noisy Control, Time, Condition=Perturbed, Class=Drug)
             eps_pred = other_model.model(y_t, t, cond_img, fingerprint, drop_cond=False)
             
-            total_mse += ((noise - eps_pred)**2).mean(dim=(1,2,3))
+            # SNR-based variance weighting (proper ELBO formulation)
+            # Get unique timesteps for each batch element
+            t_unique = t.unique()
+            for t_val in t_unique:
+                mask = (t == t_val)
+                if mask.any():
+                    alpha_prod_t = scheduler.alphas_cumprod[t_val.item()]
+                    snr = alpha_prod_t / (1 - alpha_prod_t + 1e-8)
+                    weight = snr  # SNR weighting (can also use 1/snr depending on paper)
+                    
+                    mse_term = ((noise[mask] - eps_pred[mask])**2).mean(dim=(1,2,3))
+                    total_mse[mask] += weight * mse_term
             
     reward = -1.0 * (total_mse / (n_samples * other_model.cfg.reward_mc))
     return reward
@@ -518,15 +556,28 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     surr2 = torch.clamp(ratio, 1.0 - config.ppo_clip_range, 1.0 + config.ppo_clip_range) * adv
     ppo_loss = -torch.min(surr1, surr2).mean()
 
+    # --- Reference Model Distribution (FIXED: Use CONDITIONAL reference, not unconditional) ---
+    # This computes KL(π_θ || π_ref) where both are CONDITIONAL on the same inputs
+    # The reference model has frozen parameters but uses the SAME conditioning
     with torch.no_grad():
         eps_ref = ref_model.model(
             x_t, t,
-            torch.zeros_like(cond_img),
-            torch.zeros_like(fp),
-            drop_cond=True
+            cond_img,  # FIXED: Use same conditioning (was zeros)
+            fp,        # FIXED: Use same drug vector (was zeros)
+            drop_cond=False  # FIXED: Keep conditioning (was True)
         )
+        
+        pred_x0_ref = (x_t - (1.0 - alpha_prod_t).sqrt() * eps_ref) / alpha_prod_t.sqrt()
+        pred_x0_ref = pred_x0_ref.clamp(-1, 1)
+        
+        mean_ref = pred_original_sample_coeff * pred_x0_ref + current_sample_coeff * x_t
 
-    kl_loss = F.mse_loss(eps, eps_ref)
+    # --- KL Divergence (Gaussians with same variance) ---
+    # KL(P || Q) = (μ_P - μ_Q)² / (2σ²) for Gaussians with same variance
+    # This is now TRUE KL between conditional distributions (policy vs frozen reference)
+    kl_terms = ((mean - mean_ref)**2) / (2 * var)
+    kl_loss = kl_terms.sum(dim=(1, 2, 3)).mean()
+
     loss = ppo_loss + config.kl_beta * kl_loss
 
     optimizer.zero_grad()
@@ -594,6 +645,310 @@ def build_ppo_batch(traj, reward, cond_img, fingerprint):
         "fingerprint": torch.cat(fp_list, dim=0),
     }
     return batch
+
+# ============================================================================
+# EVALUATION & CHECKPOINTING
+# ============================================================================
+
+@torch.no_grad()
+def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
+    """
+    Evaluate FID and KID metrics for both theta and phi models.
+    Returns per-class and overall metrics.
+    """
+    theta.model.eval()
+    phi.model.eval()
+    
+    # Initialize metrics
+    fid_theta = FrechetInceptionDistance(normalize=True).to(config.device)
+    kid_theta = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device)
+    fid_phi = FrechetInceptionDistance(normalize=True).to(config.device)
+    kid_phi = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device)
+    
+    # Per-class storage
+    theta_samples_per_class = {}
+    phi_samples_per_class = {}
+    real_ctrl_per_class = {}
+    real_trt_per_class = {}
+    
+    # Sample generation
+    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    total_generated = 0
+    
+    print(f"\n[EVAL] Generating {num_samples} samples for FID/KID evaluation...")
+    
+    for batch in tqdm(loader, desc="Evaluating"):
+        if total_generated >= num_samples:
+            break
+            
+        ctrl = batch['control'].to(config.device)
+        trt = batch['perturbed'].to(config.device)
+        fp = batch['fingerprint'].to(config.device)
+        cpd_names = batch['cpd_name']
+        
+        batch_size = ctrl.shape[0]
+        
+        # Generate samples
+        x_gen, _ = rollout_with_logprobs(theta, ctrl, fp, steps=steps)  # ctrl -> trt
+        y_gen, _ = rollout_with_logprobs(phi, trt, fp, steps=steps)     # trt -> ctrl
+        
+        # Normalize to [0, 1] for FID/KID
+        ctrl_norm = (ctrl * 0.5 + 0.5).clamp(0, 1)
+        trt_norm = (trt * 0.5 + 0.5).clamp(0, 1)
+        x_gen_norm = (x_gen * 0.5 + 0.5).clamp(0, 1)
+        y_gen_norm = (y_gen * 0.5 + 0.5).clamp(0, 1)
+        
+        # Update overall metrics
+        fid_theta.update(trt_norm, real=True)
+        fid_theta.update(x_gen_norm, real=False)
+        kid_theta.update(trt_norm, real=True)
+        kid_theta.update(x_gen_norm, real=False)
+        
+        fid_phi.update(ctrl_norm, real=True)
+        fid_phi.update(y_gen_norm, real=False)
+        kid_phi.update(ctrl_norm, real=True)
+        kid_phi.update(y_gen_norm, real=False)
+        
+        # Store per-class samples
+        for i in range(batch_size):
+            cpd = cpd_names[i]
+            if cpd not in theta_samples_per_class:
+                theta_samples_per_class[cpd] = []
+                phi_samples_per_class[cpd] = []
+                real_ctrl_per_class[cpd] = []
+                real_trt_per_class[cpd] = []
+            
+            theta_samples_per_class[cpd].append(x_gen_norm[i].cpu())
+            phi_samples_per_class[cpd].append(y_gen_norm[i].cpu())
+            real_ctrl_per_class[cpd].append(ctrl_norm[i].cpu())
+            real_trt_per_class[cpd].append(trt_norm[i].cpu())
+        
+        total_generated += batch_size
+    
+    # Compute overall metrics
+    fid_theta_val = fid_theta.compute().item()
+    kid_theta_mean, kid_theta_std = kid_theta.compute()
+    fid_phi_val = fid_phi.compute().item()
+    kid_phi_mean, kid_phi_std = kid_phi.compute()
+    
+    # Compute per-class metrics
+    fid_theta_per_class = {}
+    kid_theta_per_class = {}
+    fid_phi_per_class = {}
+    kid_phi_per_class = {}
+    
+    print("\n[EVAL] Computing per-class metrics...")
+    for cpd in tqdm(theta_samples_per_class.keys(), desc="Per-class FID/KID"):
+        if len(theta_samples_per_class[cpd]) < 10:  # Skip if too few samples
+            continue
+        
+        # Theta (ctrl -> trt)
+        try:
+            fid_metric_class = FrechetInceptionDistance(normalize=True).to(config.device)
+            real_trt_class = torch.stack(real_trt_per_class[cpd]).to(config.device)
+            gen_trt_class = torch.stack(theta_samples_per_class[cpd]).to(config.device)
+            
+            fid_metric_class.update(real_trt_class, real=True)
+            fid_metric_class.update(gen_trt_class, real=False)
+            fid_theta_per_class[cpd] = fid_metric_class.compute().item()
+            
+            subset_size = min(len(theta_samples_per_class[cpd]), 100)
+            kid_metric_class = KernelInceptionDistance(subset_size=subset_size, normalize=True).to(config.device)
+            kid_metric_class.update(real_trt_class, real=True)
+            kid_metric_class.update(gen_trt_class, real=False)
+            kid_mean, kid_std = kid_metric_class.compute()
+            kid_theta_per_class[cpd] = {"mean": kid_mean.item(), "std": kid_std.item()}
+        except Exception as e:
+            print(f"  [WARN] Failed to compute theta metrics for {cpd}: {e}")
+        
+        # Phi (trt -> ctrl)
+        try:
+            fid_metric_class = FrechetInceptionDistance(normalize=True).to(config.device)
+            real_ctrl_class = torch.stack(real_ctrl_per_class[cpd]).to(config.device)
+            gen_ctrl_class = torch.stack(phi_samples_per_class[cpd]).to(config.device)
+            
+            fid_metric_class.update(real_ctrl_class, real=True)
+            fid_metric_class.update(gen_ctrl_class, real=False)
+            fid_phi_per_class[cpd] = fid_metric_class.compute().item()
+            
+            subset_size = min(len(phi_samples_per_class[cpd]), 100)
+            kid_metric_class = KernelInceptionDistance(subset_size=subset_size, normalize=True).to(config.device)
+            kid_metric_class.update(real_ctrl_class, real=True)
+            kid_metric_class.update(gen_ctrl_class, real=False)
+            kid_mean, kid_std = kid_metric_class.compute()
+            kid_phi_per_class[cpd] = {"mean": kid_mean.item(), "std": kid_std.item()}
+        except Exception as e:
+            print(f"  [WARN] Failed to compute phi metrics for {cpd}: {e}")
+    
+    # Compute averages
+    avg_fid_theta = np.mean(list(fid_theta_per_class.values())) if fid_theta_per_class else 0.0
+    avg_fid_phi = np.mean(list(fid_phi_per_class.values())) if fid_phi_per_class else 0.0
+    avg_kid_theta_mean = np.mean([v["mean"] for v in kid_theta_per_class.values()]) if kid_theta_per_class else 0.0
+    avg_kid_phi_mean = np.mean([v["mean"] for v in kid_phi_per_class.values()]) if kid_phi_per_class else 0.0
+    
+    results = {
+        "theta": {
+            "overall_fid": fid_theta_val,
+            "overall_kid_mean": kid_theta_mean.item(),
+            "overall_kid_std": kid_theta_std.item(),
+            "avg_fid": avg_fid_theta,
+            "avg_kid_mean": avg_kid_theta_mean,
+            "fid_per_class": fid_theta_per_class,
+            "kid_per_class": kid_theta_per_class,
+        },
+        "phi": {
+            "overall_fid": fid_phi_val,
+            "overall_kid_mean": kid_phi_mean.item(),
+            "overall_kid_std": kid_phi_std.item(),
+            "avg_fid": avg_fid_phi,
+            "avg_kid_mean": avg_kid_phi_mean,
+            "fid_per_class": fid_phi_per_class,
+            "kid_per_class": kid_phi_per_class,
+        }
+    }
+    
+    print(f"\n[EVAL] Theta (ctrl->trt): FID={fid_theta_val:.2f}, KID={kid_theta_mean.item():.4f}±{kid_theta_std.item():.4f}")
+    print(f"[EVAL] Phi (trt->ctrl): FID={fid_phi_val:.2f}, KID={kid_phi_mean.item():.4f}±{kid_phi_std.item():.4f}")
+    
+    return results
+
+def save_checkpoint(theta, phi, theta_opt, phi_opt, iteration, metrics_history, config):
+    """Save training checkpoint"""
+    checkpoint_dir = Path(config.output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    checkpoint = {
+        "iteration": iteration,
+        "theta_state_dict": theta.model.state_dict(),
+        "phi_state_dict": phi.model.state_dict(),
+        "theta_opt_state_dict": theta_opt.state_dict(),
+        "phi_opt_state_dict": phi_opt.state_dict(),
+        "metrics_history": metrics_history,
+        "config": vars(config),
+    }
+    
+    # Save latest
+    torch.save(checkpoint, checkpoint_dir / "latest.pt")
+    
+    # Save numbered checkpoint
+    torch.save(checkpoint, checkpoint_dir / f"checkpoint_iter_{iteration}.pt")
+    
+    print(f"[CHECKPOINT] Saved at iteration {iteration}")
+
+def load_checkpoint(checkpoint_path, theta, phi, theta_opt, phi_opt, config):
+    """Load training checkpoint"""
+    print(f"[CHECKPOINT] Loading from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=config.device)
+    
+    theta.model.load_state_dict(checkpoint["theta_state_dict"])
+    phi.model.load_state_dict(checkpoint["phi_state_dict"])
+    theta_opt.load_state_dict(checkpoint["theta_opt_state_dict"])
+    phi_opt.load_state_dict(checkpoint["phi_opt_state_dict"])
+    
+    iteration = checkpoint["iteration"]
+    metrics_history = checkpoint.get("metrics_history", {})
+    
+    print(f"[CHECKPOINT] Resumed from iteration {iteration}")
+    return iteration, metrics_history
+
+def plot_metrics(metrics_history, output_dir):
+    """Plot training metrics"""
+    plots_dir = Path(output_dir) / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Extract data
+    iterations = sorted(metrics_history.keys())
+    
+    # Rewards
+    r_theta = [metrics_history[i].get("r_theta_mean", 0) for i in iterations]
+    r_phi = [metrics_history[i].get("r_phi_mean", 0) for i in iterations]
+    
+    # Losses
+    loss_theta_ppo = [metrics_history[i].get("loss_theta_ppo", 0) for i in iterations]
+    loss_phi_ppo = [metrics_history[i].get("loss_phi_ppo", 0) for i in iterations]
+    loss_theta_joint = [metrics_history[i].get("loss_theta_joint", 0) for i in iterations]
+    loss_phi_joint = [metrics_history[i].get("loss_phi_joint", 0) for i in iterations]
+    
+    # KL
+    kl_theta = [metrics_history[i].get("kl_theta", 0) for i in iterations]
+    kl_phi = [metrics_history[i].get("kl_phi", 0) for i in iterations]
+    
+    # FID/KID (sparse)
+    fid_theta = [(i, metrics_history[i]["fid_theta"]) for i in iterations if "fid_theta" in metrics_history[i]]
+    fid_phi = [(i, metrics_history[i]["fid_phi"]) for i in iterations if "fid_phi" in metrics_history[i]]
+    kid_theta = [(i, metrics_history[i]["kid_theta_mean"]) for i in iterations if "kid_theta_mean" in metrics_history[i]]
+    kid_phi = [(i, metrics_history[i]["kid_phi_mean"]) for i in iterations if "kid_phi_mean" in metrics_history[i]]
+    
+    # Create plots
+    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    
+    # Rewards
+    axes[0, 0].plot(iterations, r_theta, label="Theta", alpha=0.7)
+    axes[0, 0].plot(iterations, r_phi, label="Phi", alpha=0.7)
+    axes[0, 0].set_title("Rewards")
+    axes[0, 0].set_xlabel("Iteration")
+    axes[0, 0].set_ylabel("Reward")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # PPO Losses
+    axes[0, 1].plot(iterations, loss_theta_ppo, label="Theta PPO", alpha=0.7)
+    axes[0, 1].plot(iterations, loss_phi_ppo, label="Phi PPO", alpha=0.7)
+    axes[0, 1].set_title("PPO Losses")
+    axes[0, 1].set_xlabel("Iteration")
+    axes[0, 1].set_ylabel("Loss")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Joint Losses
+    axes[1, 0].plot(iterations, loss_theta_joint, label="Theta Joint", alpha=0.7)
+    axes[1, 0].plot(iterations, loss_phi_joint, label="Phi Joint", alpha=0.7)
+    axes[1, 0].set_title("Joint Constraint Losses")
+    axes[1, 0].set_xlabel("Iteration")
+    axes[1, 0].set_ylabel("Loss")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # KL Divergence
+    axes[1, 1].plot(iterations, kl_theta, label="Theta KL", alpha=0.7)
+    axes[1, 1].plot(iterations, kl_phi, label="Phi KL", alpha=0.7)
+    axes[1, 1].set_title("KL Divergence")
+    axes[1, 1].set_xlabel("Iteration")
+    axes[1, 1].set_ylabel("KL")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    # FID
+    if fid_theta:
+        fid_theta_iters, fid_theta_vals = zip(*fid_theta)
+        axes[2, 0].plot(fid_theta_iters, fid_theta_vals, 'o-', label="Theta", alpha=0.7)
+    if fid_phi:
+        fid_phi_iters, fid_phi_vals = zip(*fid_phi)
+        axes[2, 0].plot(fid_phi_iters, fid_phi_vals, 's-', label="Phi", alpha=0.7)
+    axes[2, 0].set_title("FID Score")
+    axes[2, 0].set_xlabel("Iteration")
+    axes[2, 0].set_ylabel("FID")
+    axes[2, 0].legend()
+    axes[2, 0].grid(True, alpha=0.3)
+    
+    # KID
+    if kid_theta:
+        kid_theta_iters, kid_theta_vals = zip(*kid_theta)
+        axes[2, 1].plot(kid_theta_iters, kid_theta_vals, 'o-', label="Theta", alpha=0.7)
+    if kid_phi:
+        kid_phi_iters, kid_phi_vals = zip(*kid_phi)
+        axes[2, 1].plot(kid_phi_iters, kid_phi_vals, 's-', label="Phi", alpha=0.7)
+    axes[2, 1].set_title("KID Score")
+    axes[2, 1].set_xlabel("Iteration")
+    axes[2, 1].set_ylabel("KID")
+    axes[2, 1].legend()
+    axes[2, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(plots_dir / "training_metrics.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"[PLOT] Saved training metrics to {plots_dir / 'training_metrics.png'}")
 
 # ============================================================================
 # MAIN TRAINING LOOP
