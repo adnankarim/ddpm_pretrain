@@ -135,10 +135,10 @@ class MorganEncoder:
 
         if RDKIT_OK and smiles and smiles not in ["DMSO", ""]:
             try:
-    mol = Chem.MolFromSmiles(smiles)
+                mol = Chem.MolFromSmiles(smiles)
                 fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=self.n_bits)
                 arr = np.zeros((self.n_bits,), dtype=np.float32)
-    DataStructs.ConvertToNumpyArray(fp, arr)
+                DataStructs.ConvertToNumpyArray(fp, arr)
                 self.cache[smiles] = arr
                 return arr
             except Exception:
@@ -369,7 +369,7 @@ class PairedBBBC021Dataset(Dataset):
             # normalize to uint8 0..255 for PIL
             if img.max() > 1.0:
                 img = img.astype(np.uint8)
-        else:
+            else:
                 if img.min() < 0:
                     img = (img + 1.0) / 2.0
                 img = (img * 255).astype(np.uint8)
@@ -659,7 +659,39 @@ def run_evaluation(pipe, controlnet, transformer, drug_proj, eval_dataset, args,
 # =============================================================================
 # TORCHMETRICS EVALUATION
 # =============================================================================
-def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj, dataset, args, device, weight_dtype, num_samples=20480, num_inference_steps=50):
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Numpy implementation of the Frechet Distance with stability features."""
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+
+    assert mu1.shape == mu2.shape, "Training and test mean vectors have different lengths"
+    assert sigma1.shape == sigma2.shape, "Training and test covariances have different dimensions"
+
+    diff = mu1 - mu2
+    
+    # Product might be almost singular
+    from scipy.linalg import sqrtm
+    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        msg = "fid calculation produces singular product; adding %s to diagonal of cov estimates" % eps
+        print(msg)
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = sqrtm((sigma1 + offset).dot(sigma2 + offset))
+
+    # Numerical error might give slight imaginary component
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError("Imaginary component {}".format(m))
+        covmean = covmean.real
+
+    tr_covmean = np.trace(covmean)
+
+    return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
+
+def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj, dataset, args, device, weight_dtype, num_samples=5000, num_inference_steps=50):
     """
     Calculate evaluation metrics using torchmetrics (FID/KID) following reference pattern.
     """
@@ -682,6 +714,12 @@ def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj
     # Group samples by compound
     generated_samples = {}
     target_samples = {}
+    
+    # Store extracted features for CFID
+    real_features = []
+    fake_features = []
+    fingerprints = []
+
     
     eval_loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=2)
     
@@ -745,6 +783,33 @@ def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj
             fid_metric.update(gen_uint8, real=False)
             kid_metric.update(real_uint8, real=True)
             kid_metric.update(gen_uint8, real=False)
+
+            # --- CFID Feature Extraction ---
+            # Attempt to extract features using the internal Inception model from fid_metric
+            if hasattr(fid_metric, 'inception'):
+                try:
+                    # FID expects [0, 255] byte images, already have real_uint8/gen_uint8
+                    # Inception expects 3-channel, these are 3-channel
+                    # Extract 2048-dim features
+                    with torch.no_grad():
+                        real_feats = fid_metric.inception(real_uint8.to(dtype=torch.uint8))
+                        fake_feats = fid_metric.inception(gen_uint8.to(dtype=torch.uint8))
+                        
+                        # Flatten if needed [B, 2048, 1, 1] -> [B, 2048]
+                        if real_feats.dim() > 2:
+                            real_feats = real_feats.view(real_feats.size(0), -1)
+                            fake_feats = fake_feats.view(fake_feats.size(0), -1)
+                        
+                        real_features.append(real_feats.cpu().numpy())
+                        fake_features.append(fake_feats.cpu().numpy())
+                        fingerprints.append(fp.cpu().numpy())
+                except Exception as e:
+                    print(f"  Warning: CFID feature extraction failed: {e}")
+            else:
+                 # Fallback/Warning if inception not accessible (e.g. different torchmetrics version)
+                 # print("  Warning: fid_metric.inception not found, skipping CFID.")
+                 pass
+
             
             # Group by compound
             for i in range(tgt_px.shape[0]):
@@ -767,6 +832,32 @@ def calculate_metrics_torchmetrics_flux(pipe, controlnet, transformer, drug_proj
     # Compute overall metrics
     fid = fid_metric.compute()
     kid_mean, kid_std = kid_metric.compute()
+    
+    # --- Compute CFID ---
+    cfid_score = -1.0
+    if len(real_features) > 0:
+        try:
+            # Concatenate all batches
+            real_feats_all = np.concatenate(real_features, axis=0) # [N, 2048]
+            fake_feats_all = np.concatenate(fake_features, axis=0) # [N, 2048]
+            fps_all = np.concatenate(fingerprints, axis=0)         # [N, 1024]
+            
+            # Concatenate features and fingerprints -> [N, 3072]
+            real_full = np.concatenate([real_feats_all, fps_all], axis=1)
+            fake_full = np.concatenate([fake_feats_all, fps_all], axis=1)
+            
+            # Compute Mean and Covariance
+            mu1, sigma1 = np.mean(real_full, axis=0), np.cov(real_full, rowvar=False)
+            mu2, sigma2 = np.mean(fake_full, axis=0), np.cov(fake_full, rowvar=False)
+            
+            cfid_score = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+            print(f"  Overall CFID: {cfid_score:.4f}")
+        except Exception as e:
+            print(f"  Warning: CFID computation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+
     
     # Compute per-class metrics
     fid_per_class = {}

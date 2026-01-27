@@ -78,7 +78,7 @@ class Config:
     output_dir = "ddpm_ddmec_results"
     
     # Evaluation
-    eval_max_samples = 500
+    eval_max_samples = 5000
     eval_steps = 50
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -919,6 +919,38 @@ def flatten_trajectory(traj, reward, cond_img, fingerprint):
 # EVALUATION
 # ============================================================================
 
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Numpy implementation of the Frechet Distance with stability features."""
+    mu1 = np.atleast_1d(mu1)
+    mu2 = np.atleast_1d(mu2)
+    sigma1 = np.atleast_2d(sigma1)
+    sigma2 = np.atleast_2d(sigma2)
+
+    assert mu1.shape == mu2.shape, "Training and test mean vectors have different lengths"
+    assert sigma1.shape == sigma2.shape, "Training and test covariances have different dimensions"
+
+    diff = mu1 - mu2
+    
+    # Product might be almost singular
+    from scipy.linalg import sqrtm
+    covmean, _ = sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        msg = "fid calculation produces singular product; adding %s to diagonal of cov estimates" % eps
+        print(msg)
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = sqrtm((sigma1 + offset).dot(sigma2 + offset))
+
+    # Numerical error might give slight imaginary component
+    if np.iscomplexobj(covmean):
+        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            m = np.max(np.abs(covmean.imag))
+            raise ValueError("Imaginary component {}".format(m))
+        covmean = covmean.real
+
+    tr_covmean = np.trace(covmean)
+
+    return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
+
 @torch.no_grad()
 def evaluate_metrics(theta_model, phi_model, dataloader, config):
     print("Running Evaluation (FID/KID)...")
@@ -930,6 +962,14 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
     
     fid_metric_treated = FrechetInceptionDistance(normalize=True).to(config.device) # FIDo (Real Trt vs Fake Trt from Ctrl)
     kid_metric_treated = KernelInceptionDistance(subset_size=100, normalize=True).to(config.device)
+    
+    # Storage for CFID
+    real_ctrl_feats = []
+    fake_ctrl_feats = []
+    real_trt_feats = []
+    fake_trt_feats = []
+    fingerprints = []
+
     
     samples_count = 0
     
@@ -987,6 +1027,35 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         kid_metric_control.update(real_ctrl_norm, real=True)
         kid_metric_control.update(fake_ctrl_norm, real=False)
         
+        # --- CFID Feature Extraction ---
+        # Reuse Inception from FID metric if available
+        if hasattr(fid_metric_control, 'inception'):
+            try:
+                with torch.no_grad():
+                    # Treated (Theta): Real Trt vs Fake Trt
+                    r_trt_f = fid_metric_treated.inception(real_trt_norm.to(dtype=torch.uint8))
+                    f_trt_f = fid_metric_treated.inception(fake_trt_norm.to(dtype=torch.uint8))
+                    
+                    # Control (Phi): Real Ctrl vs Fake Ctrl
+                    r_ctrl_f = fid_metric_control.inception(real_ctrl_norm.to(dtype=torch.uint8))
+                    f_ctrl_f = fid_metric_control.inception(fake_ctrl_norm.to(dtype=torch.uint8))
+                    
+                    if r_trt_f.dim() > 2: r_trt_f = r_trt_f.view(r_trt_f.size(0), -1)
+                    if f_trt_f.dim() > 2: f_trt_f = f_trt_f.view(f_trt_f.size(0), -1)
+                    if r_ctrl_f.dim() > 2: r_ctrl_f = r_ctrl_f.view(r_ctrl_f.size(0), -1)
+                    if f_ctrl_f.dim() > 2: f_ctrl_f = f_ctrl_f.view(f_ctrl_f.size(0), -1)
+                    
+                    real_trt_feats.append(r_trt_f.cpu().numpy())
+                    fake_trt_feats.append(f_trt_f.cpu().numpy())
+                    real_ctrl_feats.append(r_ctrl_f.cpu().numpy())
+                    fake_ctrl_feats.append(f_ctrl_f.cpu().numpy())
+                    
+                    fingerprints.append(fp.cpu().numpy())
+            except Exception as e:
+                # print(f"Warning: CFID feat extraction error: {e}")
+                pass
+
+        
         samples_count += ctrl.shape[0]
         if samples_count >= config.eval_max_samples:
             break
@@ -1007,12 +1076,48 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
     except Exception as e:
         print(f"Error computing Treated metrics: {e}")
         fid_t, kid_t = -1, -1
+
+    # Compute CFID
+    cfid_c = -1.0
+    cfid_t = -1.0
+    if len(fingerprints) > 0:
+        try:
+            # Common Fingerprints
+            fps_all = np.concatenate(fingerprints, axis=0) # [N, 1024]
+            
+            # --- CFID Control (Phi) ---
+            r_c_all = np.concatenate(real_ctrl_feats, axis=0)
+            f_c_all = np.concatenate(fake_ctrl_feats, axis=0)
+            
+            real_full_c = np.concatenate([r_c_all, fps_all], axis=1) # [N, 3072]
+            fake_full_c = np.concatenate([f_c_all, fps_all], axis=1)
+            
+            mu1, sigma1 = np.mean(real_full_c, axis=0), np.cov(real_full_c, rowvar=False)
+            mu2, sigma2 = np.mean(fake_full_c, axis=0), np.cov(fake_full_c, rowvar=False)
+            cfid_c = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+            
+            # --- CFID Treated (Theta) ---
+            r_t_all = np.concatenate(real_trt_feats, axis=0)
+            f_t_all = np.concatenate(fake_trt_feats, axis=0)
+            
+            real_full_t = np.concatenate([r_t_all, fps_all], axis=1)
+            fake_full_t = np.concatenate([f_t_all, fps_all], axis=1)
+            
+            mu1_t, sigma1_t = np.mean(real_full_t, axis=0), np.cov(real_full_t, rowvar=False)
+            mu2_t, sigma2_t = np.mean(fake_full_t, axis=0), np.cov(fake_full_t, rowvar=False)
+            cfid_t = calculate_frechet_distance(mu1_t, sigma1_t, mu2_t, sigma2_t)
+            
+        except Exception as e:
+            print(f"Error computing CFID: {e}")
+
         
     return {
         "FID_Control": fid_c,
         "KID_Control": kid_c,
+        "CFID_Control": cfid_c,
         "FID_Treated": fid_t,
-        "KID_Treated": kid_t
+        "KID_Treated": kid_t,
+        "CFID_Treated": cfid_t
     }
 
 # ============================================================================
@@ -1203,7 +1308,7 @@ def main():
     # Initialize CSV Log
     if not os.path.exists(config.log_file):
         with open(config.log_file, 'w') as f:
-            f.write("iteration,theta_reward,phi_reward,theta_ppo_loss,phi_ppo_loss,theta_sup_loss,phi_sup_loss,fid_control,fid_treated,kid_control,kid_treated\n")
+            f.write("iteration,theta_reward,phi_reward,theta_ppo_loss,phi_ppo_loss,theta_sup_loss,phi_sup_loss,fid_control,fid_treated,kid_control,kid_treated,cfid_control,cfid_treated\n")
             
     if start_iter > 0:
         print(f"Continuing DDMEC-PPO Loop from iteration {start_iter} to {args.iters}...")
@@ -1229,7 +1334,7 @@ def main():
             # Log initial values (iteration 0)
             with open(config.log_file, 'a') as f:
                 f.write(f"0,0,0,0,0,0,0,"
-                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
+                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f},{metrics['CFID_Control']:.4f},{metrics['CFID_Treated']:.4f}\n")
                         
         except Exception as e:
             print(f"Warning: Initial evaluation failed: {e}")
@@ -1371,6 +1476,8 @@ def main():
             print(f"Iter {it+1} Evaluation:")
             print(f"  FID_Control (Phi quality): {metrics['FID_Control']:.2f}")
             print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
+            print(f"  CFID_Control: {metrics['CFID_Control']:.4f}")
+            print(f"  CFID_Treated: {metrics['CFID_Treated']:.4f}")
             print(f"  KID_Control: {metrics['KID_Control']:.4f}")
             print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
             print(f"{'='*60}\n")
@@ -1386,7 +1493,7 @@ def main():
             
             with open(config.log_file, 'a') as f:
                 f.write(f"{it+1},{t_rew:.4f},{p_rew:.4f},{t_ppo:.4f},{p_ppo:.4f},{t_sup:.4f},{p_sup:.4f},"
-                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f}\n")
+                        f"{metrics['FID_Control']:.4f},{metrics['FID_Treated']:.4f},{metrics['KID_Control']:.6f},{metrics['KID_Treated']:.6f},{metrics['CFID_Control']:.4f},{metrics['CFID_Treated']:.4f}\n")
 
 if __name__ == "__main__":
     main()
