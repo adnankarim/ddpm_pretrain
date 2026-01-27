@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
 from pathlib import Path
 from tqdm import tqdm
-from tqdm import tqdm
 import matplotlib.pyplot as plt
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.kid import KernelInceptionDistance
@@ -969,6 +968,12 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
     real_trt_feats = []
     fake_trt_feats = []
     fingerprints = []
+    
+    # Storage for conditional FID (per compound)
+    generated_treated_per_compound = {}  # compound -> list of generated treated images
+    target_treated_per_compound = {}     # compound -> list of real treated images
+    generated_control_per_compound = {}  # compound -> list of generated control images
+    target_control_per_compound = {}     # compound -> list of real control images
 
     
     samples_count = 0
@@ -991,6 +996,7 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         ctrl = batch['control'].to(config.device) # Real Control
         trt = batch['perturbed'].to(config.device) # Real Treated
         fp = batch['fingerprint'].to(config.device)
+        compounds = batch.get('compound', [])  # Get compound names
         
         # 1. Evaluate Theta (Ctrl -> Fake Trt) => Compare with Real Trt
         # Use specific eval steps
@@ -1011,6 +1017,19 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         kid_metric_treated.update(real_trt_norm, real=True)
         kid_metric_treated.update(fake_trt_norm, real=False)
         
+        # Store per compound for conditional FID (Treated)
+        if compounds:
+            for i, compound in enumerate(compounds):
+                if compound not in generated_treated_per_compound:
+                    generated_treated_per_compound[compound] = []
+                    target_treated_per_compound[compound] = []
+                generated_treated_per_compound[compound].append(fake_trt_norm[i:i+1].cpu())
+                target_treated_per_compound[compound].append(real_trt_norm[i:i+1].cpu())
+        else:
+            # Debug: warn if compounds not found
+            if samples_count == 0:
+                print("  Warning: No compounds found in batch. Conditional FID may not be computed.")
+        
         # 2. Evaluate Phi (Trt -> Fake Ctrl) => Compare with Real Ctrl
         fake_ctrl, _ = rollout_with_logprobs(phi_model, trt, fp, steps=config.eval_steps)
         
@@ -1026,6 +1045,15 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         fid_metric_control.update(fake_ctrl_norm, real=False)
         kid_metric_control.update(real_ctrl_norm, real=True)
         kid_metric_control.update(fake_ctrl_norm, real=False)
+        
+        # Store per compound for conditional FID (Control)
+        if compounds:
+            for i, compound in enumerate(compounds):
+                if compound not in generated_control_per_compound:
+                    generated_control_per_compound[compound] = []
+                    target_control_per_compound[compound] = []
+                generated_control_per_compound[compound].append(fake_ctrl_norm[i:i+1].cpu())
+                target_control_per_compound[compound].append(real_ctrl_norm[i:i+1].cpu())
         
         # --- CFID Feature Extraction ---
         # Reuse Inception from FID metric if available
@@ -1110,6 +1138,52 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         except Exception as e:
             print(f"Error computing CFID: {e}")
 
+    # Compute Conditional FID per compound
+    fid_per_compound_treated = {}
+    fid_per_compound_control = {}
+    
+    print("\nComputing Conditional FID per compound...")
+    for compound in generated_treated_per_compound.keys():
+        if len(generated_treated_per_compound[compound]) < 2:
+            continue  # Need at least 2 samples for FID
+        
+        try:
+            # Treated (Theta) - per compound
+            gen_t = torch.cat(generated_treated_per_compound[compound], dim=0).to(config.device)
+            tgt_t = torch.cat(target_treated_per_compound[compound], dim=0).to(config.device)
+            
+            fid_metric_compound_t = FrechetInceptionDistance(normalize=True).to(config.device)
+            fid_metric_compound_t.update(tgt_t, real=True)
+            fid_metric_compound_t.update(gen_t, real=False)
+            fid_per_compound_treated[compound] = fid_metric_compound_t.compute().item()
+            print(f"  {compound} (Treated, {len(generated_treated_per_compound[compound])} samples): FID={fid_per_compound_treated[compound]:.4f}")
+        except Exception as e:
+            print(f"  Warning: Failed to compute FID for {compound} (Treated): {e}")
+            fid_per_compound_treated[compound] = -1.0
+    
+    for compound in generated_control_per_compound.keys():
+        if len(generated_control_per_compound[compound]) < 2:
+            continue  # Need at least 2 samples for FID
+        
+        try:
+            # Control (Phi) - per compound
+            gen_c = torch.cat(generated_control_per_compound[compound], dim=0).to(config.device)
+            tgt_c = torch.cat(target_control_per_compound[compound], dim=0).to(config.device)
+            
+            fid_metric_compound_c = FrechetInceptionDistance(normalize=True).to(config.device)
+            fid_metric_compound_c.update(tgt_c, real=True)
+            fid_metric_compound_c.update(gen_c, real=False)
+            fid_per_compound_control[compound] = fid_metric_compound_c.compute().item()
+            print(f"  {compound} (Control, {len(generated_control_per_compound[compound])} samples): FID={fid_per_compound_control[compound]:.4f}")
+        except Exception as e:
+            print(f"  Warning: Failed to compute FID for {compound} (Control): {e}")
+            fid_per_compound_control[compound] = -1.0
+    
+    # Calculate average FID per compound
+    avg_fid_treated = np.mean([v for v in fid_per_compound_treated.values() if v > 0]) if fid_per_compound_treated else -1.0
+    avg_fid_control = np.mean([v for v in fid_per_compound_control.values() if v > 0]) if fid_per_compound_control else -1.0
+    
+    print(f"\nAverage Conditional FID - Treated: {avg_fid_treated:.4f}, Control: {avg_fid_control:.4f}")
         
     return {
         "FID_Control": fid_c,
@@ -1117,7 +1191,11 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
         "CFID_Control": cfid_c,
         "FID_Treated": fid_t,
         "KID_Treated": kid_t,
-        "CFID_Treated": cfid_t
+        "CFID_Treated": cfid_t,
+        "FID_per_compound_Treated": fid_per_compound_treated,
+        "FID_per_compound_Control": fid_per_compound_control,
+        "Average_FID_per_compound_Treated": avg_fid_treated,
+        "Average_FID_per_compound_Control": avg_fid_control
     }
 
 # ============================================================================
@@ -1127,7 +1205,7 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
 def main():
     parser = argparse.ArgumentParser(description='DDMEC-PPO Training')
     parser.add_argument('--iters', type=int, default=100, help='Total number of training iterations')
-    parser.add_argument('--eval_samples', type=int, default=1000, help='Number of samples for evaluation')
+    parser.add_argument('--eval_samples', type=int, default=5000, help='Number of samples for evaluation')
     parser.add_argument('--eval_steps', type=int, default=50, help='Number of inference steps for evaluation')
     parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint in output_dir')
     parser.add_argument('--theta_checkpoint', type=str, default='./ddpm_diffusers_results/checkpoints/checkpoint_epoch_60.pt', 
@@ -1330,6 +1408,51 @@ def main():
             print(f"  FID_Treated (Theta quality): {metrics['FID_Treated']:.2f}")
             print(f"  KID_Control: {metrics['KID_Control']:.4f}")
             print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+            print(f"  CFID_Control: {metrics['CFID_Control']:.4f}")
+            print(f"  CFID_Treated: {metrics['CFID_Treated']:.4f}")
+            
+            # Print conditional FID per compound
+            if 'FID_per_compound_Treated' in metrics and metrics['FID_per_compound_Treated']:
+                print(f"\n  Conditional FID per Compound (Treated):")
+                for compound, fid_val in sorted(metrics['FID_per_compound_Treated'].items()):
+                    if fid_val > 0:
+                        print(f"    {compound}: {fid_val:.4f}")
+                if 'Average_FID_per_compound_Treated' in metrics:
+                    print(f"  Average Conditional FID (Treated): {metrics['Average_FID_per_compound_Treated']:.4f}")
+            
+            if 'FID_per_compound_Control' in metrics and metrics['FID_per_compound_Control']:
+                print(f"\n  Conditional FID per Compound (Control):")
+                for compound, fid_val in sorted(metrics['FID_per_compound_Control'].items()):
+                    if fid_val > 0:
+                        print(f"    {compound}: {fid_val:.4f}")
+                if 'Average_FID_per_compound_Control' in metrics:
+                    print(f"  Average Conditional FID (Control): {metrics['Average_FID_per_compound_Control']:.4f}")
+            
+            # Save results to JSON
+            import json
+            import os
+            os.makedirs("outputs/evaluation", exist_ok=True)
+            output_name = f"ppo_initial_eval_{config.eval_max_samples}_{config.eval_steps}"
+            json_path = f"outputs/evaluation/{output_name}.json"
+            results = {
+                "eval_split": "test",
+                "num_samples": config.eval_max_samples,
+                "inference_steps": config.eval_steps,
+                "overall_fid_control": float(metrics['FID_Control']),
+                "overall_fid_treated": float(metrics['FID_Treated']),
+                "overall_kid_control": float(metrics['KID_Control']),
+                "overall_kid_treated": float(metrics['KID_Treated']),
+                "cfid_control": float(metrics['CFID_Control']),
+                "cfid_treated": float(metrics['CFID_Treated']),
+            }
+            if 'FID_per_compound_Treated' in metrics:
+                results["fid_per_compound_treated"] = {k: float(v) for k, v in metrics['FID_per_compound_Treated'].items()}
+                results["fid_per_compound_control"] = {k: float(v) for k, v in metrics['FID_per_compound_Control'].items()}
+                results["average_fid_per_compound_treated"] = float(metrics['Average_FID_per_compound_Treated'])
+                results["average_fid_per_compound_control"] = float(metrics['Average_FID_per_compound_Control'])
+            with open(json_path, 'w') as f:
+                json.dump(results, f, indent=4)
+            print(f"  Results saved to: {json_path}")
             
             # Log initial values (iteration 0)
             with open(config.log_file, 'a') as f:
@@ -1480,7 +1603,51 @@ def main():
             print(f"  CFID_Treated: {metrics['CFID_Treated']:.4f}")
             print(f"  KID_Control: {metrics['KID_Control']:.4f}")
             print(f"  KID_Treated: {metrics['KID_Treated']:.4f}")
+            
+            # Print conditional FID per compound
+            if 'FID_per_compound_Treated' in metrics and metrics['FID_per_compound_Treated']:
+                print(f"\n  Conditional FID per Compound (Treated):")
+                for compound, fid_val in sorted(metrics['FID_per_compound_Treated'].items()):
+                    if fid_val > 0:
+                        print(f"    {compound}: {fid_val:.4f}")
+                if 'Average_FID_per_compound_Treated' in metrics:
+                    print(f"  Average Conditional FID (Treated): {metrics['Average_FID_per_compound_Treated']:.4f}")
+            
+            if 'FID_per_compound_Control' in metrics and metrics['FID_per_compound_Control']:
+                print(f"\n  Conditional FID per Compound (Control):")
+                for compound, fid_val in sorted(metrics['FID_per_compound_Control'].items()):
+                    if fid_val > 0:
+                        print(f"    {compound}: {fid_val:.4f}")
+                if 'Average_FID_per_compound_Control' in metrics:
+                    print(f"  Average Conditional FID (Control): {metrics['Average_FID_per_compound_Control']:.4f}")
             print(f"{'='*60}\n")
+            
+            # Save results to JSON
+            import json
+            import os
+            os.makedirs("outputs/evaluation", exist_ok=True)
+            output_name = f"ppo_iter_{it+1}_eval_{config.eval_max_samples}_{config.eval_steps}"
+            json_path = f"outputs/evaluation/{output_name}.json"
+            results = {
+                "iteration": it+1,
+                "eval_split": "test",
+                "num_samples": config.eval_max_samples,
+                "inference_steps": config.eval_steps,
+                "overall_fid_control": float(metrics['FID_Control']),
+                "overall_fid_treated": float(metrics['FID_Treated']),
+                "overall_kid_control": float(metrics['KID_Control']),
+                "overall_kid_treated": float(metrics['KID_Treated']),
+                "cfid_control": float(metrics['CFID_Control']),
+                "cfid_treated": float(metrics['CFID_Treated']),
+            }
+            if 'FID_per_compound_Treated' in metrics:
+                results["fid_per_compound_treated"] = {k: float(v) for k, v in metrics['FID_per_compound_Treated'].items()}
+                results["fid_per_compound_control"] = {k: float(v) for k, v in metrics['FID_per_compound_Control'].items()}
+                results["average_fid_per_compound_treated"] = float(metrics['Average_FID_per_compound_Treated'])
+                results["average_fid_per_compound_control"] = float(metrics['Average_FID_per_compound_Control'])
+            with open(json_path, 'w') as f:
+                json.dump(results, f, indent=4)
+            print(f"  Results saved to: {json_path}")
             
             # Log to CSV
             # Get latest losses (defaults to 0 if list empty or index error, though loop ensures append)

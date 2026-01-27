@@ -322,15 +322,12 @@ class DDMECModel(nn.Module):
         drop_drug = None
         
         if drop_cond is None:
-            # Check if separate probabilities are configured
-            if (self.cfg.cond_drop_prob_img is not None and 
-                self.cfg.cond_drop_prob_drug is not None):
-                # Separate dropout for image and drug
-                drop_img = torch.rand(b, device=self.cfg.device) < self.cfg.cond_drop_prob_img
-                drop_drug = torch.rand(b, device=self.cfg.device) < self.cfg.cond_drop_prob_drug
-            else:
-                # Combined dropout (both drop together)
-                drop_cond = torch.rand(b, device=self.cfg.device) < self.cfg.cond_drop_prob
+            # Independent dropout logic (robust fallback)
+            p_img = self.cfg.cond_drop_prob_img if self.cfg.cond_drop_prob_img is not None else self.cfg.cond_drop_prob
+            p_drug = self.cfg.cond_drop_prob_drug if self.cfg.cond_drop_prob_drug is not None else self.cfg.cond_drop_prob
+            
+            drop_img = torch.rand(b, device=self.cfg.device) < p_img
+            drop_drug = torch.rand(b, device=self.cfg.device) < p_drug
         
         # Pass per-sample dropout mask(s) to model
         noise_pred = self.model(xt, t, condition_img, fingerprint, 
@@ -381,15 +378,27 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
         alpha_t = alphas[t_int].view(1, 1, 1, 1)
 
         # Predict x0 from epsilon
+        # pred_x0 = (x_t - sqrt(1-alpha_bar_t) * eps) / sqrt(alpha_bar_t)
         pred_x0 = (x - (1.0 - alpha_prod_t).sqrt() * eps) / alpha_prod_t.sqrt()
         pred_x0 = pred_x0.clamp(-1, 1)
 
-        # DDPM posterior p(x_{t-1} | x_t) mean/var using predicted x0
-        mean = (
-            beta_t * alpha_prod_prev.sqrt() / (1.0 - alpha_prod_t) * pred_x0 +
-            (1.0 - alpha_prod_prev) * alpha_t.sqrt() / (1.0 - alpha_prod_t) * x
-        )
-        var = beta_t * (1.0 - alpha_prod_prev) / (1.0 - alpha_prod_t)
+        # Correct Posterior for arbitrary stride (t -> prev_t)
+        # Using Diffusers/DDPM formulation
+        beta_prod_t = 1 - alpha_prod_t
+        beta_prod_prev = 1 - alpha_prod_prev
+        
+        # Effective beta for current step
+        current_alpha_t = alpha_prod_t / alpha_prod_prev
+        current_beta_t = 1 - current_alpha_t
+        
+        # Mean coefficients
+        pred_original_sample_coeff = (alpha_prod_prev.sqrt() * current_beta_t) / beta_prod_t
+        current_sample_coeff = (current_alpha_t.sqrt() * beta_prod_prev) / beta_prod_t
+        
+        mean = pred_original_sample_coeff * pred_x0 + current_sample_coeff * x
+        
+        # Variance
+        var = (beta_prod_prev / beta_prod_t) * current_beta_t
         var = var.clamp(min=1e-20)
         std = var.sqrt()
 
@@ -400,8 +409,9 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
         log_prob = dist.log_prob(x_prev).sum(dim=(1, 2, 3))
 
         # Memory optimization: store only every k-th timestep (reduce memory usage)
+        # CRITICAL FIX: Skip the final deterministic step (prev_t_int == -1) to avoid PPO instability
         stride = model.cfg.ppo_traj_stride
-        if i % stride == 0 or i == len(timesteps) - 1:  # Always store last step
+        if prev_t_int >= 0 and (i % stride == 0):
             traj.append({
                 "x_t": x.detach().cpu(),
                 "x_prev": x_prev.detach().cpu(),
@@ -471,8 +481,6 @@ def ppo_update(model, ref_model, optimizer, batch, config):
 
     # buffers on device
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
-    betas = scheduler.betas.to(device)
-    alphas = scheduler.alphas.to(device)
 
     eps = model.model(x_t, t, cond_img, fp, drop_cond=False)
 
@@ -483,17 +491,22 @@ def ppo_update(model, ref_model, optimizer, batch, config):
         alphas_cumprod[torch.clamp(prev_t, min=0)].view(-1, 1, 1, 1),
         torch.ones_like(alpha_prod_t),
     )
-    beta_t = betas[t].view(-1, 1, 1, 1)
-    alpha_t = alphas[t].view(-1, 1, 1, 1)
 
     pred_x0 = (x_t - (1.0 - alpha_prod_t).sqrt() * eps) / alpha_prod_t.sqrt()
     pred_x0 = pred_x0.clamp(-1, 1)
 
-    mean = (
-        beta_t * alpha_prod_prev.sqrt() / (1.0 - alpha_prod_t) * pred_x0 +
-        (1.0 - alpha_prod_prev) * alpha_t.sqrt() / (1.0 - alpha_prod_t) * x_t
-    )
-    var = beta_t * (1.0 - alpha_prod_prev) / (1.0 - alpha_prod_t)
+    # Correct Posterior for Strided Steps (Match rollout)
+    beta_prod_t = 1 - alpha_prod_t
+    beta_prod_prev = 1 - alpha_prod_prev
+    current_alpha_t = alpha_prod_t / alpha_prod_prev
+    current_beta_t = 1 - current_alpha_t
+    
+    pred_original_sample_coeff = (alpha_prod_prev.sqrt() * current_beta_t) / beta_prod_t
+    current_sample_coeff = (current_alpha_t.sqrt() * beta_prod_prev) / beta_prod_t
+    
+    mean = pred_original_sample_coeff * pred_x0 + current_sample_coeff * x_t
+    
+    var = (beta_prod_prev / beta_prod_t) * current_beta_t
     var = var.clamp(min=1e-20)
     std = var.sqrt()
 
@@ -518,6 +531,13 @@ def ppo_update(model, ref_model, optimizer, batch, config):
 
     optimizer.zero_grad()
     loss.backward()
+    
+    # Log PPO Grad Norm (Debug)
+    if np.random.rand() < 0.01:
+        if hasattr(model.model, 'fingerprint_proj') and model.model.fingerprint_proj[0].weight.grad is not None:
+              norm = model.model.fingerprint_proj[0].weight.grad.norm().item()
+              print(f"  [PPO] Drug grad norm: {norm:.6f}")
+
     optimizer.step()
     return loss.item()
 
@@ -645,6 +665,13 @@ def main():
             phi_opt.zero_grad(set_to_none=True)
             loss_phi_joint = phi(ctrl, x_gen, fp)  # phi: learn to reconstruct ctrl given condition x_gen
             loss_phi_joint.backward()
+            
+            # Log Grad Norm immediately
+            if np.random.rand() < 0.05:
+                if phi.model.fingerprint_proj[0].weight.grad is not None:
+                     norm = phi.model.fingerprint_proj[0].weight.grad.norm().item()
+                     print(f"  [JOINT] Phi drug grad norm: {norm:.6f}")
+                     
             phi_opt.step()
             
             # --- PHASE 3: Update Phi with PPO (Algorithm 1) ---
@@ -681,6 +708,13 @@ def main():
             theta_opt.zero_grad(set_to_none=True)
             loss_theta_joint = theta(trt, y_gen, fp)  # theta: learn to reconstruct trt given condition y_gen
             loss_theta_joint.backward()
+            
+            # Log Grad Norm immediately
+            if np.random.rand() < 0.05:
+                if theta.model.fingerprint_proj[0].weight.grad is not None:
+                     norm = theta.model.fingerprint_proj[0].weight.grad.norm().item()
+                     print(f"  [JOINT] Theta drug grad norm: {norm:.6f}")
+                     
             theta_opt.step()
             
             # NOTE: For a hybrid approach (more stable but not pure unpaired DDMEC), you can add
@@ -698,22 +732,16 @@ def main():
             if np.random.rand() < 0.01:
                 print(f"R_Theta: {r_theta.mean().item():.3f} | R_Phi: {r_phi.mean().item():.3f}")
                 
-                # Drug conditioning verification: check gradient norms
-                if theta.model.fingerprint_proj[0].weight.grad is not None:
-                    theta_fp_grad_norm = theta.model.fingerprint_proj[0].weight.grad.norm().item()
-                    print(f"  Theta drug projection grad norm: {theta_fp_grad_norm:.6f}")
-                if phi.model.fingerprint_proj[0].weight.grad is not None:
-                    phi_fp_grad_norm = phi.model.fingerprint_proj[0].weight.grad.norm().item()
-                    print(f"  Phi drug projection grad norm: {phi_fp_grad_norm:.6f}")
+                # Removed late gradient logging (moved to immediately after backward)
                 
                 # Ablation test: generate with real drug vs zero drug
                 with torch.no_grad():
                     theta.model.eval()
                     # Generate with real drug
-                    x_gen_real_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp[:1], steps=20)
+                    x_gen_real_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp[:1], steps=10)
                     # Generate with zero drug
                     fp_zero = torch.zeros_like(fp[:1])
-                    x_gen_zero_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp_zero, steps=20)
+                    x_gen_zero_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp_zero, steps=10)
                     # Compute difference
                     drug_effect = F.mse_loss(x_gen_real_fp, x_gen_zero_fp).item()
                     print(f"  Drug conditioning effect (MSE between real vs zero drug): {drug_effect:.6f}")
