@@ -1203,6 +1203,7 @@ def evaluate_metrics(theta_model, phi_model, dataloader, config):
 # ============================================================================
 
 def main():
+    import os
     parser = argparse.ArgumentParser(description='DDMEC-PPO Training')
     parser.add_argument('--iters', type=int, default=100, help='Total number of training iterations')
     parser.add_argument('--eval_samples', type=int, default=5000, help='Number of samples for evaluation')
