@@ -9,6 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
+import torchvision.transforms.functional as TF
+from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -173,18 +175,45 @@ class BBBC021PairedDataset(Dataset):
         return len(self.treated_df)
 
     def load_image(self, path):
-        full_path = self.data_dir / path
-        img = np.load(full_path)
-        img = torch.from_numpy(img).float()
+        # Robust path resolution: try data_dir joined, then raw path, then cwd joined
+        candidates = [
+            self.data_dir / path,
+            Path(path),
+            Path.cwd() / path
+        ]
+        
+        full_path = None
+        for p in candidates:
+            if p.exists():
+                full_path = p
+                break
+        
+        if full_path is None:
+            # Create dummy image if missing to prevent crash during debugging
+            print(f"Warning: Image not found {path}, using zeros.")
+            return torch.zeros((3, 96, 96))
 
-        # Ensure channel-first
-        if img.ndim == 3 and img.shape[2] == 3:
-            img = img.permute(2, 0, 1)
+        if full_path.suffix.lower() == '.npy':
+            img = np.load(full_path)
+            img = torch.from_numpy(img).float()
+            # Ensure channel-first
+            if img.ndim == 3 and img.shape[2] == 3:
+                img = img.permute(2, 0, 1)
+        else:
+            # Assume image file (jpg, png)
+            pil_img = Image.open(full_path).convert("RGB")
+            img = TF.to_tensor(pil_img) # [3, H, W] in [0, 1]
+            
+            # Resize if needed (simple check)
+            if img.shape[1] != 96 or img.shape[2] != 96:
+                img = TF.resize(img, [96, 96], antialias=True)
 
         # Normalize robustly to [-1, 1]
-        if img.max() <= 1.0:
+        # TF.to_tensor gives [0, 1], so we map to [-1, 1]
+        if img.min() >= 0.0 and img.max() <= 1.0:
             img = img * 2.0 - 1.0
-        else:
+        elif img.max() > 1.0:
+             # Handle 0-255 inputs just in case
             img = (img / 127.5) - 1.0
 
         return img
