@@ -78,10 +78,11 @@ class Config:
     output_dir = "ddpm_ddmec_drug_results"
     
     # Evaluation & Logging
-    eval_every = 10           # Evaluate FID/KID every N iterations
-    eval_steps = 50           # Number of diffusion steps for evaluation
-    eval_samples = 5000       # Number of samples for FID/KID
-    save_checkpoint_every = 50  # Save checkpoint every N iterations
+    # Evaluation & Logging
+    eval_every = 10         # Evaluate FID/KID every N iterations (Slower schedule by default)
+    eval_steps = 50           # Faster evaluation steps
+    eval_samples = 5000       # Fewer samples for faster evaluation
+    save_checkpoint_every = 10  # Save checkpoint every N iterations
     log_every = 1             # Log metrics every N iterations
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -680,7 +681,8 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None, record_traj=
         
         # Variance
         var = (beta_prod_prev / beta_prod_t) * current_beta_t
-        var = var.clamp(min=1e-20)
+        # FIX: Floor variance higher to avoid instability
+        var = var.clamp(min=1e-6)
         std = var.sqrt()
 
         # Fix 1: Noise/Step consistency (only add noise if transitioning to non-zero step)
@@ -693,9 +695,13 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None, record_traj=
         stride = model.cfg.ppo_traj_stride
         
         # Robust Logic: only compute log_prob when we actually store the step
-        if record_traj and prev_t_int >= 0 and (i % stride == 0):
+        # FIX: Skip very small timesteps where variance is tiny and gradients explode
+        min_t_for_ppo = 50  # skip transitions where t < 50
+        
+        if record_traj and prev_t_int >= 0 and (i % stride == 0) and t_int >= min_t_for_ppo:
             dist = torch.distributions.Normal(mean, std)
-            log_prob = dist.log_prob(x_prev).sum(dim=(1, 2, 3))
+            # FIX: Use mean instead of sum to prevent overflow
+            log_prob = dist.log_prob(x_prev).mean(dim=(1, 2, 3))
             
             traj.append({
                 # Optimization: Store as float16 on CPU to save memory
@@ -805,13 +811,18 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     mean = pred_original_sample_coeff * pred_x0 + current_sample_coeff * x_t
     
     var = (beta_prod_prev / beta_prod_t) * current_beta_t
-    var = var.clamp(min=1e-20)
+    # FIX: Floor variance higher to avoid instability
+    var = var.clamp(min=1e-6)
     std = var.sqrt()
 
     dist = torch.distributions.Normal(mean, std)
-    new_logprob = dist.log_prob(x_prev).sum(dim=(1, 2, 3))
+    # FIX: Use mean instead of sum
+    new_logprob = dist.log_prob(x_prev).mean(dim=(1, 2, 3))
 
-    ratio = (new_logprob - old_logprob).exp()
+    # FIX: Clamp ratio to prevent overflow
+    log_ratio = new_logprob - old_logprob
+    log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
+    ratio = log_ratio.exp()
     surr1 = ratio * adv
     surr2 = torch.clamp(ratio, 1.0 - config.ppo_clip_range, 1.0 + config.ppo_clip_range) * adv
     ppo_loss = -torch.min(surr1, surr2).mean()
@@ -836,12 +847,26 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     # KL(P || Q) = (μ_P - μ_Q)² / (2σ²) for Gaussians with same variance
     # This is now TRUE KL between conditional distributions (policy vs frozen reference)
     kl_terms = ((mean - mean_ref)**2) / (2 * var)
-    kl_loss = kl_terms.sum(dim=(1, 2, 3)).mean()
+    # FIX: Use mean instead of sum (consistent with PPO loss)
+    kl_loss = kl_terms.mean(dim=(1, 2, 3)).mean()
 
     loss = ppo_loss + config.kl_beta * kl_loss
 
     optimizer.zero_grad()
+    
+    # FIX: Hard-stop if loss is NaN
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        return {"loss": float("nan"), "ppo_loss": float("nan"), "kl": float("nan"), "ratio_mean": float("nan")}
+        
     loss.backward()
+    
+    # FIX: Hard-stop if grads are NaN
+    for p in model.model.parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            optimizer.zero_grad(set_to_none=True)
+            return {"loss": float("nan"), "ppo_loss": float("nan"), "kl": float("nan"), "ratio_mean": float("nan")}
+
     torch.nn.utils.clip_grad_norm_(model.model.parameters(), 1.0)
     
     # Log PPO Grad Norm (Debug)
@@ -888,7 +913,10 @@ def build_ppo_batch(traj, reward, cond_img, fingerprint):
     fingerprint = fingerprint.detach().to(storage_device)
 
     # Normalize reward -> advantages (constant per timestep)
-    normalized_reward = (reward - reward.mean()) / (reward.std() + 1e-8)
+    # FIX: Robust normalization
+    std = reward.std(unbiased=False).clamp_min(1e-3)
+    normalized_reward = (reward - reward.mean()) / std
+    normalized_reward = normalized_reward.clamp(-5.0, 5.0)
 
     x_t_list, x_prev_list, t_list, prev_t_list = [], [], [], []
     old_logprob_list, adv_list, cond_img_list, fp_list = [], [], [], []
