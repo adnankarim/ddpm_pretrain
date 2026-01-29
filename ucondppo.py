@@ -130,7 +130,7 @@ class BBBC021PairedDataset(Dataset):
     """
     Returns pairs: (Control Image, Treated Image, Drug Vector)
     """
-    def __init__(self, data_dir, metadata_file, encoder):
+    def __init__(self, data_dir, metadata_file, encoder, split='train'):
         self.data_dir = Path(data_dir).resolve()
         
         # Robust metadata loading: Check multiple possible locations
@@ -156,6 +156,13 @@ class BBBC021PairedDataset(Dataset):
         
         print(f"Loading metadata from: {meta_path}")
         df = pd.read_csv(meta_path)
+        
+        # Filter by split if SPLIT column exists
+        if 'SPLIT' in df.columns:
+            df = df[df['SPLIT'].str.lower() == split.lower()]
+            print(f"  Filtered to {split} split: {len(df)} samples")
+        else:
+            print(f"  No SPLIT column found, using all {len(df)} samples")
         
         # Filter for treated samples
         self.treated_df = df[df['CPD_NAME'] != 'DMSO'].reset_index(drop=True)
@@ -724,13 +731,33 @@ def reward_negloglik(other_model, target_img, cond_img, fingerprint):
             y_t = scheduler.add_noise(target_img, noise, t)
 
             eps_pred = other_model.model(y_t, t, cond_img, fingerprint, drop_cond=False)
+            
+            # NaN check: if model output is NaN, skip this term
+            if torch.isnan(eps_pred).any():
+                continue
 
             mse = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))   # [b]
+            # Clamp MSE to prevent extreme values
+            mse = torch.clamp(mse, min=0.0, max=1000.0)
+            
             alpha = alphas_cumprod[t]                            # [b]
             snr = alpha / (1 - alpha + 1e-8)                     # [b]
+            # Clamp SNR to prevent extreme values
+            snr = torch.clamp(snr, min=0.0, max=1e6)
+            
             total += snr * mse
 
-    return -total / (n_terms * other_model.cfg.reward_mc)
+    reward = -total / (n_terms * other_model.cfg.reward_mc)
+    
+    # Final NaN check: if reward is NaN, return zeros
+    if torch.isnan(reward).any():
+        print(f"  [WARN] NaN detected in reward, returning zeros")
+        return torch.zeros_like(reward)
+    
+    # Clamp reward to reasonable range
+    reward = torch.clamp(reward, min=-100.0, max=100.0)
+    
+    return reward
 
 def ppo_update(model, ref_model, optimizer, batch, config):
     """
@@ -821,7 +848,10 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     if np.random.rand() < 0.01:
         if hasattr(model.model, 'fingerprint_proj') and model.model.fingerprint_proj[0].weight.grad is not None:
               norm = model.model.fingerprint_proj[0].weight.grad.norm().item()
-              print(f"  [PPO] Drug grad norm: {norm:.6f}")
+              if np.isnan(norm) or np.isinf(norm):
+                  print(f"  [PPO] Drug grad norm: NaN/Inf detected!")
+              else:
+                  print(f"  [PPO] Drug grad norm: {norm:.6f}")
 
     optimizer.step()
     
@@ -1248,10 +1278,11 @@ def main():
     theta_opt = torch.optim.AdamW(theta.model.parameters(), lr=config.lr)
     phi_opt = torch.optim.AdamW(phi.model.parameters(), lr=config.lr)
     
-    # 2. Data
+    # 2. Data (only training split)
     encoder = MorganFingerprintEncoder()
-    dataset = BBBC021PairedDataset(config.data_dir, config.metadata_file, encoder)
+    dataset = BBBC021PairedDataset(config.data_dir, config.metadata_file, encoder, split='train')
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    print(f"  Training dataset size: {len(dataset)} samples")
     
     print("Starting DDMEC-PPO with Drug Conditioning...")
     
@@ -1276,6 +1307,11 @@ def main():
             # High prob = x_gen looks like a perturbed state that corresponds to this control/drug pair
             # Fix 2: Detach generated images to prevent accidental gradients/memory leak
             r_theta = reward_negloglik(phi, target_img=ctrl, cond_img=x_gen.detach(), fingerprint=fp)
+            
+            # NaN check for reward
+            if torch.isnan(r_theta).any():
+                print(f"  [WARN] NaN detected in r_theta, skipping PPO update")
+                r_theta = torch.zeros_like(r_theta)
             
             # 3. PPO Update Theta (reward + marginal constraint)
             loss_theta_ppo = 0
@@ -1326,7 +1362,10 @@ def main():
             if np.random.rand() < 0.05:
                 if phi.model.fingerprint_proj[0].weight.grad is not None:
                      norm = phi.model.fingerprint_proj[0].weight.grad.norm().item()
-                     print(f"  [JOINT] Phi drug grad norm: {norm:.6f}")
+                     if np.isnan(norm) or np.isinf(norm):
+                         print(f"  [JOINT] Phi drug grad norm: NaN/Inf detected!")
+                     else:
+                         print(f"  [JOINT] Phi drug grad norm: {norm:.6f}")
                      
             phi_opt.step()
             
@@ -1338,6 +1377,11 @@ def main():
             # Theta estimates: P(Perturbed | y_gen, Drug)
             # Fix 2: Detach generated images
             r_phi = reward_negloglik(theta, target_img=trt, cond_img=y_gen.detach(), fingerprint=fp)
+            
+            # NaN check for reward
+            if torch.isnan(r_phi).any():
+                print(f"  [WARN] NaN detected in r_phi, skipping PPO update")
+                r_phi = torch.zeros_like(r_phi)
             
             # 3. PPO Update Phi (reward + marginal constraint)
             loss_phi_ppo = 0
@@ -1388,7 +1432,10 @@ def main():
             if np.random.rand() < 0.05:
                 if theta.model.fingerprint_proj[0].weight.grad is not None:
                      norm = theta.model.fingerprint_proj[0].weight.grad.norm().item()
-                     print(f"  [JOINT] Theta drug grad norm: {norm:.6f}")
+                     if np.isnan(norm) or np.isinf(norm):
+                         print(f"  [JOINT] Theta drug grad norm: NaN/Inf detected!")
+                     else:
+                         print(f"  [JOINT] Theta drug grad norm: {norm:.6f}")
                      
             theta_opt.step()
             
