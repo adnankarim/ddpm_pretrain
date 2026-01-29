@@ -3,6 +3,7 @@ import os
 import sys
 import copy
 import argparse
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -1091,7 +1092,8 @@ def main():
     parser.add_argument('--iters', type=int, default=100, help='Total number of training iterations')
     parser.add_argument('--eval_samples', type=int, default=5000, help='Number of samples for evaluation')
     parser.add_argument('--eval_steps', type=int, default=50, help='Number of inference steps for evaluation')
-    parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint in output_dir')
+    parser.add_argument('--eval_only', action='store_true', help='Run FID/CFID evaluation only (load theta/phi, evaluate on test set, then exit)')
+    parser.add_argument('--resume', action='store_true', help='Resume training from latest checkpoint in output_dir (with --eval_only: load latest from output_dir)')
     parser.add_argument('--theta_checkpoint', type=str, default='./ddpm_diffusers_results/checkpoints/checkpoint_epoch_60.pt', 
                         help='Path to theta checkpoint (default: pretrained from config)')
     parser.add_argument('--phi_checkpoint', type=str, default='./results_phi_phi/checkpoints/checkpoint_epoch_100.pt',
@@ -1175,7 +1177,36 @@ def main():
     # Test Data for Evaluation
     test_ds = BBBC021Dataset(config.data_dir, config.metadata_file, split='test', encoder=encoder, paths_csv=args.paths_csv)
     test_loader = PairedDataLoader(test_ds, config.batch_size, shuffle=False)
-    
+
+    # --- Eval-only mode: run FID/CFID evaluation then exit ---
+    if args.eval_only:
+        print(f"\n{'='*60}")
+        print("EVAL-ONLY MODE: Running FID/CFID evaluation")
+        print(f"{'='*60}")
+        print(f"  Theta: {theta_checkpoint_path}")
+        print(f"  Phi:   {phi_checkpoint_path}")
+        print(f"  Samples: {config.eval_max_samples}, Steps: {config.eval_steps}")
+        print(f"{'='*60}\n")
+        try:
+            metrics = evaluate_metrics(theta_model, phi_model, test_loader, config)
+            print(f"\nEvaluation Results:")
+            print(f"  FID_Control (Phi):    {metrics['FID_Control']:.2f}")
+            print(f"  FID_Treated (Theta): {metrics['FID_Treated']:.2f}")
+            print(f"  KID_Control:         {metrics['KID_Control']:.4f}")
+            print(f"  KID_Treated:         {metrics['KID_Treated']:.4f}")
+            print(f"  CFID_Control (Phi):   {metrics['CFID_Control']:.4f}")
+            print(f"  CFID_Treated (Theta): {metrics['CFID_Treated']:.4f}")
+            os.makedirs(f"{config.output_dir}/eval", exist_ok=True)
+            out_path = f"{config.output_dir}/eval/es_eval_{config.eval_max_samples}_{config.eval_steps}.json"
+            with open(out_path, 'w') as f:
+                json.dump(metrics, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else x)
+            print(f"\nResults saved to {out_path}")
+        except Exception as e:
+            print(f"Evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return
+
     # Print dataset details
     print(f"\n{'='*60}")
     print(f"Dataset Details:")

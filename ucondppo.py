@@ -1122,6 +1122,9 @@ def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
     
     print(f"\n[EVAL] Theta (ctrl->trt): FID={fid_theta_val:.2f}, KID={kid_theta_mean.item():.4f}±{kid_theta_std.item():.4f}")
     print(f"[EVAL] Phi (trt->ctrl): FID={fid_phi_val:.2f}, KID={kid_phi_mean.item():.4f}±{kid_phi_std.item():.4f}")
+    # Conditional FID (average per-class FID)
+    print(f"[EVAL] Theta CFID (avg per-class): {avg_fid_theta:.2f}")
+    print(f"[EVAL] Phi CFID (avg per-class): {avg_fid_phi:.2f}")
     
     return results
 
@@ -1196,11 +1199,13 @@ def plot_metrics(metrics_history, output_dir):
     kl_theta = [metrics_history[i].get("kl_theta", 0) for i in iterations]
     kl_phi = [metrics_history[i].get("kl_phi", 0) for i in iterations]
     
-    # FID/KID (sparse)
+    # FID/KID/CFID (sparse)
     fid_theta = [(i, metrics_history[i]["fid_theta"]) for i in iterations if "fid_theta" in metrics_history[i]]
     fid_phi = [(i, metrics_history[i]["fid_phi"]) for i in iterations if "fid_phi" in metrics_history[i]]
     kid_theta = [(i, metrics_history[i]["kid_theta_mean"]) for i in iterations if "kid_theta_mean" in metrics_history[i]]
     kid_phi = [(i, metrics_history[i]["kid_phi_mean"]) for i in iterations if "kid_phi_mean" in metrics_history[i]]
+    cfid_theta = [(i, metrics_history[i]["cfid_theta"]) for i in iterations if "cfid_theta" in metrics_history[i]]
+    cfid_phi = [(i, metrics_history[i]["cfid_phi"]) for i in iterations if "cfid_phi" in metrics_history[i]]
     
     # Create plots
     fig, axes = plt.subplots(3, 2, figsize=(15, 12))
@@ -1241,16 +1246,22 @@ def plot_metrics(metrics_history, output_dir):
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
-    # FID
+    # FID + CFID
     if fid_theta:
         fid_theta_iters, fid_theta_vals = zip(*fid_theta)
-        axes[2, 0].plot(fid_theta_iters, fid_theta_vals, 'o-', label="Theta", alpha=0.7)
+        axes[2, 0].plot(fid_theta_iters, fid_theta_vals, 'o-', label="Theta FID", alpha=0.7)
     if fid_phi:
         fid_phi_iters, fid_phi_vals = zip(*fid_phi)
-        axes[2, 0].plot(fid_phi_iters, fid_phi_vals, 's-', label="Phi", alpha=0.7)
-    axes[2, 0].set_title("FID Score")
+        axes[2, 0].plot(fid_phi_iters, fid_phi_vals, 's-', label="Phi FID", alpha=0.7)
+    if cfid_theta:
+        cfid_theta_iters, cfid_theta_vals = zip(*cfid_theta)
+        axes[2, 0].plot(cfid_theta_iters, cfid_theta_vals, 'o--', label="Theta CFID", alpha=0.7)
+    if cfid_phi:
+        cfid_phi_iters, cfid_phi_vals = zip(*cfid_phi)
+        axes[2, 0].plot(cfid_phi_iters, cfid_phi_vals, 's--', label="Phi CFID", alpha=0.7)
+    axes[2, 0].set_title("FID / CFID Score")
     axes[2, 0].set_xlabel("Iteration")
-    axes[2, 0].set_ylabel("FID")
+    axes[2, 0].set_ylabel("FID / CFID")
     # Fix: Check if handles exist before calling legend
     handles, labels = axes[2, 0].get_legend_handles_labels()
     if handles:
@@ -1550,11 +1561,13 @@ def main():
                                            num_samples=config.eval_samples,
                                            steps=config.eval_steps)
                                            
-                # Store full metrics history
+                # Store full metrics history (overall + conditional FID)
                 metrics_history[iteration]["fid_theta"] = results["theta"]["overall_fid"]
                 metrics_history[iteration]["kid_theta_mean"] = results["theta"]["overall_kid_mean"]
                 metrics_history[iteration]["fid_phi"] = results["phi"]["overall_fid"]
                 metrics_history[iteration]["kid_phi_mean"] = results["phi"]["overall_kid_mean"]
+                metrics_history[iteration]["cfid_theta"] = results["theta"]["avg_fid"]
+                metrics_history[iteration]["cfid_phi"] = results["phi"]["avg_fid"]
                 
                 # Also save detailed results to file
                 with open(f"{config.output_dir}/eval_{iteration}.json", 'w') as f:
