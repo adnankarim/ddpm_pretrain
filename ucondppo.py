@@ -131,10 +131,19 @@ class BBBC021PairedDataset(Dataset):
     Returns pairs: (Control Image, Treated Image, Drug Vector)
     """
     def __init__(self, data_dir, metadata_file, encoder):
-        self.data_dir = Path(data_dir)
-        df = pd.read_csv(self.data_dir / metadata_file)
-        
         # Filter for treated samples
+        self.data_dir = Path(data_dir)
+        
+        # Robust metadata loading: check data_dir first, then CWD
+        meta_path = self.data_dir / metadata_file
+        if not meta_path.exists():
+            if Path(metadata_file).exists():
+                meta_path = Path(metadata_file)
+            else:
+                # Fallback let pandas try or fail
+                pass 
+        
+        df = pd.read_csv(meta_path)
         self.treated_df = df[df['CPD_NAME'] != 'DMSO'].reset_index(drop=True)
         
         # Optimization: Pre-group controls by batch to avoid pandas operations in __getitem__
