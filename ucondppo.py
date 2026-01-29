@@ -9,8 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid, save_image
-import torchvision.transforms.functional as TF
-from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -133,19 +131,16 @@ class BBBC021PairedDataset(Dataset):
     Returns pairs: (Control Image, Treated Image, Drug Vector)
     """
     def __init__(self, data_dir, metadata_file, encoder):
-        # Filter for treated samples
         self.data_dir = Path(data_dir)
         
-        # Robust metadata loading: check data_dir first, then CWD
+        # Robust metadata loading: Check in data_dir, else check at root/absolute
         meta_path = self.data_dir / metadata_file
         if not meta_path.exists():
-            if Path(metadata_file).exists():
-                meta_path = Path(metadata_file)
-            else:
-                # Fallback let pandas try or fail
-                pass 
-        
+            meta_path = Path(metadata_file)
+            
         df = pd.read_csv(meta_path)
+        
+        # Filter for treated samples
         self.treated_df = df[df['CPD_NAME'] != 'DMSO'].reset_index(drop=True)
         
         # Optimization: Pre-group controls by batch to avoid pandas operations in __getitem__
@@ -171,49 +166,84 @@ class BBBC021PairedDataset(Dataset):
                 cpd_name=row['CPD_NAME']
             )
 
+        # Optimization: storage for resolving paths from SAMPLE_KEY -> actual file path
+        # Ported from ppo.py to handle file structure complexity (Week directories etc)
+        self.paths_lookup = {}
+        paths_csv_path = self.data_dir / "paths.csv"
+        if not paths_csv_path.exists():
+             paths_csv_path = Path("paths.csv")
+             
+        if paths_csv_path.exists():
+            print(f"Loading file paths from {paths_csv_path}...")
+            paths_df = pd.read_csv(paths_csv_path)
+            # Create a lookup for exact filename match
+            for _, row in paths_df.iterrows():
+                fname = row['filename']
+                fpath = row['relative_path']
+                if fname not in self.paths_lookup:
+                    self.paths_lookup[fname] = []
+                self.paths_lookup[fname].append(fpath)
+            print(f"Loaded {len(self.paths_lookup)} mapping entries.")
+        else:
+            print("Warning: paths.csv not found. Fallback to heuristic search.")
+
+    def _find_file_path(self, path_key):
+        """
+        Robustly resolves a file path from a key (filename or SAMPLE_KEY).
+        """
+        # 1. Exact path match
+        p = Path(path_key)
+        candidates = [
+            self.data_dir / p,
+            self.data_dir / f"{path_key}.npy",
+            self.data_dir.parent / p,
+            self.data_dir.parent / f"{path_key}.npy"
+        ]
+        
+        for c in candidates:
+            if c.exists(): return c
+            
+        # 2. paths.csv Lookup
+        filename = p.name
+        
+        # If passed key is a filename in lookup
+        if filename in self.paths_lookup:
+            for rel_path in self.paths_lookup[filename]:
+                 # Try to resolve relative path against data_dir and parent
+                 cand = self.data_dir / rel_path
+                 if cand.exists(): return cand
+                 cand = self.data_dir.parent / rel_path
+                 if cand.exists(): return cand
+                 
+        # 3. Last Resort: Recursively search for the filename
+        # This is slow but safe as a fallback
+        search_name = filename if filename.endswith('.npy') else f"{filename}.npy"
+        matches = list(self.data_dir.rglob(search_name))
+        if matches:
+            return matches[0]
+            
+        return None
+
     def __len__(self):
         return len(self.treated_df)
 
     def load_image(self, path):
-        # Robust path resolution: try data_dir joined, then raw path, then cwd joined
-        candidates = [
-            self.data_dir / path,
-            Path(path),
-            Path.cwd() / path
-        ]
-        
-        full_path = None
-        for p in candidates:
-            if p.exists():
-                full_path = p
-                break
+        full_path = self._find_file_path(path)
         
         if full_path is None:
-            # Create dummy image if missing to prevent crash during debugging
-            print(f"Warning: Image not found {path}, using zeros.")
-            return torch.zeros((3, 96, 96))
+            raise FileNotFoundError(f"Could not find image for key: {path} in {self.data_dir}")
 
-        if full_path.suffix.lower() == '.npy':
-            img = np.load(full_path)
-            img = torch.from_numpy(img).float()
-            # Ensure channel-first
-            if img.ndim == 3 and img.shape[2] == 3:
-                img = img.permute(2, 0, 1)
-        else:
-            # Assume image file (jpg, png)
-            pil_img = Image.open(full_path).convert("RGB")
-            img = TF.to_tensor(pil_img) # [3, H, W] in [0, 1]
-            
-            # Resize if needed (simple check)
-            if img.shape[1] != 96 or img.shape[2] != 96:
-                img = TF.resize(img, [96, 96], antialias=True)
+        img = np.load(full_path)
+        img = torch.from_numpy(img).float()
+
+        # Ensure channel-first
+        if img.ndim == 3 and img.shape[2] == 3:
+            img = img.permute(2, 0, 1)
 
         # Normalize robustly to [-1, 1]
-        # TF.to_tensor gives [0, 1], so we map to [-1, 1]
-        if img.min() >= 0.0 and img.max() <= 1.0:
+        if img.max() <= 1.0:
             img = img * 2.0 - 1.0
-        elif img.max() > 1.0:
-             # Handle 0-255 inputs just in case
+        else:
             img = (img / 127.5) - 1.0
 
         return img
