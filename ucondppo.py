@@ -1284,6 +1284,54 @@ def main():
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     print(f"  Training dataset size: {len(dataset)} samples")
     
+    # Save a random dataset sample image to verify loading is correct
+    print("\nSaving random dataset sample images to verify loading...")
+    try:
+        import random
+        from PIL import Image
+        
+        # Get a random sample from train dataset
+        if len(dataset) > 0:
+            random_idx = random.randint(0, len(dataset) - 1)
+            sample = dataset[random_idx]
+            
+            # Convert control image tensor to numpy image
+            ctrl_img_tensor = sample['control']  # Shape: [3, H, W], range [-1, 1]
+            ctrl_img_np = ((ctrl_img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+            ctrl_img_np = np.clip(ctrl_img_np, 0, 255)
+            
+            # Save control image
+            ctrl_img_pil = Image.fromarray(ctrl_img_np)
+            ctrl_filename = f"ucondppo_dataset_sample_control_{sample['cpd_name'].replace('/', '_').replace(' ', '_')}.jpg"
+            ctrl_path = os.path.abspath(ctrl_filename)
+            ctrl_img_pil.save(ctrl_path, "JPEG", quality=95)
+            print(f"  ✓ Saved random train sample (control) to: {ctrl_path}")
+            print(f"    Compound: {sample['cpd_name']}")
+            print(f"    Control image shape: {ctrl_img_tensor.shape}")
+            print(f"    Control image range: [{ctrl_img_tensor.min():.2f}, {ctrl_img_tensor.max():.2f}]")
+            
+            # Convert perturbed image tensor to numpy image
+            trt_img_tensor = sample['perturbed']  # Shape: [3, H, W], range [-1, 1]
+            trt_img_np = ((trt_img_tensor.permute(1, 2, 0).numpy() + 1) * 127.5).astype(np.uint8)
+            trt_img_np = np.clip(trt_img_np, 0, 255)
+            
+            # Save perturbed image
+            trt_img_pil = Image.fromarray(trt_img_np)
+            trt_filename = f"ucondppo_dataset_sample_perturbed_{sample['cpd_name'].replace('/', '_').replace(' ', '_')}.jpg"
+            trt_path = os.path.abspath(trt_filename)
+            trt_img_pil.save(trt_path, "JPEG", quality=95)
+            print(f"  ✓ Saved random train sample (perturbed) to: {trt_path}")
+            print(f"    Perturbed image shape: {trt_img_tensor.shape}")
+            print(f"    Perturbed image range: [{trt_img_tensor.min():.2f}, {trt_img_tensor.max():.2f}]")
+            print(f"    Fingerprint shape: {sample['fingerprint'].shape}")
+            
+    except Exception as e:
+        print(f"  Warning: Could not save sample images: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    print()  # Empty line for readability
+    
     print("Starting DDMEC-PPO with Drug Conditioning...")
     
     # Fix 5: Iteration counter and eval/checkpointing
