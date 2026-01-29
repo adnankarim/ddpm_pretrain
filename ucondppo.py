@@ -58,11 +58,11 @@ class Config:
     ppo_minibatch_size = 8 
     
     # PPO Specifics
-    ppo_epochs = 4        
+    ppo_epochs = 2        
     ppo_clip_range = 0.1  
     kl_beta = 0.1         # Constraint to keep model close to marginals
-    rollout_steps = 50    # Steps for PPO rollout (faster than full timesteps)
-    ppo_traj_stride = 5   # Store every k-th timestep to reduce memory (1=all, 5=every 5th)
+    rollout_steps = 25    # Steps for PPO rollout (faster than full timesteps)
+    ppo_traj_stride = 10  # Store every k-th timestep to reduce memory (1=all, 5=every 5th)
     cond_drop_prob = 0.1  # For Classifier-Free Guidance training
     cond_drop_prob_img = None  # If None, uses cond_drop_prob for both. If set, separate prob for image
     cond_drop_prob_drug = None  # If None, uses cond_drop_prob for both. If set, separate prob for drug
@@ -79,10 +79,10 @@ class Config:
     
     # Evaluation & Logging
     # Evaluation & Logging
-    eval_every = 10         # Evaluate FID/KID every N iterations (Slower schedule by default)
+    eval_every = 500          # Evaluate FID/KID every N iterations (Dev mode)
     eval_steps = 50           # Faster evaluation steps
-    eval_samples = 5000       # Fewer samples for faster evaluation
-    save_checkpoint_every = 10  # Save checkpoint every N iterations
+    eval_samples = 1000        # Fewer samples for faster evaluation
+    save_checkpoint_every = 200  # Save checkpoint every N iterations
     log_every = 1             # Log metrics every N iterations
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1251,7 +1251,10 @@ def plot_metrics(metrics_history, output_dir):
     axes[2, 0].set_title("FID Score")
     axes[2, 0].set_xlabel("Iteration")
     axes[2, 0].set_ylabel("FID")
-    axes[2, 0].legend()
+    # Fix: Check if handles exist before calling legend
+    handles, labels = axes[2, 0].get_legend_handles_labels()
+    if handles:
+        axes[2, 0].legend()
     axes[2, 0].grid(True, alpha=0.3)
     
     # KID
@@ -1264,7 +1267,10 @@ def plot_metrics(metrics_history, output_dir):
     axes[2, 1].set_title("KID Score")
     axes[2, 1].set_xlabel("Iteration")
     axes[2, 1].set_ylabel("KID")
-    axes[2, 1].legend()
+    # Fix: Check if handles exist before calling legend
+    handles, labels = axes[2, 1].get_legend_handles_labels()
+    if handles:
+        axes[2, 1].legend()
     axes[2, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
