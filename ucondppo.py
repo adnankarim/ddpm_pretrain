@@ -16,7 +16,6 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.kid import KernelInceptionDistance
 import json
 from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
 
 # Check for diffusers
 try:
@@ -28,6 +27,7 @@ except ImportError:
 # Check for RDKit
 try:
     from rdkit import Chem
+    from rdkit import DataStructs
     from rdkit.Chem import AllChem
     RDKIT_AVAILABLE = True
 except ImportError:
@@ -61,12 +61,12 @@ class Config:
     ppo_epochs = 4        
     ppo_clip_range = 0.1  
     kl_beta = 0.1         # Constraint to keep model close to marginals
-    rollout_steps = 1000  
+    rollout_steps = 50    # Steps for PPO rollout (faster than full timesteps)
     ppo_traj_stride = 5   # Store every k-th timestep to reduce memory (1=all, 5=every 5th)
     cond_drop_prob = 0.1  # For Classifier-Free Guidance training
     cond_drop_prob_img = None  # If None, uses cond_drop_prob for both. If set, separate prob for image
     cond_drop_prob_drug = None  # If None, uses cond_drop_prob for both. If set, separate prob for drug
-    guidance_scale = 1.0  
+    guidance_scale = 1.0
     
     # Reward Estimation (DDMEC)
     reward_n_terms = 16   # Timesteps to sample for likelihood est
@@ -118,7 +118,7 @@ class MorganFingerprintEncoder:
             mol = Chem.MolFromSmiles(smiles)
             fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=self.n_bits)
             arr = np.zeros((self.n_bits,), dtype=np.float32)
-            AllChem.DataStructs.ConvertToNumpyArray(fp, arr)
+            DataStructs.ConvertToNumpyArray(fp, arr)
             self.cache[cache_key] = arr
             return arr
         except:
@@ -137,8 +137,17 @@ class BBBC021PairedDataset(Dataset):
         # Filter for treated samples
         self.treated_df = df[df['CPD_NAME'] != 'DMSO'].reset_index(drop=True)
         
-        # Group controls by batch for pairing
-        self.controls_by_batch = df[df['CPD_NAME'] == 'DMSO'].groupby('BATCH')
+        # Optimization: Pre-group controls by batch to avoid pandas operations in __getitem__
+        # Create a dict mapping BATCH -> list of image paths (or SAMPLE_KEYs if path not present)
+        # We assume image_path is the better key if available
+        self.image_col = 'image_path' if 'image_path' in df.columns else 'SAMPLE_KEY'
+        
+        self.controls_by_batch = (
+            df[df['CPD_NAME'] == 'DMSO']
+            .groupby('BATCH')[self.image_col]
+            .apply(list)
+            .to_dict()
+        )
         
         self.encoder = encoder
         self.fingerprints = {}
@@ -174,14 +183,16 @@ class BBBC021PairedDataset(Dataset):
     def __getitem__(self, idx):
         # 1. Get Treated Sample
         row = self.treated_df.iloc[idx]
-        img_key = 'image_path' if 'image_path' in row.index else 'SAMPLE_KEY'
-        trt_img = self.load_image(row[img_key])
+        trt_img = self.load_image(row[self.image_col])
         
-        # 2. Get Paired Control (Same Batch)
+        # 2. Get Paired Control (Same Batch) - Optimized
         batch = row['BATCH']
-        if batch in self.controls_by_batch.groups:
-            ctrl_row = self.controls_by_batch.get_group(batch).sample(1).iloc[0]
-            ctrl_img = self.load_image(ctrl_row[img_key] if img_key in ctrl_row.index else ctrl_row['SAMPLE_KEY'])
+        ctrl_paths = self.controls_by_batch.get(batch, [])
+        
+        if len(ctrl_paths) > 0:
+            # Fast random selection from list
+            ctrl_path = np.random.choice(ctrl_paths)
+            ctrl_img = self.load_image(ctrl_path)
         else:
             # Fallback if no control in batch
             ctrl_img = torch.zeros_like(trt_img)
@@ -350,7 +361,7 @@ class DDMECModel(nn.Module):
 # ============================================================================
 
 @torch.no_grad()
-def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
+def rollout_with_logprobs(model, cond_img, fingerprint, steps=None, record_traj=True):
     """
     Generates a sample and records trajectory data for PPO.
     """
@@ -401,8 +412,6 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
         alpha_prod_t = alphas_cumprod[t_int].view(1, 1, 1, 1)
         alpha_prod_prev = (alphas_cumprod[prev_t_int].view(1, 1, 1, 1)
                            if prev_t_int >= 0 else torch.ones_like(alpha_prod_t))
-        beta_t = betas[t_int].view(1, 1, 1, 1)
-        alpha_t = alphas[t_int].view(1, 1, 1, 1)
 
         # Predict x0 from epsilon
         # pred_x0 = (x_t - sqrt(1-alpha_bar_t) * eps) / sqrt(alpha_bar_t)
@@ -429,22 +438,27 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
         var = var.clamp(min=1e-20)
         std = var.sqrt()
 
+        # Fix 1: Noise/Step consistency (only add noise if transitioning to non-zero step)
+        # RE-FIX: Standard DDPM rule: add noise iff current timestep t_int > 0
         noise = torch.randn_like(x) if t_int > 0 else torch.zeros_like(x)
         x_prev = mean + std * noise
-
-        dist = torch.distributions.Normal(mean, std)
-        log_prob = dist.log_prob(x_prev).sum(dim=(1, 2, 3))
 
         # Memory optimization: store only every k-th timestep (reduce memory usage)
         # CRITICAL FIX: Skip the final deterministic step (prev_t_int == -1) to avoid PPO instability
         stride = model.cfg.ppo_traj_stride
-        if prev_t_int >= 0 and (i % stride == 0):
+        
+        # Robust Logic: only compute log_prob when we actually store the step
+        if record_traj and prev_t_int >= 0 and (i % stride == 0):
+            dist = torch.distributions.Normal(mean, std)
+            log_prob = dist.log_prob(x_prev).sum(dim=(1, 2, 3))
+            
             traj.append({
-                "x_t": x.detach().cpu(),
-                "x_prev": x_prev.detach().cpu(),
+                # Optimization: Store as float16 on CPU to save memory
+                "x_t": x.detach().to(dtype=torch.float16).cpu(),
+                "x_prev": x_prev.detach().to(dtype=torch.float16).cpu(),
                 "t": t_batch.detach().cpu(),
                 "prev_t": torch.full((b,), prev_t_int, dtype=torch.long).cpu(),
-                "old_logprob": log_prob.detach().cpu(),
+                "old_logprob": log_prob.detach().cpu(), # keep fp32 for precision
             })
 
         x = x_prev
@@ -453,52 +467,32 @@ def rollout_with_logprobs(model, cond_img, fingerprint, steps=None):
 
 @torch.no_grad()
 def reward_negloglik(other_model, target_img, cond_img, fingerprint):
-    """
-    DDMEC Reward: -log P_phi(Target | Generated_Condition, Drug)
-    Used to train Theta.
-    target_img: Real Control Image
-    cond_img: Generated Perturbed Image
-    fingerprint: Drug Vector
-    """
     other_model.model.eval()
     scheduler = other_model.noise_scheduler
     device = other_model.cfg.device
     b = target_img.shape[0]
-    
-    # Monte Carlo estimation of likelihood (Eq 8 in paper)
-    # We estimate likelihood by calculating MSE at random timesteps
-    n_samples = other_model.cfg.reward_n_terms
-    total_mse = torch.zeros((b,), device=device)
-    
+
+    alphas_cumprod = scheduler.alphas_cumprod.to(device)
+
+    n_terms = other_model.cfg.reward_n_terms
+    total = torch.zeros((b,), device=device)
+
     for _ in range(other_model.cfg.reward_mc):
-        t_samples = torch.randint(0, scheduler.config.num_train_timesteps, (n_samples, b), device=device)
-        
-        for k in range(n_samples):
-            t = t_samples[k]
-            noise = torch.randn_like(target_img)
-            
-            # Add noise to the Target (Control)
+        t_samples = torch.randint(0, scheduler.config.num_train_timesteps, (n_terms, b), device=device)
+
+        for k in range(n_terms):
+            t = t_samples[k]                              # [b] on device
+            noise = torch.randn_like(target_img)           # [b,3,H,W]
             y_t = scheduler.add_noise(target_img, noise, t)
-            
-            # Predict noise using Other Model (Phi)
-            # Phi inputs: (Noisy Control, Time, Condition=Perturbed, Class=Drug)
+
             eps_pred = other_model.model(y_t, t, cond_img, fingerprint, drop_cond=False)
-            
-            # SNR-based variance weighting (proper ELBO formulation)
-            # Get unique timesteps for each batch element
-            t_unique = t.unique()
-            for t_val in t_unique:
-                mask = (t == t_val)
-                if mask.any():
-                    alpha_prod_t = scheduler.alphas_cumprod[t_val.item()]
-                    snr = alpha_prod_t / (1 - alpha_prod_t + 1e-8)
-                    weight = snr  # SNR weighting (can also use 1/snr depending on paper)
-                    
-                    mse_term = ((noise[mask] - eps_pred[mask])**2).mean(dim=(1,2,3))
-                    total_mse[mask] += weight * mse_term
-            
-    reward = -1.0 * (total_mse / (n_samples * other_model.cfg.reward_mc))
-    return reward
+
+            mse = ((noise - eps_pred) ** 2).mean(dim=(1,2,3))   # [b]
+            alpha = alphas_cumprod[t]                            # [b]
+            snr = alpha / (1 - alpha + 1e-8)                     # [b]
+            total += snr * mse
+
+    return -total / (n_terms * other_model.cfg.reward_mc)
 
 def ppo_update(model, ref_model, optimizer, batch, config):
     """
@@ -508,8 +502,9 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     device = config.device
     scheduler = model.noise_scheduler
 
-    x_t = batch['x_t'].to(device)
-    x_prev = batch['x_prev'].to(device)
+    # Cast back to float32 on device
+    x_t = batch['x_t'].to(device, dtype=torch.float32)
+    x_prev = batch['x_prev'].to(device, dtype=torch.float32)
     t = batch['t'].to(device).long()
     prev_t = batch['prev_t'].to(device).long()
     old_logprob = batch['old_logprob'].to(device)
@@ -582,6 +577,7 @@ def ppo_update(model, ref_model, optimizer, batch, config):
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.model.parameters(), 1.0)
     
     # Log PPO Grad Norm (Debug)
     if np.random.rand() < 0.01:
@@ -590,7 +586,13 @@ def ppo_update(model, ref_model, optimizer, batch, config):
               print(f"  [PPO] Drug grad norm: {norm:.6f}")
 
     optimizer.step()
-    return loss.item()
+    
+    return {
+        "loss": loss.item(),
+        "ppo_loss": ppo_loss.item(),
+        "kl": kl_loss.item(),
+        "ratio_mean": ratio.mean().item(),
+    }
 
 # ============================================================================
 # PPO BATCH BUILDING & ADVANTAGE COMPUTATION
@@ -689,8 +691,9 @@ def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
         batch_size = ctrl.shape[0]
         
         # Generate samples
-        x_gen, _ = rollout_with_logprobs(theta, ctrl, fp, steps=steps)  # ctrl -> trt
-        y_gen, _ = rollout_with_logprobs(phi, trt, fp, steps=steps)     # trt -> ctrl
+        # Fix 3: Disable trajectory recording during eval for speed/memory
+        x_gen, _ = rollout_with_logprobs(theta, ctrl, fp, steps=steps, record_traj=False)  # ctrl -> trt
+        y_gen, _ = rollout_with_logprobs(phi, trt, fp, steps=steps, record_traj=False)     # trt -> ctrl
         
         # Normalize to [0, 1] for FID/KID
         ctrl_norm = (ctrl * 0.5 + 0.5).clamp(0, 1)
@@ -698,16 +701,22 @@ def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
         x_gen_norm = (x_gen * 0.5 + 0.5).clamp(0, 1)
         y_gen_norm = (y_gen * 0.5 + 0.5).clamp(0, 1)
         
-        # Update overall metrics
-        fid_theta.update(trt_norm, real=True)
-        fid_theta.update(x_gen_norm, real=False)
-        kid_theta.update(trt_norm, real=True)
-        kid_theta.update(x_gen_norm, real=False)
+        # Fix 3: Convert to uint8 [0, 255] for torchmetrics
+        ctrl_u8 = (ctrl_norm * 255).to(torch.uint8)
+        trt_u8 = (trt_norm * 255).to(torch.uint8)
+        x_gen_u8 = (x_gen_norm * 255).to(torch.uint8)
+        y_gen_u8 = (y_gen_norm * 255).to(torch.uint8)
         
-        fid_phi.update(ctrl_norm, real=True)
-        fid_phi.update(y_gen_norm, real=False)
-        kid_phi.update(ctrl_norm, real=True)
-        kid_phi.update(y_gen_norm, real=False)
+        # Update overall metrics
+        fid_theta.update(trt_u8, real=True)
+        fid_theta.update(x_gen_u8, real=False)
+        kid_theta.update(trt_u8, real=True)
+        kid_theta.update(x_gen_u8, real=False)
+        
+        fid_phi.update(ctrl_u8, real=True)
+        fid_phi.update(y_gen_u8, real=False)
+        kid_phi.update(ctrl_u8, real=True)
+        kid_phi.update(y_gen_u8, real=False)
         
         # Store per-class samples
         for i in range(batch_size):
@@ -748,14 +757,18 @@ def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
             real_trt_class = torch.stack(real_trt_per_class[cpd]).to(config.device)
             gen_trt_class = torch.stack(theta_samples_per_class[cpd]).to(config.device)
             
-            fid_metric_class.update(real_trt_class, real=True)
-            fid_metric_class.update(gen_trt_class, real=False)
+            # Fix 2: Convert per-class batches to uint8 [0, 255]
+            real_trt_u8 = (real_trt_class.clamp(0, 1) * 255).to(torch.uint8)
+            gen_trt_u8 = (gen_trt_class.clamp(0, 1) * 255).to(torch.uint8)
+            
+            fid_metric_class.update(real_trt_u8, real=True)
+            fid_metric_class.update(gen_trt_u8, real=False)
             fid_theta_per_class[cpd] = fid_metric_class.compute().item()
             
             subset_size = min(len(theta_samples_per_class[cpd]), 100)
             kid_metric_class = KernelInceptionDistance(subset_size=subset_size, normalize=True).to(config.device)
-            kid_metric_class.update(real_trt_class, real=True)
-            kid_metric_class.update(gen_trt_class, real=False)
+            kid_metric_class.update(real_trt_u8, real=True)
+            kid_metric_class.update(gen_trt_u8, real=False)
             kid_mean, kid_std = kid_metric_class.compute()
             kid_theta_per_class[cpd] = {"mean": kid_mean.item(), "std": kid_std.item()}
         except Exception as e:
@@ -767,14 +780,18 @@ def evaluate_fid_kid(theta, phi, dataset, config, num_samples=5000, steps=50):
             real_ctrl_class = torch.stack(real_ctrl_per_class[cpd]).to(config.device)
             gen_ctrl_class = torch.stack(phi_samples_per_class[cpd]).to(config.device)
             
-            fid_metric_class.update(real_ctrl_class, real=True)
-            fid_metric_class.update(gen_ctrl_class, real=False)
+            # Fix 2: Convert per-class batches to uint8 [0, 255]
+            real_ctrl_u8 = (real_ctrl_class.clamp(0, 1) * 255).to(torch.uint8)
+            gen_ctrl_u8 = (gen_ctrl_class.clamp(0, 1) * 255).to(torch.uint8)
+            
+            fid_metric_class.update(real_ctrl_u8, real=True)
+            fid_metric_class.update(gen_ctrl_u8, real=False)
             fid_phi_per_class[cpd] = fid_metric_class.compute().item()
             
             subset_size = min(len(phi_samples_per_class[cpd]), 100)
             kid_metric_class = KernelInceptionDistance(subset_size=subset_size, normalize=True).to(config.device)
-            kid_metric_class.update(real_ctrl_class, real=True)
-            kid_metric_class.update(gen_ctrl_class, real=False)
+            kid_metric_class.update(real_ctrl_u8, real=True)
+            kid_metric_class.update(gen_ctrl_u8, real=False)
             kid_mean, kid_std = kid_metric_class.compute()
             kid_phi_per_class[cpd] = {"mean": kid_mean.item(), "std": kid_std.item()}
         except Exception as e:
@@ -817,14 +834,24 @@ def save_checkpoint(theta, phi, theta_opt, phi_opt, iteration, metrics_history, 
     checkpoint_dir = Path(config.output_dir) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
+    # Fix 4: Truncate metrics history in checkpoint to avoid blow-up
+    # Keep only the last 1000 entries (full history is in log file/json)
+    if len(metrics_history) > 1000:
+        sorted_keys = sorted(metrics_history.keys())[-1000:]
+        metrics_small = {k: metrics_history[k] for k in sorted_keys}
+    else:
+        metrics_small = metrics_history
+
     checkpoint = {
         "iteration": iteration,
         "theta_state_dict": theta.model.state_dict(),
         "phi_state_dict": phi.model.state_dict(),
         "theta_opt_state_dict": theta_opt.state_dict(),
         "phi_opt_state_dict": phi_opt.state_dict(),
-        "metrics_history": metrics_history,
-        "config": vars(config),
+        "metrics_history": metrics_small,
+        # Fix 3: Correctly serialize Config class attributes
+        "config": {k: getattr(config, k) for k in dir(config)
+                   if not k.startswith("__") and not callable(getattr(config, k))},
     }
     
     # Save latest
@@ -958,6 +985,9 @@ def main():
     config = Config()
     os.makedirs(config.output_dir, exist_ok=True)
     
+    # Fix 3: Enforce guidance_scale == 1.0 for PPO
+    assert config.guidance_scale == 1.0, "Set guidance_scale=1.0 during PPO training; use CFG only at eval."
+
     # 1. Initialize Models
     # Theta: Control -> Perturbed (using Drug)
     theta = DDMECModel(config)
@@ -969,6 +999,14 @@ def main():
     phi.load_pretrained_unconditional(config.phi_pretrained) # Load weights trained on Control
     phi_ref = copy.deepcopy(phi)
     
+    # Fix 2: Freeze + eval() reference models
+    theta_ref.model.eval()
+    phi_ref.model.eval()
+    for p in theta_ref.model.parameters():
+        p.requires_grad_(False)
+    for p in phi_ref.model.parameters():
+        p.requires_grad_(False)
+
     theta_opt = torch.optim.AdamW(theta.model.parameters(), lr=config.lr)
     phi_opt = torch.optim.AdamW(phi.model.parameters(), lr=config.lr)
     
@@ -979,31 +1017,43 @@ def main():
     
     print("Starting DDMEC-PPO with Drug Conditioning...")
     
-    for epoch in range(10): # Example epochs
-        for batch in tqdm(loader):
+    # Fix 5: Iteration counter and eval/checkpointing
+    iteration = 0
+    metrics_history = {}
+
+    for epoch in range(100): 
+        for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+            iteration += 1
+            
             ctrl = batch['control'].to(config.device)
             trt = batch['perturbed'].to(config.device)
             fp = batch['fingerprint'].to(config.device)
             
             # --- PHASE 1: Update Theta with PPO (Algorithm 1) ---
             # 1. Generate Fake Perturbed (x_gen) from Control + Drug
-            x_gen, traj_theta = rollout_with_logprobs(theta, ctrl, fp, steps=50) # Reduced steps for speed
+            x_gen, traj_theta = rollout_with_logprobs(theta, ctrl, fp, steps=config.rollout_steps)
             
             # 2. Calculate Reward using Phi
             # Phi estimates: P(Control | x_gen, Drug)
             # High prob = x_gen looks like a perturbed state that corresponds to this control/drug pair
-            r_theta = reward_negloglik(phi, target_img=ctrl, cond_img=x_gen, fingerprint=fp)
+            # Fix 2: Detach generated images to prevent accidental gradients/memory leak
+            r_theta = reward_negloglik(phi, target_img=ctrl, cond_img=x_gen.detach(), fingerprint=fp)
             
             # 3. PPO Update Theta (reward + marginal constraint)
+            loss_theta_ppo = 0
+            kl_theta_last = 0
             if len(traj_theta) > 0:
                 ppo_batch_theta = build_ppo_batch(traj_theta, r_theta, ctrl, fp)
                 
                 if ppo_batch_theta is not None:
                     # PPO epochs with minibatches
                     total_samples = ppo_batch_theta['x_t'].shape[0]
-                    indices = torch.randperm(total_samples, device=ppo_batch_theta['x_t'].device)  # CPU
+                    theta_stats = []
                     
                     for ppo_epoch in range(config.ppo_epochs):
+                        # Reshuffle for each PPO epoch
+                        indices = torch.randperm(total_samples, device=ppo_batch_theta['x_t'].device)  # CPU
+                        
                         for start_idx in range(0, total_samples, config.ppo_minibatch_size):
                             end_idx = min(start_idx + config.ppo_minibatch_size, total_samples)
                             batch_indices = indices[start_idx:end_idx]
@@ -1012,16 +1062,29 @@ def main():
                                 k: v[batch_indices] for k, v in ppo_batch_theta.items()
                             }
                             
-                            loss_val = ppo_update(theta, theta_ref, theta_opt, minibatch, config)
+                            stats = ppo_update(theta, theta_ref, theta_opt, minibatch, config)
+                            theta_stats.append(stats)
+                    
+                    if theta_stats:
+                        loss_theta_ppo = np.mean([s["loss"] for s in theta_stats])
+                        kl_theta_last = np.mean([s["kl"] for s in theta_stats])
             
             # --- PHASE 2: Update Phi with Joint Constraint (Algorithm 2) ---
             # After theta generates x_gen, update phi to agree: phi should map x_gen -> ctrl
-            # This enforces the joint constraint: p_theta and p_phi should agree on generated samples
             phi_opt.zero_grad(set_to_none=True)
-            loss_phi_joint = phi(ctrl, x_gen, fp)  # phi: learn to reconstruct ctrl given condition x_gen
-            loss_phi_joint.backward()
+            # Fix 1: Force conditioning ON during joint training check
+            loss_phi_joint = phi(ctrl, x_gen.detach(), fp, drop_cond=False)  # phi: learn to reconstruct ctrl given condition x_gen
             
-            # Log Grad Norm immediately
+            # Optimization: Add small unconditional loss (5%) allow CFG at eval
+            loss_phi_uncond = phi(ctrl, torch.zeros_like(x_gen), torch.zeros_like(fp), drop_cond=True)
+            loss_phi_joint_total = loss_phi_joint + 0.05 * loss_phi_uncond
+            
+            loss_phi_joint_total.backward()
+            
+            # Fix 4: Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(phi.model.parameters(), 1.0)
+            
+            # Log Grad Norm immediately (sampled)
             if np.random.rand() < 0.05:
                 if phi.model.fingerprint_proj[0].weight.grad is not None:
                      norm = phi.model.fingerprint_proj[0].weight.grad.norm().item()
@@ -1031,22 +1094,28 @@ def main():
             
             # --- PHASE 3: Update Phi with PPO (Algorithm 1) ---
             # 1. Generate Fake Control (y_gen) from Perturbed + Drug
-            y_gen, traj_phi = rollout_with_logprobs(phi, trt, fp, steps=50)
+            y_gen, traj_phi = rollout_with_logprobs(phi, trt, fp, steps=config.rollout_steps)
             
             # 2. Calculate Reward using Theta
             # Theta estimates: P(Perturbed | y_gen, Drug)
-            r_phi = reward_negloglik(theta, target_img=trt, cond_img=y_gen, fingerprint=fp)
+            # Fix 2: Detach generated images
+            r_phi = reward_negloglik(theta, target_img=trt, cond_img=y_gen.detach(), fingerprint=fp)
             
             # 3. PPO Update Phi (reward + marginal constraint)
+            loss_phi_ppo = 0
+            kl_phi_last = 0
             if len(traj_phi) > 0:
                 ppo_batch_phi = build_ppo_batch(traj_phi, r_phi, trt, fp)
                 
                 if ppo_batch_phi is not None:
                     # PPO epochs with minibatches
                     total_samples = ppo_batch_phi['x_t'].shape[0]
-                    indices = torch.randperm(total_samples, device=ppo_batch_phi['x_t'].device)  # CPU
+                    phi_stats = []
                     
                     for ppo_epoch in range(config.ppo_epochs):
+                        # Reshuffle for each PPO epoch
+                        indices = torch.randperm(total_samples, device=ppo_batch_phi['x_t'].device)  # CPU
+                        
                         for start_idx in range(0, total_samples, config.ppo_minibatch_size):
                             end_idx = min(start_idx + config.ppo_minibatch_size, total_samples)
                             batch_indices = indices[start_idx:end_idx]
@@ -1055,16 +1124,29 @@ def main():
                                 k: v[batch_indices] for k, v in ppo_batch_phi.items()
                             }
                             
-                            loss_val = ppo_update(phi, phi_ref, phi_opt, minibatch, config)
+                            stats = ppo_update(phi, phi_ref, phi_opt, minibatch, config)
+                            phi_stats.append(stats)
+                    
+                    if phi_stats:
+                        loss_phi_ppo = np.mean([s["loss"] for s in phi_stats])
+                        kl_phi_last = np.mean([s["kl"] for s in phi_stats])
             
             # --- PHASE 4: Update Theta with Joint Constraint (Algorithm 2) ---
             # After phi generates y_gen, update theta to agree: theta should map y_gen -> trt
-            # This enforces the joint constraint: p_theta and p_phi should agree on generated samples
             theta_opt.zero_grad(set_to_none=True)
-            loss_theta_joint = theta(trt, y_gen, fp)  # theta: learn to reconstruct trt given condition y_gen
-            loss_theta_joint.backward()
+            # Fix 1: Force conditioning ON during joint training check
+            loss_theta_joint = theta(trt, y_gen.detach(), fp, drop_cond=False)
             
-            # Log Grad Norm immediately
+            # Optimization: Add small unconditional loss (5%) allow CFG at eval
+            loss_theta_uncond = theta(trt, torch.zeros_like(y_gen), torch.zeros_like(fp), drop_cond=True)
+            loss_theta_joint_total = loss_theta_joint + 0.05 * loss_theta_uncond
+            
+            loss_theta_joint_total.backward()
+            
+            # Fix 4: Gradient Clipping
+            torch.nn.utils.clip_grad_norm_(theta.model.parameters(), 1.0)
+            
+            # Log Grad Norm immediately (sampled)
             if np.random.rand() < 0.05:
                 if theta.model.fingerprint_proj[0].weight.grad is not None:
                      norm = theta.model.fingerprint_proj[0].weight.grad.norm().item()
@@ -1072,41 +1154,45 @@ def main():
                      
             theta_opt.step()
             
-            # NOTE: For a hybrid approach (more stable but not pure unpaired DDMEC), you can add
-            # supervised losses on real pairs after the joint constraint updates:
-            #   theta_opt.zero_grad(set_to_none=True)
-            #   phi_opt.zero_grad(set_to_none=True)
-            #   loss_theta_sup = theta(trt, ctrl, fp)  # Learn on real pairs
-            #   loss_phi_sup = phi(ctrl, trt, fp)       # Learn on real pairs
-            #   loss_theta_sup.backward()
-            #   loss_phi_sup.backward()
-            #   theta_opt.step()
-            #   phi_opt.step()
-            
-            # Logging and drug conditioning verification
-            if np.random.rand() < 0.01:
-                print(f"R_Theta: {r_theta.mean().item():.3f} | R_Phi: {r_phi.mean().item():.3f}")
+            # Logging
+            if iteration % config.log_every == 0:
+                print(f"Iter {iteration} | R_Theta: {r_theta.mean().item():.3f} | R_Phi: {r_phi.mean().item():.3f}")
+                metrics_history[iteration] = {
+                    "r_theta_mean": r_theta.mean().item(),
+                    "r_phi_mean": r_phi.mean().item(),
+                    "r_phi_mean": r_phi.mean().item(),
+                    "loss_theta_ppo": loss_theta_ppo,
+                    "loss_phi_ppo": loss_phi_ppo,
+                    "loss_theta_joint": loss_theta_joint.item(),
+                    "loss_phi_joint": loss_phi_joint.item(),
+                    "kl_theta": kl_theta_last if "kl_theta_last" in locals() else 0.0,
+                    "kl_phi": kl_phi_last if "kl_phi_last" in locals() else 0.0,
+                }
+
+            # Checkpointing
+            if iteration % config.save_checkpoint_every == 0:
+                save_checkpoint(theta, phi, theta_opt, phi_opt, iteration, metrics_history, config)
+                try:
+                    plot_metrics(metrics_history, config.output_dir)
+                except Exception as e:
+                    print(f"Plotting failed: {e}")
+
+            # Evaluation
+            if iteration % config.eval_every == 0:
+                results = evaluate_fid_kid(theta, phi, dataset, config,
+                                           num_samples=config.eval_samples,
+                                           steps=config.eval_steps)
+                                           
+                # Store full metrics history
+                metrics_history[iteration]["fid_theta"] = results["theta"]["overall_fid"]
+                metrics_history[iteration]["kid_theta_mean"] = results["theta"]["overall_kid_mean"]
+                metrics_history[iteration]["fid_phi"] = results["phi"]["overall_fid"]
+                metrics_history[iteration]["kid_phi_mean"] = results["phi"]["overall_kid_mean"]
                 
-                # Removed late gradient logging (moved to immediately after backward)
-                
-                # Ablation test: generate with real drug vs zero drug
-                with torch.no_grad():
-                    theta.model.eval()
-                    # Generate with real drug
-                    x_gen_real_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp[:1], steps=10)
-                    # Generate with zero drug
-                    fp_zero = torch.zeros_like(fp[:1])
-                    x_gen_zero_fp, _ = rollout_with_logprobs(theta, ctrl[:1], fp_zero, steps=10)
-                    # Compute difference
-                    drug_effect = F.mse_loss(x_gen_real_fp, x_gen_zero_fp).item()
-                    print(f"  Drug conditioning effect (MSE between real vs zero drug): {drug_effect:.6f}")
-                    if drug_effect < 1e-4:
-                        print("  WARNING: Drug conditioning appears to have minimal effect!")
-                
-        # Save visualization
-        with torch.no_grad():
-            vis = torch.cat([ctrl[:4], x_gen[:4], trt[:4], y_gen[:4]], dim=0)
-            save_image(vis, f"{config.output_dir}/epoch_{epoch}.png", nrow=4, normalize=True, value_range=(-1, 1))
+                # Also save detailed results to file
+                with open(f"{config.output_dir}/eval_{iteration}.json", 'w') as f:
+                    # Convert tensors/numpy to native types for JSON
+                    json.dump(results, f, indent=4, default=lambda x: x.tolist() if hasattr(x, 'tolist') else x)
 
 if __name__ == "__main__":
     main()
