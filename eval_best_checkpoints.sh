@@ -4,10 +4,9 @@ set -e
 # Configuration
 NUM_SAMPLES=5000
 EVAL_SPLIT="test"
-INFERENCE_STEPS_LIST=(50 1000)  # Evaluate with both 50 and 1000 steps
+INFERENCE_STEPS_LIST=(1000)  # Evaluate with both 50 and 1000 steps
 
 # Checkpoints from ppo.py
-THETA_CHECKPOINT="./ddpm_diffusers_results/checkpoints/checkpoint_epoch_60.pt"
 PHI_CHECKPOINT="./results_phi_phi/checkpoints/checkpoint_epoch_100.pt"
 
 # Checkpoints from sdlora.py
