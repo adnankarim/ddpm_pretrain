@@ -133,11 +133,28 @@ class BBBC021PairedDataset(Dataset):
     def __init__(self, data_dir, metadata_file, encoder):
         self.data_dir = Path(data_dir)
         
-        # Robust metadata loading: Check in data_dir, else check at root/absolute
-        meta_path = self.data_dir / metadata_file
-        if not meta_path.exists():
-            meta_path = Path(metadata_file)
-            
+        # Robust metadata loading: Check multiple possible locations
+        candidates = [
+            self.data_dir / metadata_file,  # In data directory
+            Path(metadata_file),            # Relative to current directory
+            Path(metadata_file).resolve(),  # Absolute path
+        ]
+        
+        meta_path = None
+        for candidate in candidates:
+            if candidate.exists():
+                meta_path = candidate
+                break
+        
+        if meta_path is None:
+            raise FileNotFoundError(
+                f"Metadata file '{metadata_file}' not found in any of these locations:\n"
+                f"  - {candidates[0]}\n"
+                f"  - {candidates[1]}\n"
+                f"  - {candidates[2]}"
+            )
+        
+        print(f"Loading metadata from: {meta_path}")
         df = pd.read_csv(meta_path)
         
         # Filter for treated samples
