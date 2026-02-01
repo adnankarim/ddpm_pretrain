@@ -335,7 +335,7 @@ class MolFormerEncoder:
         except Exception as e:
             print(f"Warning: Failed to encode SMILES '{smiles}': {e}")
             # Return random fingerprint on failure to prevent crash
-            np.random.seed(hash(str(smiles)) % 2**32)
+        np.random.seed(hash(str(smiles)) % 2**32)
             return (np.random.rand(self.target_dim) > 0.5).astype(np.float32)
 
 class BBBC021Dataset(Dataset):
@@ -453,7 +453,7 @@ class BBBC021Dataset(Dataset):
     def get_paired_sample(self, trt_idx):
         batch = self.metadata[trt_idx].get('BATCH', 'unknown')
         if batch in self.batch_map and self.batch_map[batch]['ctrl']:
-            ctrls = self.batch_map[batch]['ctrl']
+        ctrls = self.batch_map[batch]['ctrl']
             return (np.random.choice(ctrls), trt_idx)
         return (trt_idx, trt_idx)  # Fallback: use self as control if none found
 
@@ -716,7 +716,7 @@ class BBBC021Dataset(Dataset):
             # Fallback: use DMSO
             fp = self.fingerprints.get('DMSO', np.zeros(768))
             smiles = 'DMSO'
-        
+
         cpd = meta.get('CPD_NAME', 'DMSO')
         
         return {
@@ -921,7 +921,8 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
         num_inference_steps: Number of inference steps for generation
     
     Returns:
-        dict with keys: 'overall_fid', 'overall_kid', 'fid_per_class', 'kid_per_class', 'average_fid', 'average_kid'
+        dict with keys: 'overall_fid', 'overall_kid', 'fid_per_class', 'kid_per_class', 
+        'average_fid', 'average_kid', 'cfid', 'num_conditions_for_cfid'
     """
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
@@ -941,8 +942,11 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
     generated_samples = {}  # compound_name -> list of tensors
     target_samples = {}     # compound_name -> list of tensors
     
+    # Group samples by condition (control + fingerprint) for cFID
+    condition_groups = {}  # cond_key -> {'real': [], 'gen': []}
+    
     sample_count = 0
-    with torch.no_grad():
+            with torch.no_grad():
         from tqdm.auto import tqdm
         for batch in tqdm(val_loader, desc="  Evaluating", leave=False):
             if sample_count >= num_samples:
@@ -978,6 +982,16 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
                     target_samples[compound] = []
                 generated_samples[compound].append(gen_uint8[i])
                 target_samples[compound].append(real_uint8[i])
+                
+                # Group by condition (control + fingerprint) for cFID
+                # Use approximate hash: mean of control channels + first 10 fp dims
+                ctrl_hash = tuple(ctrl[i].mean(dim=(1, 2)).detach().cpu().numpy().round(decimals=2))
+                fp_hash = tuple(fp[i].detach().cpu().numpy()[:10].round(decimals=2))  # Use first 10 dims for hash
+                cond_key = (ctrl_hash, fp_hash)
+                if cond_key not in condition_groups:
+                    condition_groups[cond_key] = {'real': [], 'gen': []}
+                condition_groups[cond_key]['real'].append(real_uint8[i])
+                condition_groups[cond_key]['gen'].append(gen_uint8[i])
             
             sample_count += real_t.shape[0]
     
@@ -1016,7 +1030,7 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
             }
             
             print(f"  {compound} ({len(generated_samples[compound])}): FID={fid_per_class[compound]:.2f}, KID={kid_per_class[compound]['mean']:.4f}±{kid_per_class[compound]['std']:.4f}", flush=True)
-        except Exception as e:
+    except Exception as e:
             print(f"  Warning: Failed to compute metrics for {compound}: {e}", flush=True)
             continue
     
@@ -1025,6 +1039,33 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
     avg_kid_mean = np.mean([v["mean"] for v in kid_per_class.values()]) if kid_per_class else None
     avg_kid_std = np.mean([v["std"] for v in kid_per_class.values()]) if kid_per_class else None
     
+    # Compute conditional FID (cFID) by averaging FID across condition groups
+    cfid_scores = []
+    print(f"  Computing cFID across {len(condition_groups)} condition groups...", flush=True)
+    for cond_key, group in tqdm(condition_groups.items(), desc="  Computing cFID", leave=False):
+        if len(group['real']) < 2 or len(group['gen']) < 2:
+            continue  # Skip groups with insufficient samples
+        
+        try:
+            real_stack = torch.stack(group['real']).to(device)
+            gen_stack = torch.stack(group['gen']).to(device)
+            
+            fid_metric_cond = FrechetInceptionDistance(normalize=True).to(device, non_blocking=True)
+            fid_metric_cond.update(real_stack, real=True)
+            fid_metric_cond.update(gen_stack, real=False)
+            cfid_scores.append(float(fid_metric_cond.compute().cpu().item()))
+        except Exception as e:
+            print(f"  Warning: Failed to compute cFID for condition group: {e}", flush=True)
+            continue
+    
+    cfid = float(np.mean(cfid_scores)) if cfid_scores else None
+    num_conditions_for_cfid = len(cfid_scores)
+    
+    if cfid is not None:
+        print(f"  cFID computed from {num_conditions_for_cfid} condition groups: {cfid:.2f}", flush=True)
+    else:
+        print(f"  Warning: Could not compute cFID (insufficient condition groups with >=2 samples)", flush=True)
+    
     result = {
         "overall_fid": float(fid.item()),
         "overall_kid": {"mean": float(kid_mean.item()), "std": float(kid_std.item())},
@@ -1032,6 +1073,8 @@ def calculate_metrics_torchmetrics(model, val_loader, device, num_samples=20480,
         "kid_per_class": kid_per_class,
         "average_fid": float(avg_fid) if avg_fid is not None else None,
         "average_kid": {"mean": avg_kid_mean, "std": avg_kid_std} if avg_kid_mean is not None else None,
+        "cfid": cfid,
+        "num_conditions_for_cfid": num_conditions_for_cfid,
     }
     
     return result
@@ -1486,6 +1529,8 @@ Examples:
             print(f"  Average FID:        {metrics['average_fid']:.2f}", flush=True)
         if metrics['average_kid'] is not None:
             print(f"  Average KID:        mean={metrics['average_kid']['mean']:.4f}, std={metrics['average_kid']['std']:.4f}", flush=True)
+        if metrics.get('cfid') is not None:
+            print(f"  cFID (Conditional): {metrics['cfid']:.2f} (from {metrics.get('num_conditions_for_cfid', 0)} condition groups)", flush=True)
         print(f"{'='*60}", flush=True)
         
         # Save results to JSON

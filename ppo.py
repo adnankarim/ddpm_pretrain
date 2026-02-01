@@ -153,7 +153,7 @@ class BBBC021Dataset(Dataset):
             print(f"Loading file paths from {paths_csv_path}...")
             paths_df = pd.read_csv(paths_csv_path)
             
-            for _, row in paths_df.iterrows():
+             for _, row in paths_df.iterrows():
                 filename = row['filename']
                 rel_path = row['relative_path']
                 basename = Path(filename).stem  # filename without extension
@@ -380,8 +380,8 @@ class BBBC021Dataset(Dataset):
         try:
             # Get file size before loading
             file_size_bytes = full_path.stat().st_size if full_path.exists() else 0
-            
-            img = np.load(full_path)
+
+        img = np.load(full_path)
             original_shape = img.shape
             original_dtype = img.dtype
             original_min = float(img.min())
@@ -394,7 +394,7 @@ class BBBC021Dataset(Dataset):
             elif img.ndim == 3 and img.shape[0] == 3:
                 # Already in CHW format, no transpose needed
                 pass
-            img = torch.from_numpy(img).float()
+        img = torch.from_numpy(img).float()
             
             # Normalize [0, 255] or [0, 1] -> [-1, 1]
             if img.max() > 1.0: 
@@ -402,7 +402,7 @@ class BBBC021Dataset(Dataset):
             else:
                 img = (img * 2.0) - 1.0
                 
-            img = torch.clamp(img, -1, 1)
+        img = torch.clamp(img, -1, 1)
             
             # Debug: Check for constant images (Grey/Black)
             if img.min() == img.max():
@@ -434,7 +434,7 @@ class BBBC021Dataset(Dataset):
                 f"  File path: {full_path}\n"
                 f"  Original error: {type(e).__name__}: {str(e)}"
             ) from e
-
+        
         cpd = meta.get('CPD_NAME', 'DMSO')
         fp = self.fingerprints.get(cpd, np.zeros(1024))
         
@@ -526,7 +526,7 @@ class ModifiedDiffusersUNet(nn.Module):
             # Explicitly zero the embedding to avoid bias from projection layer
             emb = torch.zeros((x.shape[0], self.target_dim), device=x.device, dtype=x.dtype)
         else:
-            emb = self.fingerprint_proj(fingerprint)
+        emb = self.fingerprint_proj(fingerprint)
             
         x_in = torch.cat([x, control], dim=1)
         return self.unet(x_in, t, class_labels=emb).sample
@@ -744,14 +744,14 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
     scheduler = other_model.noise_scheduler
     device = other_model.cfg.device
     b = target_img.shape[0]
-
+    
 
     
     # Pre-fetch scale
     w_cfg = other_model.cfg.guidance_scale
     
     acc = torch.zeros((b,), device=device)
-
+    
     for _ in range(mc):
         # sample a set of timesteps per batch element
         t_batch_mc = torch.randint(0, scheduler.config.num_train_timesteps, (n_terms, b), device=device).long()
@@ -762,7 +762,7 @@ def reward_negloglik_ddpm(other_model: DiffusionModel,
         
         for k in range(n_terms):
             tk = t_batch_mc[k]
-            noise = torch.randn_like(target_img)
+        noise = torch.randn_like(target_img)
             y_t = scheduler.add_noise(target_img, noise, tk)
             
             # Use CFG for reward likelihood proxy
@@ -1392,7 +1392,7 @@ def main():
     if start_iter > 0:
         print(f"Continuing DDMEC-PPO Loop from iteration {start_iter} to {args.iters}...")
     else:
-        print(f"Starting DDMEC-PPO Loop for {args.iters} iterations...")
+    print(f"Starting DDMEC-PPO Loop for {args.iters} iterations...")
     iterator = iter(loader)
     
     # --- Initial Evaluation ---

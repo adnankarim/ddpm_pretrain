@@ -198,8 +198,8 @@ class BBBC021PairedDataset(Dataset):
         
         paths_csv_path = self.data_dir / "paths.csv"
         if not paths_csv_path.exists():
-            paths_csv_path = Path("paths.csv")
-        
+             paths_csv_path = Path("paths.csv")
+             
         if paths_csv_path.exists():
             print(f"Loading file paths from {paths_csv_path}...")
             paths_df = pd.read_csv(paths_csv_path)
@@ -371,9 +371,9 @@ class BBBC021PairedDataset(Dataset):
                     if search_dir.exists():
                         search_pattern = path if path.endswith('.npy') else path + '.npy'
                         matches = list(search_dir.rglob(search_pattern))
-                        if matches:
-                            return matches[0]
-        
+        if matches:
+            return matches[0]
+            
         return None
 
     def __len__(self):
@@ -393,7 +393,7 @@ class BBBC021PairedDataset(Dataset):
             )
         
         try:
-            img = np.load(full_path)
+        img = np.load(full_path)
             original_shape = img.shape
             original_dtype = img.dtype
             
@@ -409,13 +409,13 @@ class BBBC021PairedDataset(Dataset):
             
             # Normalize [0, 255] or [0, 1] -> [-1, 1]
             if img.max() > 1.0: 
-                img = (img / 127.5) - 1.0
+            img = (img / 127.5) - 1.0
             else:
                 img = (img * 2.0) - 1.0
                 
             img = torch.clamp(img, -1, 1)
-            
-            return img
+
+        return img
             
         except Exception as e:
             # Show the actual error instead of silently failing
@@ -787,6 +787,16 @@ def ppo_update(model, ref_model, optimizer, batch, config):
     alphas_cumprod = scheduler.alphas_cumprod.to(device)
 
     eps = model.model(x_t, t, cond_img, fp, drop_cond=False)
+    
+    # NaN check: if model output is NaN, skip this update
+    if torch.isnan(eps).any() or torch.isinf(eps).any():
+        print(f"  [WARN] NaN/Inf detected in model output (eps), skipping PPO update")
+        return {
+            "loss": float('nan'),
+            "ppo_loss": float('nan'),
+            "kl": float('nan'),
+            "ratio_mean": float('nan'),
+        }
 
     # Compute mean/std per-sample timestep (vectorized indexing)
     alpha_prod_t = alphas_cumprod[t].view(-1, 1, 1, 1)
@@ -795,6 +805,9 @@ def ppo_update(model, ref_model, optimizer, batch, config):
         alphas_cumprod[torch.clamp(prev_t, min=0)].view(-1, 1, 1, 1),
         torch.ones_like(alpha_prod_t),
     )
+    
+    # Prevent division by zero
+    alpha_prod_t = torch.clamp(alpha_prod_t, min=1e-8)
 
     pred_x0 = (x_t - (1.0 - alpha_prod_t).sqrt() * eps) / alpha_prod_t.sqrt()
     pred_x0 = pred_x0.clamp(-1, 1)
@@ -876,7 +889,7 @@ def ppo_update(model, ref_model, optimizer, batch, config):
               if np.isnan(norm) or np.isinf(norm):
                   print(f"  [PPO] Drug grad norm: NaN/Inf detected!")
               else:
-                  print(f"  [PPO] Drug grad norm: {norm:.6f}")
+              print(f"  [PPO] Drug grad norm: {norm:.6f}")
 
     optimizer.step()
     
@@ -913,10 +926,22 @@ def build_ppo_batch(traj, reward, cond_img, fingerprint):
     fingerprint = fingerprint.detach().to(storage_device)
 
     # Normalize reward -> advantages (constant per timestep)
-    # FIX: Robust normalization
-    std = reward.std(unbiased=False).clamp_min(1e-3)
-    normalized_reward = (reward - reward.mean()) / std
-    normalized_reward = normalized_reward.clamp(-5.0, 5.0)
+    # NaN check: if reward contains NaN, return None to skip PPO update
+    if torch.isnan(reward).any() or torch.isinf(reward).any():
+        print(f"  [WARN] NaN/Inf detected in reward, skipping PPO batch")
+        return None
+    
+    reward_mean = reward.mean()
+    reward_std = reward.std()
+    
+    # If all rewards are the same (std=0), use zero-centered advantages
+    if reward_std < 1e-8:
+        normalized_reward = torch.zeros_like(reward)
+    else:
+        normalized_reward = (reward - reward_mean) / (reward_std + 1e-8)
+    
+    # Clamp advantages to prevent extreme values
+    normalized_reward = torch.clamp(normalized_reward, min=-10.0, max=10.0)
 
     x_t_list, x_prev_list, t_list, prev_t_list = [], [], [], []
     old_logprob_list, adv_list, cond_img_list, fp_list = [], [], [], []
@@ -1458,7 +1483,7 @@ def main():
                      if np.isnan(norm) or np.isinf(norm):
                          print(f"  [JOINT] Phi drug grad norm: NaN/Inf detected!")
                      else:
-                         print(f"  [JOINT] Phi drug grad norm: {norm:.6f}")
+                     print(f"  [JOINT] Phi drug grad norm: {norm:.6f}")
                      
             phi_opt.step()
             
@@ -1528,7 +1553,7 @@ def main():
                      if np.isnan(norm) or np.isinf(norm):
                          print(f"  [JOINT] Theta drug grad norm: NaN/Inf detected!")
                      else:
-                         print(f"  [JOINT] Theta drug grad norm: {norm:.6f}")
+                     print(f"  [JOINT] Theta drug grad norm: {norm:.6f}")
                      
             theta_opt.step()
             

@@ -328,9 +328,9 @@ class PairedBBBC021Dataset(Dataset):
             csv_full_path = metadata_file
             
         df = pd.read_csv(csv_full_path)
-        if 'SPLIT' in df.columns: 
+        if 'SPLIT' in df.columns:
             df = df[df['SPLIT'].str.lower() == split.lower()]
-        
+            
         self.metadata = df.to_dict('records')
         
         # Group by Batch to find controls
@@ -523,8 +523,8 @@ class PairedBBBC021Dataset(Dataset):
         # Last resort: Recursive search
         search_pattern = filename if filename.endswith('.npy') else filename + '.npy'
         matches = list(self.data_dir.rglob(search_pattern))
-        if matches:
-            return matches[0]
+                        if matches:
+                            return matches[0]
         
         return None
 
@@ -613,7 +613,7 @@ class PairedBBBC021Dataset(Dataset):
         # 4. Get Drug Fingerprint
         cpd = trt_meta.get('CPD_NAME', 'DMSO')
         fp = self.fingerprints.get(cpd, np.zeros(1024))
-        
+
         return {
             'control': ctrl_img,
             'target': trt_img,
@@ -879,7 +879,7 @@ def main():
     
     config = Config()
     if args.output_dir:
-        config.output_dir = args.output_dir
+    config.output_dir = args.output_dir
     
     os.makedirs(f"{config.output_dir}/checkpoints", exist_ok=True)
     os.makedirs(f"{config.output_dir}/plots", exist_ok=True)
@@ -1075,7 +1075,7 @@ def main():
             else:
                 noise_pred = model(noisy_target.float(), timesteps, ctrl_latents.float(), fp)
                 loss = F.mse_loss(noise_pred, noise)
-            
+
             # Check for NaN
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\n⚠️  Warning: NaN/Inf loss detected, skipping this batch", flush=True)
@@ -1087,7 +1087,7 @@ def main():
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            optimizer.step()
+                optimizer.step()
             
             epoch_losses.append(loss.item())
             progress.set_postfix({"loss": loss.item()})
@@ -1121,7 +1121,7 @@ def main():
                 "epoch_loss": avg_loss,
                 "learning_rate": current_lr
             })
-        
+
         # Checkpointing
         if (epoch + 1) % config.save_freq == 0:
             # Save specific epoch checkpoint (unique file for every evaluated epoch)
