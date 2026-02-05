@@ -70,8 +70,8 @@ class Config:
     beta_end = 2e-2
 
     # Training
-    epochs = 100
-    batch_size = 64
+    epochs = 200
+    batch_size = 128
     lr = 3e-5
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
