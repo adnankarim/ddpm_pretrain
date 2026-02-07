@@ -96,7 +96,7 @@ class Config:
     global_ckpt = "ddpm_uncond_all/checkpoints/best.pt"  # or latest.pt
     global_ema_path = "ddpm_uncond_all/theta_ref_ema_best.pt"  # preferred if exists
 
-    ctrl_epochs = 30            # short fine-tune (10–50 typical)
+    ctrl_epochs = 50            # short fine-tune (10–50 typical)
     ctrl_lr = 5e-6              # tiny LR (1e-6 to 1e-5)
     ctrl_patience = 5           # early stop patience (FID or loss)
     ctrl_min_delta = 0.2        # FID improvement threshold
@@ -1033,9 +1033,9 @@ def main():
         config.fid_every_epochs = 1
         config.sample_every_epochs = 1
         config.preview_real_every_epochs = 1
-        config.fid_inference_steps = 100
-        config.fid_num_gen = 500
-        config.fid_num_real = 500
+        config.fid_inference_steps = 50
+        config.fid_num_gen = 1000
+        config.fid_num_real = 1000
         config.ctrl_min_delta = 0.5
         
     assert config.cross_attention_dim % config.attention_head_dim == 0, \
