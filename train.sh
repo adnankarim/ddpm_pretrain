@@ -96,7 +96,7 @@ run_theta() {
   echo "=== Training THETA ==="
   echo "  overall_init: ${OVERALL_INIT}"
   echo "  outdir:       ${outdir}"
-  python "${TRAIN_PY}" \
+  python3 "${TRAIN_PY}" \
     --direction theta \
     --overall_init "${OVERALL_INIT}" \
     --output_dir "${outdir}" \
@@ -110,7 +110,7 @@ run_phi() {
   echo "=== Training PHI ==="
   echo "  ctrl_init: ${CTRL_INIT}"
   echo "  outdir:    ${outdir}"
-  python "${TRAIN_PY}" \
+  python3 "${TRAIN_PY}" \
     --direction phi \
     --ctrl_init "${CTRL_INIT}" \
     --output_dir "${outdir}" \
