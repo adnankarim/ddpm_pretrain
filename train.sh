@@ -21,7 +21,7 @@ set -euo pipefail
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TRAIN_PY="${SCRIPT_DIR}/train.py"
+TRAIN_PY="${SCRIPT_DIR}/traincond3.py"
 
 # ---- Defaults ----
 DIRECTION="theta"                # theta | phi | both
