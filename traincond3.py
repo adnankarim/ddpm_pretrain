@@ -39,14 +39,19 @@ except ImportError:
 from diffusers.utils import is_peft_available
 
 try:
-    from diffusers.models.lora import LoraConfig
+    from peft import LoraConfig
     DIFFUSERS_LORA_AVAILABLE = True
-except Exception:
+except ImportError:
     try:
-        from diffusers import LoraConfig
+        from diffusers.models.lora import LoraConfig
         DIFFUSERS_LORA_AVAILABLE = True
-    except Exception:
-        DIFFUSERS_LORA_AVAILABLE = False
+    except ImportError:
+        try:
+            from diffusers import LoraConfig
+            DIFFUSERS_LORA_AVAILABLE = True
+        except ImportError:
+            DIFFUSERS_LORA_AVAILABLE = False
+
 
 
 try:
