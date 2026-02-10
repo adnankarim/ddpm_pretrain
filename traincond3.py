@@ -35,21 +35,18 @@ except ImportError:
     print("CRITICAL: 'diffusers' library not found. Install with: pip install diffusers")
     sys.exit(1)
 
-# Robust LoRA import across diffusers versions
-LoRAAttnProcessor = None
+
+from diffusers.utils import is_peft_available
+
 try:
-    from diffusers.models.attention_processor import LoRAAttnProcessor2_0 as _LoRA2
-    LoRAAttnProcessor = _LoRA2
+    from diffusers.models.lora import LoraConfig
+    DIFFUSERS_LORA_AVAILABLE = True
 except Exception:
     try:
-        from diffusers.models.attention_processor import LoRAAttnProcessor as _LoRA
-        LoRAAttnProcessor = _LoRA
+        from diffusers import LoraConfig
+        DIFFUSERS_LORA_AVAILABLE = True
     except Exception:
-        LoRAAttnProcessor = None
-
-if LoRAAttnProcessor is None:
-    print("CRITICAL: Could not import a LoRA attention processor from diffusers.")
-    sys.exit(1)
+        DIFFUSERS_LORA_AVAILABLE = False
 
 
 try:
@@ -764,64 +761,36 @@ class CtrlImageToTokens(nn.Module):
         return self.proj(h)  # [B,M,D]
 
 
-def _hidden_size_from_attn_name(name: str, block_out_channels):
-    # down_blocks.{i}.* -> block_out_channels[i]
-    # up_blocks.{i}.*   -> block_out_channels[-(i+1)]
-    # mid_block.*       -> block_out_channels[-1]
-    if name.startswith("mid_block"):
-        return block_out_channels[-1]
-    if name.startswith("down_blocks"):
-        i = int(name.split(".")[1])
-        return block_out_channels[i]
-    if name.startswith("up_blocks"):
-        i = int(name.split(".")[1])
-        return block_out_channels[-(i + 1)]
-    raise ValueError(f"CRITICAL: cannot parse attention processor name: {name}")
 
+def enable_unet_lora(unet: UNet2DConditionModel, rank: int = 8):
+    """
+    Diffusers-native LoRA for attention layers.
+    Works with diffusers>=0.20 and especially 0.36.0.
+    """
+    if not is_peft_available():
+        raise RuntimeError(
+            "PEFT not available but required for diffusers LoRA adapters.\n"
+            "Install: pip install peft"
+        )
+    
+    # Check if LoraConfig is available
+    if not DIFFUSERS_LORA_AVAILABLE:
+         raise RuntimeError(
+            "LoraConfig not available. Please upgrade diffusers."
+        )
 
+    lora_config = LoraConfig(
+        r=rank,
+        lora_alpha=rank,
+        init_lora_weights="gaussian",
+        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+    )
+    unet.add_adapter(lora_config)
+    # unet.enable_adapters() # Some versions might not have this or it might be default
 
-def inject_lora_crossattn(unet: UNet2DConditionModel, rank=8):
-    """Attach LoRA ONLY to cross-attn (attn2) processors, compatible across diffusers versions."""
-    sig = inspect.signature(LoRAAttnProcessor.__init__)
-    params = set(sig.parameters.keys())
+def get_trainable_params(model: nn.Module):
+    return [p for p in model.parameters() if p.requires_grad]
 
-    attn_procs = {}
-    for name, proc in unet.attn_processors.items():
-        if "attn2" not in name:
-            attn_procs[name] = proc
-            continue
-
-        hidden_size = _hidden_size_from_attn_name(name, unet.config.block_out_channels)
-        cross_dim = unet.config.cross_attention_dim
-
-        kwargs = {"rank": rank}
-
-        # Some versions accept hidden_size
-        if "hidden_size" in params:
-            kwargs["hidden_size"] = hidden_size
-        # Some versions use "query_dim" instead
-        if "query_dim" in params and "hidden_size" not in kwargs:
-            kwargs["query_dim"] = hidden_size
-
-        # Some versions accept cross_attention_dim
-        if "cross_attention_dim" in params:
-            kwargs["cross_attention_dim"] = cross_dim
-        # Some older versions use "context_dim"
-        if "context_dim" in params and "cross_attention_dim" not in kwargs:
-            kwargs["context_dim"] = cross_dim
-
-        attn_procs[name] = LoRAAttnProcessor(**kwargs)
-
-    unet.set_attn_processor(attn_procs)
-
-
-
-def get_lora_params(unet: UNet2DConditionModel):
-    params = []
-    for name, proc in unet.attn_processors.items():
-        if "attn2" in name:
-            params += list(proc.parameters())
-    return params
 
 
 def load_uncond_init_into_cond_unet(unet: UNet2DConditionModel, ckpt_path: str, skip_conv_in: bool = True):
@@ -954,20 +923,24 @@ class ConditionalWarmupUNet(nn.Module):
         )
 
         # freeze everything (we will unfreeze LoRA + token modules + optional conv_in)
+
+        # freeze everything (we will unfreeze LoRA + token modules + optional conv_in)
         self.unet.requires_grad_(False)
 
-        inject_lora_crossattn(self.unet, rank=config.lora_rank)
+        # Enable LoRA adapters (this sets LoRA params to trainable)
+        enable_unet_lora(self.unet, rank=config.lora_rank)
 
         # allow training selected params
         for p in self.fp_tokens.parameters():
             p.requires_grad_(True)
         for p in self.ctrl_tokens.parameters():
             p.requires_grad_(True)
-        for p in get_lora_params(self.unet):
-            p.requires_grad_(True)
+        
+        # Optional conv_in
         if config.train_conv_in:
             for p in self.unet.conv_in.parameters():
                 p.requires_grad_(True)
+
 
     def forward(self, x_noisy, t, cond_img, fingerprint):
         x_in = torch.cat([x_noisy, cond_img], dim=1)  # [B,6,H,W]
@@ -1639,15 +1612,21 @@ Examples:
         print(f"Initializing ConditionalWarmupUNet for phase '{direction}' with init '{init_ckpt}'...")
         model = DiffusionModel(phase_config)
 
-        lora_params = get_lora_params(model.model.unet)
+
+        unet_trainable = [p for p in model.model.unet.parameters() if p.requires_grad]
+
         param_groups = [
             {"params": model.model.fp_tokens.parameters(), "lr": phase_config.lr},
             {"params": model.model.ctrl_tokens.parameters(), "lr": phase_config.lr},
-            {"params": lora_params, "lr": phase_config.lr},
+            {"params": unet_trainable, "lr": phase_config.lr},
         ]
+        
         if phase_config.train_conv_in:
-            param_groups.append({"params": model.model.unet.conv_in.parameters(), "lr": phase_config.lr})
+            # conv_in already included above if requires_grad=True, so no extra group needed unless you want specific LR
+            pass
+
         optimizer = torch.optim.AdamW(param_groups, weight_decay=0.0)
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=phase_config.epochs,
