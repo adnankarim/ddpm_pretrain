@@ -27,16 +27,30 @@ matplotlib.use('Agg')  # Use non-interactive backend for headless servers
 import matplotlib.pyplot as plt
 
 # --- NEW IMPORTS ---
+import inspect
 try:
     from diffusers import UNet2DConditionModel, DDPMScheduler
-    try:
-        from diffusers.models.attention_processor import LoRAAttnProcessor2_0 as LoRAAttnProcessor
-    except Exception:
-        from diffusers.models.attention_processor import LoRAAttnProcessor
     DIFFUSERS_AVAILABLE = True
 except ImportError:
     print("CRITICAL: 'diffusers' library not found. Install with: pip install diffusers")
     sys.exit(1)
+
+# Robust LoRA import across diffusers versions
+LoRAAttnProcessor = None
+try:
+    from diffusers.models.attention_processor import LoRAAttnProcessor2_0 as _LoRA2
+    LoRAAttnProcessor = _LoRA2
+except Exception:
+    try:
+        from diffusers.models.attention_processor import LoRAAttnProcessor as _LoRA
+        LoRAAttnProcessor = _LoRA
+    except Exception:
+        LoRAAttnProcessor = None
+
+if LoRAAttnProcessor is None:
+    print("CRITICAL: Could not import a LoRA attention processor from diffusers.")
+    sys.exit(1)
+
 
 try:
     import imageio
@@ -765,20 +779,41 @@ def _hidden_size_from_attn_name(name: str, block_out_channels):
     raise ValueError(f"CRITICAL: cannot parse attention processor name: {name}")
 
 
+
 def inject_lora_crossattn(unet: UNet2DConditionModel, rank=8):
-    """Attach LoRA ONLY to cross-attn (attn2) processors."""
+    """Attach LoRA ONLY to cross-attn (attn2) processors, compatible across diffusers versions."""
+    sig = inspect.signature(LoRAAttnProcessor.__init__)
+    params = set(sig.parameters.keys())
+
     attn_procs = {}
     for name, proc in unet.attn_processors.items():
         if "attn2" not in name:
-            attn_procs[name] = proc  # keep original (frozen)
+            attn_procs[name] = proc
             continue
+
         hidden_size = _hidden_size_from_attn_name(name, unet.config.block_out_channels)
-        attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size,
-            cross_attention_dim=unet.config.cross_attention_dim,
-            rank=rank,
-        )
+        cross_dim = unet.config.cross_attention_dim
+
+        kwargs = {"rank": rank}
+
+        # Some versions accept hidden_size
+        if "hidden_size" in params:
+            kwargs["hidden_size"] = hidden_size
+        # Some versions use "query_dim" instead
+        if "query_dim" in params and "hidden_size" not in kwargs:
+            kwargs["query_dim"] = hidden_size
+
+        # Some versions accept cross_attention_dim
+        if "cross_attention_dim" in params:
+            kwargs["cross_attention_dim"] = cross_dim
+        # Some older versions use "context_dim"
+        if "context_dim" in params and "cross_attention_dim" not in kwargs:
+            kwargs["context_dim"] = cross_dim
+
+        attn_procs[name] = LoRAAttnProcessor(**kwargs)
+
     unet.set_attn_processor(attn_procs)
+
 
 
 def get_lora_params(unet: UNet2DConditionModel):
