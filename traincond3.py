@@ -1366,11 +1366,13 @@ Examples:
     parser.add_argument("--overall_init", type=str, default="ddpm_uncond_all/theta_ref_ema_best.pt")
     parser.add_argument("--ctrl_init", type=str, default="ddpm_uncond_ctrl/theta_ctrl_ema_best.pt")
     parser.add_argument("--epochs_each", type=int, default=50)
+    parser.add_argument("--eval_freq", type=int, default=5, help="Frequency of evaluation (epochs)")
     parser.add_argument("--train_conv_in", action="store_true")
     args = parser.parse_args()
     
     config = Config()
     config.epochs_each = args.epochs_each
+    config.eval_freq = args.eval_freq
     config.train_conv_in = args.train_conv_in
     
     # Override calculate_fid from command line
