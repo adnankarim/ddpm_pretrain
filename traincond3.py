@@ -105,11 +105,11 @@ class Config:
     lr = 3e-5  # Lower LR when using pretrained weights to prevent drift
     save_freq = 1
     eval_freq = 5
-    calculate_fid = False  # Set to True to enable FID calculation (slower evaluation)
-    skip_metrics_during_training = True  # If True, skip metric calculations during training (only generate samples/video)
+    calculate_fid = True  # Set to True to enable FID calculation (slower evaluation)
+    skip_metrics_during_training = False  # If True, skip metric calculations during training (only generate samples/video)
 
     # LoRA / trainable-selection
-    lora_rank = 8
+    lora_rank = 16
     train_conv_in = False  # optional fine-tuning of conv_in
     
     output_dir = "ddpm_diffusers_results"
