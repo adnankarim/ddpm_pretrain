@@ -1146,7 +1146,8 @@ def calculate_metrics(model, val_loader, device, num_samples=1000, calculate_fid
                 # KL Divergence (approx)
                 b = ctrl.shape[0]
                 t = torch.randint(0, model.timesteps, (b,), device=device, generator=gen_t).long()
-                noise = torch.randn_like(target_img, generator=gen_kl)
+                # noise = torch.randn_like(target_img, generator=gen_kl) # incorrect: randn_like doesn't support generator
+                noise = torch.randn(target_img.shape, device=target_img.device, dtype=target_img.dtype, generator=gen_kl)
                 xt = model.noise_scheduler.add_noise(target_img, noise, t)
                 noise_pred = model.model(xt, t, cond_img, fp)
                 kl = calculate_kl_divergence(noise_pred, noise)
@@ -1657,6 +1658,58 @@ Examples:
                 print(f"[{direction}] Resumed at epoch {start_epoch}", flush=True)
             else:
                 print(f"[{direction}] Resume requested but checkpoint not found: {ckpt_path}", flush=True)
+
+            if start_epoch == 0:
+                 print("\n" + "="*60, flush=True)
+                 print(f"[{direction}] INITIAL EVALUATION (Before Training)", flush=True)
+                 print("="*60, flush=True)
+
+                 if not phase_config.skip_metrics_during_training:
+                     print("  Calculating metrics on validation set...", flush=True)
+                     metrics = calculate_metrics(
+                         model,
+                         val_loader,
+                         phase_config.device,
+                         num_samples=args.num_eval_samples,
+                         calculate_fid_flag=phase_config.calculate_fid,
+                         num_inference_steps=args.inference_steps,
+                         skip_other_metrics=args.fid_only,
+                         direction=direction,
+                     )
+
+                     print(f"\n  📊 INITIAL MEASUREMENTS:", flush=True)
+                     print(f"  {'-'*58}", flush=True)
+                     if metrics['kl_divergence'] is not None:
+                         print(f"    KL Divergence:     {metrics['kl_divergence']:.6f}", flush=True)
+                     if metrics['mse'] is not None:
+                         print(f"    MSE (gen vs real): {metrics['mse']:.6f}", flush=True)
+                     if metrics['psnr'] is not None:
+                         print(f"    PSNR:              {metrics['psnr']:.2f} dB", flush=True)
+                     if metrics['ssim'] is not None:
+                         print(f"    SSIM:              {metrics['ssim']:.4f}", flush=True)
+                     if metrics['fid'] is not None:
+                         print(f"    FID (Overall):     {metrics['fid']:.2f}", flush=True)
+                     if metrics['kid_mean'] is not None:
+                         print(f"    KID (Overall):     {metrics['kid_mean']:.5f} (±{metrics['kid_std']:.5f})", flush=True)
+                     if metrics['cfid'] is not None:
+                         print(f"    cFID (Conditional): {metrics['cfid']:.2f}", flush=True)
+                     if metrics['avg_kid_mean'] is not None:
+                         print(f"    Avg KID (Per-Class): {metrics['avg_kid_mean']:.5f} (±{metrics['avg_kid_std']:.5f})", flush=True)
+                     print(f"  {'-'*58}", flush=True)
+                     
+                     # Log initial metrics to CSV and TXT
+                     logger.update(0, 0.0, metrics, phase_config.lr)
+                     
+                     # Simple TXT logging
+                     txt_path = os.path.join(phase_config.output_dir, "evaluation_metrics.txt")
+                     with open(txt_path, "a") as f:
+                         f.write(f"Epoch 0 (Initial):\n")
+                         for k, v in metrics.items():
+                             if v is not None:
+                                 f.write(f"  {k}: {v}\n")
+                         f.write("-" * 40 + "\n")
+
+                 print("="*60 + "\n", flush=True)
 
         for epoch in range(start_epoch, phase_config.epochs):
             model.model.train()
